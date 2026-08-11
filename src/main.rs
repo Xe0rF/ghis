@@ -2539,7 +2539,20 @@ fn apply_tui_input(
         return Ok(());
     }
     let (paths, _) = load_config(path)?;
-    let (config, ()) = update_config(&paths, |config| {
+    apply_tui_input_at_paths(operation, input, &paths)
+}
+
+/// Apply a TUI edit after the caller has resolved the configuration paths.
+///
+/// Keeping path resolution outside this mutation makes in-process callers
+/// (especially tests) able to provide an isolated XDG root without changing
+/// the environment of the whole test process.
+fn apply_tui_input_at_paths(
+    operation: TuiPending,
+    input: &str,
+    paths: &ConfigPaths,
+) -> app::Result<()> {
+    let (config, ()) = update_config(paths, |config| {
         match operation {
             TuiPending::AddProfile => {
                 let fields = input.split('|').map(str::trim).collect::<Vec<_>>();
@@ -2610,7 +2623,7 @@ fn apply_tui_input(
         }
         Ok(())
     })?;
-    app::sync_fragments(&paths, &config)?;
+    app::sync_fragments(paths, &config)?;
     Ok(())
 }
 
@@ -3081,10 +3094,16 @@ mod tests {
         });
         config.save(&config_path).unwrap();
 
-        apply_tui_input(
-            Some(TuiPending::EditRule("all-fields".into())),
+        let mut paths = ConfigPaths::from_bases(
+            directory.path().join("xdg-config"),
+            directory.path().join("xdg-cache"),
+            directory.path().join("xdg-state"),
+        );
+        paths.set_config_file(&config_path).unwrap();
+        apply_tui_input_at_paths(
+            TuiPending::EditRule("all-fields".into()),
             "renamed|work|25|git.example.com|after|new-project|ssh://git.example.com/**|/work/**",
-            Some(&config_path),
+            &paths,
         )
         .unwrap();
 
@@ -3098,6 +3117,8 @@ mod tests {
         assert_eq!(rule.repo.as_deref(), Some("new-project"));
         assert_eq!(rule.remote.as_deref(), Some("ssh://git.example.com/**"));
         assert_eq!(rule.gitdir.as_deref(), Some("/work/**"));
+        assert!(paths.fragments_dir.join("personal.gitconfig").is_file());
+        assert!(paths.fragments_dir.join("work.gitconfig").is_file());
     }
 
     #[test]

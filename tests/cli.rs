@@ -28,8 +28,9 @@ fn prepend_path(directory: &Path) -> String {
     .into_owned()
 }
 
-fn xdg_environment(temp: &TempDir) -> [(String, PathBuf); 3] {
+fn xdg_environment(temp: &TempDir) -> [(String, PathBuf); 4] {
     [
+        ("HOME".into(), temp.path().join("home")),
         ("XDG_CONFIG_HOME".into(), temp.path().join("config")),
         ("XDG_CACHE_HOME".into(), temp.path().join("cache")),
         ("XDG_STATE_HOME".into(), temp.path().join("state")),
@@ -89,6 +90,7 @@ fi
 
     let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
     command
+        .current_dir(temp.path())
         .args(["gh", "--", "api", "user"])
         .env("PATH", prepend_path(&bin))
         .env("FAKE_GH_TRACE", &trace)
@@ -154,6 +156,7 @@ printf 'enterprise-account-ok\n'
 
     let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
     command
+        .current_dir(temp.path())
         .args(["gh", "--", "api", "user"])
         .env("PATH", prepend_path(&bin))
         .env("GH_TOKEN", "wrong-cloud-token")
@@ -184,6 +187,7 @@ fn gh_wrapper_rejects_an_explicit_cross_host_target_before_token_lookup() {
 
     let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
     command
+        .current_dir(temp.path())
         .args(["gh", "--", "api", "--hostname", "other.example", "user"])
         .env("PATH", prepend_path(&bin))
         .env("FAKE_GH_TRACE", &trace);
@@ -200,6 +204,7 @@ fn gh_wrapper_rejects_an_explicit_cross_host_target_before_token_lookup() {
 
     let mut positional = AssertCommand::cargo_bin("ghis").expect("ghis binary");
     positional
+        .current_dir(temp.path())
         .args([
             "gh",
             "--",
@@ -223,6 +228,7 @@ fn gh_wrapper_rejects_an_explicit_cross_host_target_before_token_lookup() {
 
     let mut item_url = AssertCommand::cargo_bin("ghis").expect("ghis binary");
     item_url
+        .current_dir(temp.path())
         .args([
             "gh",
             "--",
@@ -258,6 +264,7 @@ fn gh_wrapper_rejects_an_explicit_cross_host_target_before_token_lookup() {
     ] {
         let mut guarded = AssertCommand::cargo_bin("ghis").expect("ghis binary");
         guarded
+            .current_dir(temp.path())
             .arg("gh")
             .arg("--")
             .args(args)
@@ -272,6 +279,7 @@ fn gh_wrapper_rejects_an_explicit_cross_host_target_before_token_lookup() {
 
     let mut body_url = AssertCommand::cargo_bin("ghis").expect("ghis binary");
     body_url
+        .current_dir(temp.path())
         .args([
             "gh",
             "--",
@@ -344,6 +352,7 @@ fn gh_wrapper_rejects_ambiguous_and_cross_host_targets_before_token_lookup() {
     ] {
         let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
         command
+            .current_dir(temp.path())
             .arg("gh")
             .arg("--")
             .args(args)
@@ -401,6 +410,7 @@ printf 'run:%s repo=%s\n' "$*" "${GH_REPO-<unset>}" >> "$FAKE_GH_TRACE"
     ] {
         let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
         command
+            .current_dir(temp.path())
             .arg("gh")
             .arg("--")
             .args(args)
@@ -414,18 +424,19 @@ printf 'run:%s repo=%s\n' "$*" "${GH_REPO-<unset>}" >> "$FAKE_GH_TRACE"
     }
 
     let mut body = AssertCommand::cargo_bin("ghis").expect("ghis binary");
-    body.args([
-        "gh",
-        "--",
-        "pr",
-        "comment",
-        "1",
-        "--body",
-        "https://other.example/acme/project/pull/2",
-    ])
-    .env("PATH", prepend_path(&bin))
-    .env("FAKE_GH_TRACE", &trace)
-    .env("GH_REPO", "github.com/acme/project");
+    body.current_dir(temp.path())
+        .args([
+            "gh",
+            "--",
+            "pr",
+            "comment",
+            "1",
+            "--body",
+            "https://other.example/acme/project/pull/2",
+        ])
+        .env("PATH", prepend_path(&bin))
+        .env("FAKE_GH_TRACE", &trace)
+        .env("GH_REPO", "github.com/acme/project");
     for (key, value) in xdg_environment(&temp) {
         body.env(key, value);
     }
@@ -653,7 +664,7 @@ fn caller_identity_config_still_overrides_the_profile_fragment() {
     write_default_profile(&temp);
 
     let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
-    command.args([
+    command.current_dir(temp.path()).args([
         "git",
         "--",
         "-c",
@@ -690,7 +701,8 @@ fn generated_zsh_wrapper_is_valid_and_preserves_git_exit_status() {
 
     let bin = assert_cmd::cargo::cargo_bin!("ghis");
     let binary_dir = bin.parent().expect("binary directory");
-    let status = Command::new("zsh")
+    let mut command = Command::new("zsh");
+    command
         .args([
             "-f",
             "-c",
@@ -698,9 +710,15 @@ fn generated_zsh_wrapper_is_valid_and_preserves_git_exit_status() {
             "zsh",
         ])
         .arg(&init)
+        .current_dir(temp.path())
         .env("PATH", prepend_path(binary_dir))
-        .status()
-        .expect("run wrapper");
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env_remove("GHIS_CONFIG")
+        .env_remove("GHIS_PROFILE");
+    for (key, value) in xdg_environment(&temp) {
+        command.env(key, value);
+    }
+    let status = command.status().expect("run wrapper");
     assert_eq!(status.code(), Some(1));
 }
 
@@ -761,6 +779,7 @@ exec "$GHIS_REAL_GIT" "$@"
         .args(["-q", "-e", "-c"])
         .arg(&probe)
         .arg("/dev/null")
+        .current_dir(temp.path())
         .env("PATH", path)
         .env("GHIS_REAL_GIT", real_git)
         .env("HOME", temp.path().join("home"))
