@@ -51,6 +51,8 @@ name = "ghis"
 path = "src/lib.rs"
 
 [profile.release]
+opt-level = "z"
 codegen-units = 1
-lto = "thin"
+lto = "fat"
+panic = "abort"
 strip = "symbols"
