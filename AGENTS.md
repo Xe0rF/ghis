@@ -2,7 +2,7 @@
 
 ## 项目结构
 
-- `build.rs` 将 Git commit、工作区状态、tag、构建时间、目标平台和构建模式写入版本信息；`src/` 是 Rust 核心代码：`main.rs` 提供 CLI/TUI 入口，`app.rs` 负责身份解析与仓库绑定，`config.rs` 管理配置和 XDG 路径，`git.rs`、`credential.rs`、`github.rs`、`signing.rs` 分别封装 Git、凭据、gh CLI 和 SSH 签名逻辑。
+- `build.rs` 将 Git commit、工作区状态、tag、构建时间、目标平台和构建模式写入版本信息；`src/` 是 Rust 核心代码：`main.rs` 提供 CLI/TUI 入口，`app.rs` 负责身份解析与仓库绑定，`config.rs` 管理配置和 XDG 路径，`agent.rs` 与 `src/agent/` 提供 Claude/Codex agent 上下文注入、启动器和设置管理，`git.rs`、`credential.rs`、`github.rs`、`signing.rs` 分别封装 Git、凭据、gh CLI 和 SSH 签名逻辑。
 - `src/tui.rs` 和 `src/snapshots/` 包含 TUI 状态、Vim 风格按键处理及 insta 快照。
 - `tests/` 放置 CLI、wrapper、worktree、凭据、SSH 和并发行为的集成测试。
 - 如果新增、移动或删除源码目录、测试目录、脚本或打包入口，必须同步更新本节和相关开发命令，保持本指南与仓库实际结构一致。

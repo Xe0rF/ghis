@@ -4,6 +4,8 @@
 //! process and shell layers available from a library makes the safety-critical
 //! resolution rules easy to test without spawning an interactive terminal.
 
+pub mod agent;
+pub mod agent_context;
 pub mod app;
 pub mod config;
 pub mod credential;

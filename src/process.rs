@@ -132,6 +132,16 @@ impl CommandSpec {
         &self.environment
     }
 
+    /// Child environment variables removed before launch.
+    pub fn removed_environment(&self) -> &[OsString] {
+        &self.removed_environment
+    }
+
+    /// Child working directory.
+    pub fn current_directory(&self) -> Option<&std::path::Path> {
+        self.current_dir.as_deref()
+    }
+
     /// Return a redacted human-readable argv string.
     pub fn display(&self) -> String {
         display_argv(
