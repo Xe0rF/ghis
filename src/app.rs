@@ -70,6 +70,26 @@ impl AppContext {
         cwd: impl AsRef<Path>,
         explicit: Option<&str>,
     ) -> Result<Self> {
+        Self::from_config_with_target(paths, config, cwd, explicit, None)
+    }
+
+    fn from_config_for_gh(
+        paths: ConfigPaths,
+        config: Config,
+        cwd: impl AsRef<Path>,
+        explicit: Option<&str>,
+        target: Option<&GhProfileTarget>,
+    ) -> Result<Self> {
+        Self::from_config_with_target(paths, config, cwd, explicit, target)
+    }
+
+    fn from_config_with_target(
+        paths: ConfigPaths,
+        config: Config,
+        cwd: impl AsRef<Path>,
+        explicit: Option<&str>,
+        target: Option<&GhProfileTarget>,
+    ) -> Result<Self> {
         let mut warnings = Vec::new();
         let (repository, remote, binding, identities) = match repo::discover(cwd.as_ref()) {
             Ok(repository) => {
@@ -81,7 +101,7 @@ impl AppContext {
             Err(RepoError::NotRepository { .. }) => (None, None, None, None),
             Err(error) => return Err(error.into()),
         };
-        let (context, github_match) = if let Some(remote) = remote.as_ref() {
+        let (repository_context, repository_match) = if let Some(remote) = remote.as_ref() {
             (
                 RuleContext {
                     host: remote.host.clone(),
@@ -90,7 +110,7 @@ impl AppContext {
                     remote: Some(remote.url.clone()),
                     gitdir: repository.as_ref().map(|item| item.git_dir.clone()),
                 },
-                unique_profile_for_remote(&config, remote),
+                unique_profile_for_target(&config, remote.host.as_deref(), remote.owner.as_deref()),
             )
         } else {
             (
@@ -101,13 +121,21 @@ impl AppContext {
                 None,
             )
         };
+        let context = target
+            .map(|target| target.context.clone())
+            .unwrap_or(repository_context);
+        let github_match = if target.is_some() {
+            unique_profile_for_target(&config, context.host.as_deref(), context.owner.as_deref())
+        } else {
+            repository_match
+        };
         let env_explicit = std::env::var("GHIS_PROFILE").ok();
         let explicit = explicit.or(env_explicit.as_deref());
         let resolution = config::resolve_profile(
             &config,
             &context,
             explicit,
-            binding.as_deref(),
+            target.is_none().then_some(binding.as_deref()).flatten(),
             github_match.as_deref(),
         );
         warnings.extend(resolution.warnings.clone());
@@ -240,9 +268,13 @@ impl AppContext {
     }
 }
 
-fn unique_profile_for_remote(config: &Config, remote: &Remote) -> Option<String> {
-    let host = remote.host.as_deref()?;
-    let owner = remote.owner.as_deref()?;
+fn unique_profile_for_target(
+    config: &Config,
+    host: Option<&str>,
+    owner: Option<&str>,
+) -> Option<String> {
+    let host = host?;
+    let owner = owner?;
     let mut matches = config
         .profiles
         .iter()
@@ -1092,7 +1124,10 @@ pub fn run_gh(
         paths.set_config_file(path)?;
     }
     let config = Config::load(&paths.config_file)?;
-    let ctx = AppContext::from_config(paths, config, cwd, explicit)?;
+    let view = parse_gh_argument_view(args)?;
+    let inherited_repo = std::env::var_os("GH_REPO");
+    let target = gh_profile_target(&view, inherited_repo.as_deref())?;
+    let ctx = AppContext::from_config_for_gh(paths, config, cwd, explicit, target.as_ref())?;
     ctx.ensure_selection_available()?;
     if ctx.profile.is_none()
         && ctx.config.behavior.unresolved == config::UnresolvedPolicy::Fail
@@ -1125,10 +1160,10 @@ pub fn run_gh(
         .as_ref()
         .map(|repository| repo::gh_remote_context(repository, &profile.host))
         .transpose()?;
-    let target_policy = validate_gh_target_host(
+    let target_policy = validate_gh_target_view(
         &profile.host,
-        args,
-        std::env::var_os("GH_REPO").as_deref(),
+        &view,
+        inherited_repo.as_deref(),
         gh_remote
             .as_ref()
             .and_then(repo::GhRemoteContext::remote)
@@ -1174,6 +1209,87 @@ struct GhTargetPolicy {
     repository_environment: Option<String>,
 }
 
+#[derive(Debug, Clone, Default)]
+struct GhProfileTarget {
+    context: RuleContext,
+}
+
+fn gh_profile_target(
+    view: &GhArgumentView<'_>,
+    inherited_repo: Option<&std::ffi::OsStr>,
+) -> Result<Option<GhProfileTarget>> {
+    let inherited_repo = inherited_repo
+        .map(|value| {
+            value.to_str().ok_or_else(|| {
+                AppError::Message("GH_REPO 不是有效 UTF-8，无法确认目标 GitHub 主机".into())
+            })
+        })
+        .transpose()?;
+    let explicit_repository = view.repository_selectors.first().copied().or_else(|| {
+        view.positionals
+            .iter()
+            .copied()
+            .find(|value| gh_repository_selector_host(value).is_some())
+    });
+    let repository = explicit_repository.or(inherited_repo);
+    let mut host = view
+        .hostname_selectors
+        .first()
+        .map(|value| (*value).to_owned());
+    let mut owner = None;
+    let mut repo_name = None;
+    if let Some(repository) = repository {
+        let (parsed_host, parsed_owner, parsed_repo) = parse_gh_repository_target(repository);
+        host = if explicit_repository.is_some() {
+            parsed_host.or(host)
+        } else {
+            host.or(parsed_host)
+        }
+        .or_else(|| Some("github.com".into()));
+        owner = parsed_owner;
+        repo_name = parsed_repo;
+    }
+    if host.is_none() && owner.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(GhProfileTarget {
+        context: RuleContext {
+            host,
+            owner,
+            repo: repo_name,
+            ..RuleContext::default()
+        },
+    }))
+}
+
+fn parse_gh_repository_target(value: &str) -> (Option<String>, Option<String>, Option<String>) {
+    let value = value.trim();
+    let host = gh_repository_selector_host(value);
+    let path = if let Some((_, rest)) = value.split_once("://") {
+        rest.split(['?', '#'])
+            .next()
+            .unwrap_or(rest)
+            .split_once('/')
+            .map(|(_, path)| path)
+    } else if let Some((_, path)) = value.split_once(':') {
+        Some(path)
+    } else if host.is_some() {
+        value.split_once('/').map(|(_, path)| path)
+    } else {
+        Some(value)
+    };
+    let mut parts = path.unwrap_or_default().trim_matches('/').split('/');
+    let owner = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .map(str::to_owned);
+    let repo = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .map(|part| part.trim_end_matches(".git").to_owned());
+    (host, owner, repo)
+}
+
 #[derive(Debug)]
 struct GhArgumentView<'a> {
     command: &'a str,
@@ -1184,6 +1300,7 @@ struct GhArgumentView<'a> {
     option_values: Vec<(&'a str, &'a str)>,
 }
 
+#[cfg(test)]
 fn validate_gh_target_host(
     profile_host: &str,
     args: &[String],
@@ -1191,6 +1308,15 @@ fn validate_gh_target_host(
     current_repository_host: Option<&str>,
 ) -> Result<GhTargetPolicy> {
     let view = parse_gh_argument_view(args)?;
+    validate_gh_target_view(profile_host, &view, inherited_repo, current_repository_host)
+}
+
+fn validate_gh_target_view(
+    profile_host: &str,
+    view: &GhArgumentView<'_>,
+    inherited_repo: Option<&std::ffi::OsStr>,
+    current_repository_host: Option<&str>,
+) -> Result<GhTargetPolicy> {
     if !gh_supported_top_level_command(view.command) {
         return Err(AppError::Message(format!(
             "gh 命令 `{}` 尚未纳管，或它是自定义 alias/extension；无法确认目标主机，已在取 token 前停止。确需执行时请使用 GHIS_BYPASS=1",
@@ -1303,7 +1429,7 @@ fn validate_gh_target_host(
     }
 
     let needs_repository_context =
-        gh_command_uses_repository_context(&view) && !repository_context_overridden;
+        gh_command_uses_repository_context(view) && !repository_context_overridden;
     if needs_repository_context && let Some(repository) = inherited_repo {
         let repository = repository.to_str().ok_or_else(|| {
             AppError::Message("GH_REPO 不是有效 UTF-8，无法确认目标 GitHub 主机".into())

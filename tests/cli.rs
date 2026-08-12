@@ -693,6 +693,151 @@ fi
 }
 
 #[test]
+fn gh_explicit_targets_select_non_default_profiles_outside_git() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let config_directory = temp.path().join("config/ghis");
+    fs::create_dir_all(&config_directory).expect("config directory");
+    fs::write(
+        config_directory.join("config.toml"),
+        r#"version = 1
+
+[behavior]
+default_profile = "personal"
+
+[profiles.personal]
+host = "github.com"
+login = "personal"
+git_name = "Personal"
+git_email = "personal@example.test"
+
+[profiles.acme]
+host = "github.com"
+login = "acme"
+git_name = "Acme"
+git_email = "acme@example.test"
+
+[profiles.enterprise]
+host = "git.example.test"
+login = "platform"
+git_name = "Platform"
+git_email = "platform@example.test"
+
+[[rules]]
+id = "enterprise-owner"
+profile = "enterprise"
+priority = 100
+host = "git.example.test"
+owner = "platform"
+"#,
+    )
+    .expect("config");
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).expect("bin directory");
+    let trace = temp.path().join("gh.trace");
+    write_executable(
+        &bin.join("gh"),
+        r#"#!/bin/sh
+printf '%s host=%s repo=%s\n' "$*" "${GH_HOST-}" "${GH_REPO-}" >> "$FAKE_GH_TRACE"
+case "$*" in
+  "auth token --hostname github.com --user acme") printf 'acme-token\n'; exit 0 ;;
+  "auth token --hostname github.com --user personal") printf 'personal-token\n'; exit 0 ;;
+  "auth token --hostname git.example.test --user platform") printf 'enterprise-token\n'; exit 0 ;;
+esac
+case "$GH_HOST" in github.com|git.example.test) exit 0 ;; *) exit 91 ;; esac
+"#,
+    );
+
+    let cases = [
+        (vec!["repo", "view", "--repo", "acme/project"], None),
+        (
+            vec!["pr", "view", "https://github.com/acme/project/pull/7"],
+            None,
+        ),
+        (
+            vec![
+                "issue",
+                "view",
+                "https://git.example.test/platform/app/issues/9",
+            ],
+            None,
+        ),
+        (vec!["pr", "list"], Some("git.example.test/platform/app")),
+    ];
+    for (args, gh_repo) in cases {
+        let mut command = isolated_ghis_command();
+        command
+            .current_dir("/tmp")
+            .arg("gh")
+            .arg("--")
+            .args(args)
+            .env("PATH", prepend_path(&bin))
+            .env("FAKE_GH_TRACE", &trace);
+        if let Some(repo) = gh_repo {
+            command.env("GH_REPO", repo);
+        } else {
+            command.env_remove("GH_REPO");
+        }
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.assert().success();
+    }
+    let trace = fs::read_to_string(trace).expect("trace");
+    assert!(trace.contains("--user acme"));
+    assert!(trace.contains("--user platform"));
+    assert!(!trace.contains("--user personal"));
+}
+
+#[test]
+fn explicit_profile_still_precedes_gh_target_and_number_only_does_not_guess() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).expect("bin directory");
+    let trace = temp.path().join("gh.trace");
+    write_executable(
+        &bin.join("gh"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_GH_TRACE"
+if [ "$1" = auth ] && [ "$2" = token ]; then printf 'token\n'; exit 0; fi
+exit 0
+"#,
+    );
+    let mut command = isolated_ghis_command();
+    command
+        .current_dir("/tmp")
+        .args([
+            "--profile",
+            "personal",
+            "gh",
+            "--",
+            "pr",
+            "view",
+            "https://github.com/other/project/pull/1",
+        ])
+        .env("PATH", prepend_path(&bin))
+        .env("FAKE_GH_TRACE", &trace);
+    for (key, value) in xdg_environment(&temp) {
+        command.env(key, value);
+    }
+    command.assert().success();
+    assert!(fs::read_to_string(&trace).unwrap().contains("--user alice"));
+
+    fs::remove_file(&trace).unwrap();
+    let mut number = isolated_ghis_command();
+    number
+        .current_dir("/tmp")
+        .args(["gh", "--", "pr", "view", "7"])
+        .env("PATH", prepend_path(&bin))
+        .env("FAKE_GH_TRACE", &trace);
+    for (key, value) in xdg_environment(&temp) {
+        number.env(key, value);
+    }
+    number.assert().success();
+    assert!(fs::read_to_string(&trace).unwrap().contains("--user alice"));
+}
+
+#[test]
 fn relative_git_c_is_forwarded_only_once() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let repository = temp.path().join("repo");
