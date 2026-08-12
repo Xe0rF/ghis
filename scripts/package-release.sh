@@ -21,6 +21,11 @@ if [ -n "${GHIS_TARGET:-}" ] && [ "$GHIS_TARGET" != "$target" ]; then
   exit 2
 fi
 
+if [ -z "${SOURCE_DATE_EPOCH:-}" ]; then
+  SOURCE_DATE_EPOCH=$(git log -1 --format=%ct 2>/dev/null || printf '0')
+  export SOURCE_DATE_EPOCH
+fi
+
 # Keep build-machine paths and usernames out of panic locations embedded by
 # Rust and dependencies. CARGO_ENCODED_RUSTFLAGS preserves paths containing
 # spaces; fall back to RUSTFLAGS only when the caller already uses it.
@@ -69,7 +74,7 @@ zsh -n "$package_dir/completions/_ghis"
 
 archive="$dist_dir/$package.tar.gz"
 rm -f -- "$archive" "$archive.sha256"
-epoch=${SOURCE_DATE_EPOCH:-0}
+epoch=$SOURCE_DATE_EPOCH
 tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \
   -C "$stage" -cf - "$package" | gzip -n -9 > "$archive"
 

@@ -20,6 +20,10 @@
 cargo install --locked --path .
 ```
 
+`ghis --version` 会同时显示 Git commit、clean/dirty 状态、精确 tag、UTC 构建时间、
+目标平台和 debug/release 模式。设置 `SOURCE_DATE_EPOCH` 后，构建时间使用该 Unix
+时间戳，以便生成可复现的发布产物。
+
 Arch Linux 可以从当前源码生成本地归档并交给 pacman 安装：
 
 ```sh

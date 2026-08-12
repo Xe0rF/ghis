@@ -19,3 +19,20 @@ pub mod tui;
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+pub const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    "\ncommit: ",
+    env!("GHIS_BUILD_GIT_COMMIT"),
+    "-",
+    env!("GHIS_BUILD_GIT_STATE"),
+    "\ntag: ",
+    env!("GHIS_BUILD_GIT_TAG"),
+    "\nbuilt: ",
+    env!("GHIS_BUILD_TIME"),
+    "\nSOURCE_DATE_EPOCH: ",
+    env!("GHIS_BUILD_SOURCE_DATE_EPOCH"),
+    "\ntarget: ",
+    env!("GHIS_BUILD_TARGET"),
+    "\nprofile: ",
+    env!("GHIS_BUILD_PROFILE"),
+);

@@ -97,6 +97,24 @@ git_email = "alice@example.test"
 }
 
 #[test]
+fn long_version_reports_build_provenance() {
+    isolated_ghis_command()
+        .arg("--version")
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with(format!(
+            "ghis {}\n",
+            env!("CARGO_PKG_VERSION")
+        )))
+        .stdout(predicate::str::contains("commit: "))
+        .stdout(predicate::str::contains("tag: "))
+        .stdout(predicate::str::contains("built: "))
+        .stdout(predicate::str::contains("SOURCE_DATE_EPOCH: "))
+        .stdout(predicate::str::contains("target: "))
+        .stdout(predicate::str::contains("profile: "));
+}
+
+#[test]
 fn gh_wrapper_selects_exact_account_and_clears_inherited_tokens() {
     let temp = tempfile::tempdir().expect("temporary directory");
     write_default_profile(&temp);

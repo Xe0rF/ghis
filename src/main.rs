@@ -15,7 +15,12 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
 #[derive(Debug, Parser)]
-#[command(name = "ghis", version, about = "按仓库切换 Git 和 GitHub 身份")]
+#[command(
+    name = "ghis",
+    version = ghis::VERSION,
+    long_version = ghis::LONG_VERSION,
+    about = "按仓库切换 Git 和 GitHub 身份"
+)]
 struct Cli {
     /// 临时指定 profile，优先于仓库绑定和规则
     #[arg(long, global = true, env = "GHIS_PROFILE")]
