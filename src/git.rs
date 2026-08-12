@@ -5,6 +5,7 @@
 //! through `sh -c`.
 
 use crate::repo::{self, RepoError, Repository};
+use crate::signing;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
@@ -404,7 +405,7 @@ pub fn render_profile_fragment(options: &FragmentOptions) -> String {
         }
         if let Some(value) = options.signing_key.as_deref() {
             output.push_str("[user]\n\tsigningKey = ");
-            output.push_str(&git_config_quote(value));
+            output.push_str(&git_config_quote(&signing::git_signing_key_value(value)));
             output.push('\n');
         }
         output.push_str("[commit]\n\tgpgSign = ");
@@ -540,6 +541,37 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
             assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+        }
+    }
+
+    #[test]
+    fn signing_fragment_marks_every_inline_ssh_key_as_literal() {
+        for value in [
+            "ssh-ed25519 AAAA inline",
+            "ecdsa-sha2-nistp256 AAAA inline",
+            "sk-ssh-ed25519@openssh.com AAAA inline",
+            "rsa-sha2-512 AAAA inline",
+        ] {
+            let file = tempfile::NamedTempFile::new().expect("temporary fragment");
+            let fragment = render_profile_fragment(&FragmentOptions {
+                name: "Alice".into(),
+                email: "alice@example.test".into(),
+                signing_key: Some(value.into()),
+                commit_gpg_sign: true,
+                ..FragmentOptions::default()
+            });
+            std::fs::write(file.path(), fragment).expect("write fragment");
+            let output = std::process::Command::new("git")
+                .args(["config", "--file"])
+                .arg(file.path())
+                .args(["--get", "user.signingKey"])
+                .output()
+                .expect("run git config");
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8_lossy(&output.stdout).trim(),
+                format!("key::{value}")
+            );
         }
     }
 
