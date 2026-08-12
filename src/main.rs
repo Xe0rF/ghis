@@ -1,9 +1,10 @@
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::{Shell, generate};
+use ghis::agent_context::{AgentContext, AgentContextFormat};
 use ghis::app::{self, AppContext};
 use ghis::config::{
-    Config, ConfigPaths, CredentialFailurePolicy, DisplayIdentity, Profile, Rule, SigningProfile,
-    SshMode, SshProfile, SshUnmanagedPolicy, UnresolvedPolicy,
+    Config, ConfigPaths, CredentialFailurePolicy, DisplayIdentity, Profile, ResolutionSource, Rule,
+    SigningProfile, SshMode, SshProfile, SshUnmanagedPolicy, UnresolvedPolicy,
 };
 use ghis::{credential, diagnostics, github, shell, signing, tui};
 use serde::Serialize;
@@ -38,6 +39,8 @@ enum Commands {
     Tui,
     /// 显示当前仓库和有效身份
     Status(StatusArgs),
+    /// 输出供 coding agent 使用的最小、脱敏仓库身份上下文
+    Context(ContextArgs),
     /// 从 gh CLI 发现已有账号
     Discover(JsonArgs),
     /// 管理 profile
@@ -70,6 +73,13 @@ enum Commands {
     Sync,
     /// 检查依赖、账号、仓库和 1Password/SSH 状态
     Doctor(DoctorArgs),
+    /// 在执行 git/gh 前即时返回结构化诊断（不注入 agent context）
+    Check(CheckArgs),
+    /// 启动或配置 Claude Code/Codex 的 ghis 上下文集成
+    Agent {
+        #[command(subcommand)]
+        command: AgentCommand,
+    },
     /// 安装 zsh 包装器
     Setup(SetupArgs),
     /// 从 .zshrc 移除 ghis 管理块
@@ -105,6 +115,26 @@ enum ShellKind {
     Zsh,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum ContextFormatArg {
+    #[default]
+    Json,
+    Claude,
+    Codex,
+}
+
+#[derive(Debug, Args, Default)]
+struct ContextArgs {
+    #[arg(long, value_enum, default_value_t = ContextFormatArg::Json)]
+    format: ContextFormatArg,
+    /// 在指定目录解析仓库上下文
+    #[arg(long)]
+    cwd: Option<PathBuf>,
+    /// 未解析、歧义或失效选择时返回错误
+    #[arg(long)]
+    require_resolved: bool,
+}
+
 #[derive(Debug, Args, Default)]
 struct JsonArgs {
     #[arg(long)]
@@ -129,6 +159,86 @@ struct DoctorArgs {
     /// 显式访问 GitHub API，核对当前 Profile 的 SSH signing 公钥
     #[arg(long, visible_alias = "check-github-signing-keys")]
     check_github_signing_key: bool,
+}
+
+#[derive(Debug, Args)]
+struct CheckArgs {
+    #[arg(long, value_enum)]
+    operation: CheckOperation,
+    #[arg(long)]
+    json: bool,
+    #[arg(last = true, allow_hyphen_values = true)]
+    args: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum CheckOperation {
+    Git,
+    Gh,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AgentTarget {
+    Claude,
+    Codex,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum AgentScope {
+    User,
+    Project,
+}
+
+#[derive(Debug, Subcommand)]
+enum AgentCommand {
+    /// 主动注入当前 ghis 上下文并启动 coding agent
+    #[command(trailing_var_arg = true)]
+    Run {
+        #[arg(value_enum)]
+        target: AgentTarget,
+        #[arg(long)]
+        cwd: Option<PathBuf>,
+        #[arg(allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// 安装 Claude Hook 或检查 Codex launcher 能力
+    Setup {
+        #[arg(value_enum)]
+        target: AgentTarget,
+        #[arg(long, value_enum, default_value_t = AgentScope::User)]
+        scope: AgentScope,
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long)]
+        yes: bool,
+    },
+    /// 移除 ghis 管理的 Claude Hook
+    Uninstall {
+        #[arg(value_enum)]
+        target: AgentTarget,
+        #[arg(long, value_enum, default_value_t = AgentScope::User)]
+        scope: AgentScope,
+        #[arg(long)]
+        project: Option<PathBuf>,
+    },
+    /// 检查 agent CLI 与上下文集成状态
+    Status {
+        #[arg(value_enum)]
+        target: AgentTarget,
+        #[arg(long, value_enum, default_value_t = AgentScope::User)]
+        scope: AgentScope,
+        #[arg(long)]
+        project: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    /// Claude Code Hook 内部入口
+    #[command(hide = true)]
+    Hook {
+        #[arg(value_enum)]
+        target: AgentTarget,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -315,6 +425,9 @@ fn run(cli: Cli) -> app::Result<i32> {
     match command {
         Commands::Tui => run_tui(cli.config.as_deref(), cli.profile.as_deref()),
         Commands::Status(args) => status(cli.config.as_deref(), cli.profile.as_deref(), args),
+        Commands::Context(args) => {
+            agent_context(cli.config.as_deref(), cli.profile.as_deref(), args)
+        }
         Commands::Discover(args) => discover(cli.config.as_deref(), args.json),
         Commands::Profile { command } => profile_command(cli.config.as_deref(), command),
         Commands::Use { profile, repo } => {
@@ -330,6 +443,10 @@ fn run(cli: Cli) -> app::Result<i32> {
             args.json,
             args.check_github_signing_key,
         ),
+        Commands::Check(args) => check(cli.config.as_deref(), cli.profile.as_deref(), args),
+        Commands::Agent { command } => {
+            agent_command(cli.config.as_deref(), cli.profile.as_deref(), command)
+        }
         Commands::Setup(args) => setup(args),
         Commands::Uninstall => uninstall(),
         Commands::Init {
@@ -373,6 +490,179 @@ fn run(cli: Cli) -> app::Result<i32> {
             hook: hook_name, ..
         } => hook(cli.config.as_deref(), cli.profile.as_deref(), &hook_name),
     }
+}
+
+fn agent_command(
+    path: Option<&Path>,
+    explicit: Option<&str>,
+    command: AgentCommand,
+) -> app::Result<i32> {
+    match command {
+        AgentCommand::Run { target, cwd, args } => {
+            let cwd = cwd.unwrap_or(std::env::current_dir()?);
+            let context = AgentContext::from_app(&context(path, explicit, &cwd)?);
+            let paths = ConfigPaths::discover()?;
+            let shim_dir = paths.cache_dir.join("agent-shims");
+            let binary = PathBuf::from(agent_binary());
+            ghis::agent::prepare_session_shims(&shim_dir, &binary)?;
+            let spec = match target {
+                AgentTarget::Claude => {
+                    ghis::agent::claude::run_spec(&context, "claude", args, &cwd)
+                }
+                AgentTarget::Codex => ghis::agent::codex::run_spec(&context, "codex", args, &cwd),
+            }
+            .map_err(|error| app::AppError::Message(error.to_string()))?;
+            let spec = ghis::agent::prepend_path(spec, &shim_dir)?;
+            ghis::agent::launch(&ghis::process::SystemCommandRunner::new(), &spec)
+                .map_err(|error| app::AppError::Message(error.to_string()))
+        }
+        AgentCommand::Hook {
+            target: AgentTarget::Claude,
+        } => {
+            let cwd = std::env::current_dir()?;
+            let context = AgentContext::from_app(&context(path, explicit, &cwd)?);
+            let output = ghis::agent::claude::handle_hook(&context, io::stdin())
+                .map_err(|error| app::AppError::Message(error.to_string()))?;
+            ghis::agent::claude::write_hook_output(&output, io::stdout())
+                .map_err(|error| app::AppError::Message(error.to_string()))?;
+            Ok(0)
+        }
+        AgentCommand::Hook {
+            target: AgentTarget::Codex,
+        } => Err(app::AppError::Message(
+            "Codex 没有 Claude Hook 兼容入口；请使用 `ghis agent run codex`".into(),
+        )),
+        AgentCommand::Setup {
+            target: AgentTarget::Claude,
+            scope,
+            project,
+            yes,
+        } => {
+            let path = claude_settings_path(scope, project)?;
+            if !yes && !io::stdin().is_terminal() {
+                return Err(app::AppError::Message(
+                    "非交互环境请明确使用 `ghis agent setup claude --yes`".into(),
+                ));
+            }
+            let changed =
+                ghis::agent::claude::setup_settings(&path, Path::new(&agent_binary()), None)
+                    .map_err(|error| app::AppError::Message(error.to_string()))?;
+            println!(
+                "Claude Code Hook {}：{}",
+                if changed { "已安装" } else { "无需更新" },
+                path.display()
+            );
+            Ok(0)
+        }
+        AgentCommand::Setup {
+            target: AgentTarget::Codex,
+            ..
+        } => {
+            if !tool_status("codex", &["--version"]).available {
+                return Err(app::AppError::Message("未找到 Codex CLI".into()));
+            }
+            println!(
+                "Codex 使用 `ghis agent run codex` 在启动时注入 developer instructions；未修改 MCP、skill 或项目指令文件。\n"
+            );
+            Ok(0)
+        }
+        AgentCommand::Uninstall {
+            target: AgentTarget::Claude,
+            scope,
+            project,
+        } => {
+            let path = claude_settings_path(scope, project)?;
+            let changed = ghis::agent::claude::uninstall_settings(&path)
+                .map_err(|error| app::AppError::Message(error.to_string()))?;
+            println!(
+                "Claude Code Hook {}：{}",
+                if changed { "已移除" } else { "未发现" },
+                path.display()
+            );
+            Ok(0)
+        }
+        AgentCommand::Uninstall {
+            target: AgentTarget::Codex,
+            ..
+        } => {
+            println!("Codex 没有 ghis 管理的持久文件；无需卸载。\n");
+            Ok(0)
+        }
+        AgentCommand::Status {
+            target,
+            scope,
+            project,
+            json,
+        } => {
+            let available = match target {
+                AgentTarget::Claude => tool_status("claude", &["--version"]),
+                AgentTarget::Codex => tool_status("codex", &["--version"]),
+            };
+            let settings = if matches!(target, AgentTarget::Claude) {
+                Some(ghis::agent::claude::settings_status(&claude_settings_path(
+                    scope, project,
+                )?))
+            } else {
+                None
+            };
+            if json {
+                let value = serde_json::json!({
+                    "target": match target { AgentTarget::Claude => "claude", AgentTarget::Codex => "codex" },
+                    "available": available.available,
+                    "version": available.version,
+                    "settings": settings.map(|result| result.map(|item| serde_json::json!({
+                        "installed": item.installed(),
+                        "session_start": item.session_start,
+                        "user_prompt_submit": item.user_prompt_submit,
+                        "subagent_start": item.subagent_start,
+                    }))).transpose().map_err(|error| app::AppError::Message(error.to_string()))?,
+                });
+                print_json(&value)?;
+            } else {
+                println!(
+                    "{}：{}",
+                    match target {
+                        AgentTarget::Claude => "Claude Code",
+                        AgentTarget::Codex => "Codex",
+                    },
+                    tool_text(&available)
+                );
+                if let Some(settings) = settings {
+                    println!(
+                        "Hook：{}",
+                        if settings
+                            .map_err(|error| app::AppError::Message(error.to_string()))?
+                            .installed()
+                        {
+                            "已安装"
+                        } else {
+                            "未安装"
+                        }
+                    );
+                }
+            }
+            Ok(0)
+        }
+    }
+}
+
+fn claude_settings_path(scope: AgentScope, project: Option<PathBuf>) -> app::Result<PathBuf> {
+    match scope {
+        AgentScope::Project => Ok(project
+            .unwrap_or(std::env::current_dir()?)
+            .join(".claude/settings.local.json")),
+        AgentScope::User => {
+            let home = std::env::var_os("HOME")
+                .ok_or_else(|| app::AppError::Message("HOME 未设置".into()))?;
+            Ok(PathBuf::from(home).join(".claude/settings.json"))
+        }
+    }
+}
+fn agent_binary() -> String {
+    std::env::current_exe()
+        .ok()
+        .and_then(|path| path.into_os_string().into_string().ok())
+        .unwrap_or_else(|| "ghis".into())
 }
 
 fn load_config(path: Option<&Path>) -> app::Result<(ConfigPaths, Config)> {
@@ -419,6 +709,33 @@ fn status(path: Option<&Path>, explicit: Option<&str>, args: StatusArgs) -> app:
             eprintln!("警告：{warning}");
         }
     }
+    Ok(0)
+}
+
+fn agent_context(
+    path: Option<&Path>,
+    explicit: Option<&str>,
+    args: ContextArgs,
+) -> app::Result<i32> {
+    let cwd = args.cwd.unwrap_or(std::env::current_dir()?);
+    let context = context(path, explicit, cwd)?;
+    let context = AgentContext::from_app(&context);
+    if args.require_resolved {
+        context
+            .require_resolved()
+            .map_err(|error| app::AppError::Message(error.to_string()))?;
+    }
+    let format = match args.format {
+        ContextFormatArg::Json => AgentContextFormat::Json,
+        ContextFormatArg::Claude => AgentContextFormat::Claude,
+        ContextFormatArg::Codex => AgentContextFormat::Codex,
+    };
+    println!(
+        "{}",
+        context
+            .render(format)
+            .map_err(|error| app::AppError::Message(error.to_string()))?
+    );
     Ok(0)
 }
 
@@ -1000,6 +1317,8 @@ struct DoctorReport {
     signing_program: Option<DoctorSigningProgram>,
     github_signing_key: Option<DoctorGithubSigningKey>,
     git_config: diagnostics::GitConfigReport,
+    checks: Vec<diagnostics::DiagnosticCheck>,
+    repairs: Vec<diagnostics::RepairAction>,
     warnings: Vec<String>,
 }
 
@@ -1247,12 +1566,26 @@ fn doctor(
         local_signing_key_error.as_deref(),
         &mut warnings,
     );
+    let git_status = tool_status("git", &["--version"]);
+    let gh_status = tool_status("gh", &["--version"]);
+    let zsh_status = tool_status("zsh", &["--version"]);
+    let checks = build_doctor_checks(
+        &ctx,
+        &shell_integration,
+        &git_status,
+        &gh_status,
+        &zsh_status,
+        credential_available,
+        ssh_agent.as_ref(),
+        &git_config,
+    );
+    let repairs = collect_repairs(&checks, &git_config);
 
     let report = DoctorReport {
         schema_version: ghis::SCHEMA_VERSION,
-        git: tool_status("git", &["--version"]),
-        gh: tool_status("gh", &["--version"]),
-        zsh: tool_status("zsh", &["--version"]),
+        git: git_status,
+        gh: gh_status,
+        zsh: zsh_status,
         shell_integration,
         accounts: discovery
             .as_ref()
@@ -1277,6 +1610,8 @@ fn doctor(
         signing_program,
         github_signing_key,
         git_config,
+        checks,
+        repairs,
         warnings,
     };
     if json {
@@ -1364,11 +1699,214 @@ fn doctor(
         for item in &report.git_config.diagnostics {
             println!("{}", diagnostics::render_row(item));
         }
+        if !report.repairs.is_empty() {
+            println!("修复建议:");
+            for repair in &report.repairs {
+                println!(
+                    "  [{}] {}{}",
+                    repair.kind.label(),
+                    repair.command,
+                    if repair.confirmation {
+                        "（执行前确认）"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        }
         for warning in &report.warnings {
             eprintln!("警告：{warning}");
         }
     }
     Ok(0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_doctor_checks(
+    ctx: &AppContext,
+    shell: &DoctorShellIntegration,
+    git: &ToolStatus,
+    gh: &ToolStatus,
+    zsh: &ToolStatus,
+    credential_available: Option<bool>,
+    ssh_agent: Option<&DoctorAgent>,
+    git_config: &diagnostics::GitConfigReport,
+) -> Vec<diagnostics::DiagnosticCheck> {
+    use diagnostics::{DiagnosticCheck, DiagnosticCode, RepairAction, Severity};
+    let mut checks = Vec::new();
+    for (name, status) in [("git", git), ("gh", gh), ("zsh", zsh)] {
+        checks.push(DiagnosticCheck::new(
+            match name {
+                "gh" => DiagnosticCode::GhAuth,
+                "zsh" => DiagnosticCode::ShellIntegration,
+                _ => DiagnosticCode::GlobalGitConfig,
+            },
+            if status.available {
+                Severity::Info
+            } else {
+                Severity::Error
+            },
+            format!(
+                "{name} {}",
+                if status.available {
+                    "可用"
+                } else {
+                    "不可用"
+                }
+            ),
+            None,
+        ));
+    }
+    checks.push(DiagnosticCheck::new(
+        DiagnosticCode::ShellIntegration,
+        if shell.wrapper_loaded {
+            Severity::Info
+        } else {
+            Severity::Warning
+        },
+        shell.advice.clone(),
+        (!shell.wrapper_loaded).then(|| RepairAction::confirmation("ghis setup")),
+    ));
+    if credential_available == Some(false) {
+        let command = ctx.profile.as_ref().map_or_else(
+            || "gh auth login".to_string(),
+            |profile| format!("gh auth login --hostname {}", profile.host),
+        );
+        checks.push(DiagnosticCheck::new(
+            DiagnosticCode::GhAuth,
+            Severity::Error,
+            "当前 Profile 的 GitHub 凭据不可用",
+            Some(RepairAction::manual(command)),
+        ));
+    }
+    if matches!(
+        ctx.resolution.source,
+        ResolutionSource::InvalidRepositoryBinding
+    ) {
+        checks.push(DiagnosticCheck::new(
+            DiagnosticCode::InvalidBinding,
+            Severity::Error,
+            "仓库绑定的 Profile 已不存在；必须选择新的 Profile 或解绑",
+            Some(RepairAction::confirmation(
+                "ghis use <profile>  # 或 ghis unbind",
+            )),
+        ));
+    }
+    if ssh_agent.is_some_and(|agent| !agent.available) {
+        checks.push(DiagnosticCheck::new(
+            DiagnosticCode::SshKey,
+            Severity::Error,
+            "当前 Profile 所需的 SSH Agent/key 不可用",
+            Some(RepairAction::manual("ssh-add -L")),
+        ));
+    }
+    if !git_config.diagnostics.is_empty() {
+        checks.push(DiagnosticCheck::new(
+            DiagnosticCode::GlobalGitConfig,
+            if git_config.errors > 0 {
+                Severity::Error
+            } else {
+                Severity::Warning
+            },
+            diagnostics::summary_line(git_config),
+            Some(RepairAction::manual(
+                "git config --show-origin --show-scope --list",
+            )),
+        ));
+    }
+    checks.push(DiagnosticCheck::new(
+        DiagnosticCode::GlobalGitConfig,
+        Severity::Info,
+        "可安全重建 ghis fragment 和已登记仓库配置",
+        Some(RepairAction::automatic("ghis sync")),
+    ));
+    checks
+}
+
+fn collect_repairs(
+    checks: &[diagnostics::DiagnosticCheck],
+    report: &diagnostics::GitConfigReport,
+) -> Vec<diagnostics::RepairAction> {
+    let mut seen = BTreeSet::new();
+    checks
+        .iter()
+        .filter_map(|check| check.repair.clone())
+        .chain(
+            report
+                .diagnostics
+                .iter()
+                .filter_map(|item| item.repair.clone()),
+        )
+        .filter(|repair| seen.insert((repair.kind as u8, repair.command.clone())))
+        .collect()
+}
+
+#[derive(Serialize)]
+struct CheckReport {
+    schema_version: u32,
+    operation: CheckOperation,
+    checks: Vec<diagnostics::DiagnosticCheck>,
+    repairs: Vec<diagnostics::RepairAction>,
+}
+
+fn check(path: Option<&Path>, explicit: Option<&str>, args: CheckArgs) -> app::Result<i32> {
+    let ctx = context(path, explicit, std::env::current_dir()?)?;
+    let cwd = ctx
+        .repository
+        .as_ref()
+        .map_or(std::env::current_dir()?, |repo| {
+            repo.command_dir().to_path_buf()
+        });
+    let git_config = diagnostics::scan_git_config(
+        &cwd,
+        ctx.profile.as_ref(),
+        ctx.remote.as_ref(),
+        ctx.identities.as_ref(),
+    )?;
+    let shell = doctor_shell_integration(&ctx);
+    let checks = build_doctor_checks(
+        &ctx,
+        &shell,
+        &tool_status("git", &["--version"]),
+        &tool_status("gh", &["--version"]),
+        &tool_status("zsh", &["--version"]),
+        None,
+        None,
+        &git_config,
+    );
+    let repairs = collect_repairs(&checks, &git_config);
+    let report = CheckReport {
+        schema_version: ghis::SCHEMA_VERSION,
+        operation: args.operation,
+        checks,
+        repairs,
+    };
+    if args.json {
+        print_json(&report)?;
+    } else {
+        for check in &report.checks {
+            println!(
+                "{}\t{:?}\t{}",
+                check.severity.label(),
+                check.code,
+                check.summary
+            );
+        }
+        for repair in &report.repairs {
+            println!("[{}]\t{}", repair.kind.label(), repair.command);
+        }
+    }
+    Ok(
+        if report
+            .checks
+            .iter()
+            .any(|check| check.severity == diagnostics::Severity::Error)
+        {
+            1
+        } else {
+            0
+        },
+    )
 }
 
 fn doctor_shell_integration(ctx: &AppContext) -> DoctorShellIntegration {
@@ -1461,25 +1999,23 @@ fn classify_shell_integration(
     setup_installed: bool,
     repository_bound: bool,
 ) -> DoctorShellIntegrationState {
-    if health == shell::IntegrationHealth::Healthy {
-        DoctorShellIntegrationState::WrapperLoaded
-    } else if health == shell::IntegrationHealth::Incomplete {
-        DoctorShellIntegrationState::WrapperIncomplete
-    } else if setup_installed {
-        DoctorShellIntegrationState::InstalledNotLoaded
-    } else if repository_bound {
-        DoctorShellIntegrationState::RepositoryOnly
-    } else {
-        DoctorShellIntegrationState::NotIntegrated
+    match health {
+        shell::IntegrationHealth::Healthy => DoctorShellIntegrationState::WrapperLoaded,
+        shell::IntegrationHealth::Incomplete => DoctorShellIntegrationState::WrapperIncomplete,
+        shell::IntegrationHealth::NotLoaded if setup_installed => {
+            DoctorShellIntegrationState::InstalledNotLoaded
+        }
+        shell::IntegrationHealth::NotLoaded if repository_bound => {
+            DoctorShellIntegrationState::RepositoryOnly
+        }
+        shell::IntegrationHealth::NotLoaded => DoctorShellIntegrationState::NotIntegrated,
     }
 }
 
 fn doctor_shell_integration_text(state: DoctorShellIntegrationState) -> &'static str {
     match state {
         DoctorShellIntegrationState::WrapperLoaded => "当前 shell 已完整加载",
-        DoctorShellIntegrationState::WrapperIncomplete => {
-            "当前 shell marker 存在，但函数依赖不完整"
-        }
+        DoctorShellIntegrationState::WrapperIncomplete => "当前 shell wrapper 依赖不完整",
         DoctorShellIntegrationState::InstalledNotLoaded => "已安装，但当前 shell 未加载",
         DoctorShellIntegrationState::RepositoryOnly => "仅检测到仓库本地 ghis 配置",
         DoctorShellIntegrationState::NotIntegrated => "未安装或未接入",
@@ -1492,7 +2028,7 @@ fn doctor_shell_integration_advice(state: DoctorShellIntegrationState) -> &'stat
             "普通 git/gh 会经过 ghis；command git、绝对路径或 GHIS_BYPASS=1 仍可明确绕过 wrapper"
         }
         DoctorShellIntegrationState::WrapperIncomplete => {
-            "当前 shell 只继承了旧版/不完整 marker；重新 source init.zsh、运行 exec zsh 或新开终端"
+            "GHIS marker 存在，但函数依赖不完整；运行 `source ${XDG_CONFIG_HOME:-$HOME/.config}/ghis/init.zsh` 或重新启动 zsh"
         }
         DoctorShellIntegrationState::InstalledNotLoaded => {
             "运行 exec zsh 或新开终端后再试；ghis 不会替换当前 shell"
@@ -1996,6 +2532,19 @@ impl TuiWorkers {
         })
     }
 
+    fn repair_sync(
+        &self,
+        path: Option<PathBuf>,
+        explicit: Option<String>,
+        cwd: PathBuf,
+    ) -> io::Result<()> {
+        self.send(TuiWorkerJob::RepairSync {
+            path,
+            explicit,
+            cwd,
+        })
+    }
+
     fn send(&self, job: TuiWorkerJob) -> io::Result<()> {
         self.jobs
             .send(job)
@@ -2026,6 +2575,11 @@ enum TuiWorkerJob {
         cwd: PathBuf,
     },
     Unbind {
+        path: Option<PathBuf>,
+        explicit: Option<String>,
+        cwd: PathBuf,
+    },
+    RepairSync {
         path: Option<PathBuf>,
         explicit: Option<String>,
         cwd: PathBuf,
@@ -2106,6 +2660,20 @@ fn run_tui_worker(receiver: Receiver<TuiWorkerJob>, sender: Sender<TuiWorkerResu
                     result,
                 }
             }
+            TuiWorkerJob::RepairSync {
+                path,
+                explicit,
+                cwd,
+            } => {
+                let result = (|| {
+                    let (paths, config) = load_config(path.as_deref())?;
+                    app::sync_fragments(&paths, &config)?;
+                    let config = Config::load(&paths.config_file)?;
+                    app::sync_registered_repositories(&paths, &config);
+                    build_tui_local_snapshot(path.as_deref(), explicit.as_deref(), &cwd)
+                })();
+                TuiWorkerResult::RepairSync(result)
+            }
         };
         if sender.send(result).is_err() {
             break;
@@ -2136,6 +2704,7 @@ enum TuiWorkerResult {
         operation: TuiRepositoryMutation,
         result: app::Result<TuiLocalSnapshot>,
     },
+    RepairSync(app::Result<TuiLocalSnapshot>),
 }
 
 #[derive(Debug)]
@@ -2167,6 +2736,7 @@ enum TuiPending {
     EditRule(String),
     DeleteProfile(String),
     DeleteRule(String),
+    RepairSync,
     LoadingDiscoveredProfile {
         host: String,
         login: String,
@@ -2816,6 +3386,23 @@ fn handle_tui_action(
             schedule_tui_local_refresh(state, active_workers, action_context)?;
             state.status = "设置已更新".into();
         }
+        tui::Action::Repair | tui::Action::RepairAll if state.view == tui::View::Diagnostics => {
+            let selected_is_sync = state
+                .selected_item()
+                .is_some_and(|item| item.contains("ghis sync"));
+            if action == tui::Action::Repair && !selected_is_sync {
+                state.status =
+                    "所选诊断仅提供手动命令；不会自动登录、删除 Git 配置或上传 SSH key".into();
+                return Ok(());
+            }
+            *pending = Some(TuiPending::RepairSync);
+            state.set_input("运行安全修复 `ghis sync`（仅重建 ghis 管理配置）");
+            state.details = vec![
+                "自动修复仅包含 sync".into(),
+                "不会登录 gh、删除全局 Git 配置或上传 SSH key".into(),
+            ];
+            state.mode = tui::Mode::Confirm;
+        }
         tui::Action::Add if state.view == tui::View::Profiles => {
             let mut wizard = TuiProfileWizard::new("github.com", "", "", false);
             wizard.id = "新身份".into();
@@ -2952,6 +3539,16 @@ fn handle_tui_action(
                 } else {
                     format!("已创建身份配置 `{}`", wizard.id)
                 };
+            }
+            Some(TuiPending::RepairSync) => {
+                workers.repair_sync(
+                    path.map(Path::to_path_buf),
+                    explicit.map(str::to_owned),
+                    cwd.to_path_buf(),
+                )?;
+                *active_workers += 1;
+                state.loading = true;
+                state.status = "安全修复已在后台启动".into();
             }
             _ => {}
         },
@@ -3613,9 +4210,7 @@ fn receive_tui_worker_results(
                 Ok(snapshot) => {
                     apply_tui_local_snapshot(state, snapshot, discovery.as_ref());
                     state.status = match operation {
-                        TuiRepositoryMutation::Bind(id) => {
-                            format!("已绑定身份配置 `{id}`")
-                        }
+                        TuiRepositoryMutation::Bind(id) => format!("已绑定身份配置 `{id}`"),
                         TuiRepositoryMutation::Unbind => "已解除仓库绑定".into(),
                     };
                     if !state.loading {
@@ -3629,9 +4224,17 @@ fn receive_tui_worker_results(
                     };
                     state.status = format!("{action}后台任务失败：{error}");
                     state.warnings.push(format!("{action}失败：{error}"));
-                    if !state.loading {
-                        state.details.clear();
-                    }
+                }
+            },
+            TuiWorkerResult::RepairSync(result) => match result {
+                Ok(snapshot) => {
+                    apply_tui_local_snapshot(state, snapshot, discovery.as_ref());
+                    state.status = "安全修复完成：已同步 ghis fragment 和仓库配置".into();
+                    state.details.clear();
+                }
+                Err(error) => {
+                    state.status = format!("安全修复失败：{error}");
+                    state.warnings.push(format!("安全修复失败：{error}"));
                 }
             },
         }
@@ -4133,23 +4736,23 @@ mod tests {
     #[test]
     fn shell_integration_state_prefers_loaded_then_installed_then_repository() {
         assert_eq!(
-            classify_shell_integration(shell::IntegrationHealth::Healthy, true, true,),
+            classify_shell_integration(shell::IntegrationHealth::Healthy, true, true),
             DoctorShellIntegrationState::WrapperLoaded
         );
         assert_eq!(
-            classify_shell_integration(shell::IntegrationHealth::Incomplete, true, true,),
+            classify_shell_integration(shell::IntegrationHealth::Incomplete, true, true),
             DoctorShellIntegrationState::WrapperIncomplete
         );
         assert_eq!(
-            classify_shell_integration(shell::IntegrationHealth::NotLoaded, true, true,),
+            classify_shell_integration(shell::IntegrationHealth::NotLoaded, true, true),
             DoctorShellIntegrationState::InstalledNotLoaded
         );
         assert_eq!(
-            classify_shell_integration(shell::IntegrationHealth::NotLoaded, false, true,),
+            classify_shell_integration(shell::IntegrationHealth::NotLoaded, false, true),
             DoctorShellIntegrationState::RepositoryOnly
         );
         assert_eq!(
-            classify_shell_integration(shell::IntegrationHealth::NotLoaded, false, false,),
+            classify_shell_integration(shell::IntegrationHealth::NotLoaded, false, false),
             DoctorShellIntegrationState::NotIntegrated
         );
     }
