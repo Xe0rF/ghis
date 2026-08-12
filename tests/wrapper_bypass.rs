@@ -177,7 +177,7 @@ git_email = "work@example.test"
     .expect("init script");
 
     // A loaded wrapper resolves the default Profile for an otherwise unbound
-    // repository and prints its identity before the commit.
+    // repository and prints its Profile before the commit.
     let output = run_wrapped(
         &binary,
         &init_file,
@@ -195,7 +195,10 @@ git_email = "work@example.test"
         identity(&git, &plain, &temp, &global),
         "Work Identity|work@example.test"
     );
-    assert!(String::from_utf8_lossy(&output.stderr).contains("Work Identity <work@example.test>"));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("ghis: profile=work"));
+    assert!(!stderr.contains("Work Identity"));
+    assert!(!stderr.contains("work@example.test"));
 
     // GHIS_BYPASS skips the shell wrapper for this invocation, so the same
     // unbound repository falls back to Git's global identity.
@@ -212,7 +215,7 @@ git_email = "work@example.test"
         identity(&git, &plain, &temp, &global),
         "Global Identity|global@example.test"
     );
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("Work Identity <work@example.test>"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("ghis: profile=work"));
 
     // `command git` and an absolute path bypass the zsh function too.
     let output = run_wrapped(

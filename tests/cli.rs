@@ -1249,7 +1249,7 @@ exit 42
         hook.assert()
             .success()
             .stderr(predicate::str::contains("profile=work"))
-            .stderr(predicate::str::contains("Work Identity"))
+            .stderr(predicate::str::contains("Work Identity").not())
             .stderr(predicate::str::contains("Alice").not());
     }
 }
@@ -1458,9 +1458,8 @@ git_email = "work@example.test"
         .assert()
         .success()
         .stderr(predicate::str::contains("profile=work"))
-        .stderr(predicate::str::contains(
-            "Work Identity <work@example.test>",
-        ));
+        .stderr(predicate::str::contains("Work Identity").not())
+        .stderr(predicate::str::contains("work@example.test").not());
 
     let mut alias_author = isolated_ghis_command();
     alias_author

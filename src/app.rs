@@ -188,19 +188,36 @@ impl AppContext {
         )
     }
 
-    /// Add the identities resolved by Git itself for a hook invocation.
+    /// Keep automatic wrapper output compact. Detailed identity information is
+    /// available through `ghis status` and should not accompany every command.
+    pub fn operation_banner(&self) -> String {
+        match self.profile_id() {
+            Some(id) => format!("ghis: profile={id}"),
+            None => "ghis: profile=未解析".into(),
+        }
+    }
+
+    /// Add Git-resolved identities only when a hook detects a mismatch.
     ///
     /// The wrapper can inspect its own `-c` and `--author` arguments before
     /// launching Git. A hook may also be reached through an absolute-path Git
     /// invocation, so it reports `git var` results instead of assuming that
     /// the Profile fragment won every config/environment override.
     pub fn hook_identity_banner(&self) -> String {
-        let banner = self.identity_banner();
-        let Some(identities) = self.identities.as_ref() else {
+        let banner = self.operation_banner();
+        let (Some(profile), Some(identities)) = (self.profile.as_ref(), self.identities.as_ref())
+        else {
             return banner;
         };
+        let check = identities.check(git::IdentityExpectation {
+            name: &profile.git_name,
+            email: &profile.git_email,
+        });
+        if check.author_matches && check.committer_matches {
+            return banner;
+        }
         format!(
-            "{banner} 实际作者={} <{}> 实际提交者={} <{}>",
+            "{banner}\nghis: 警告：Git 实际身份与 Profile 不一致；实际作者={} <{}>；实际提交者={} <{}>",
             identities.author.name,
             identities.author.email,
             identities.committer.name,
@@ -798,7 +815,7 @@ pub fn run_git(
     let banner = should_display_git_banner(&ctx, &operation);
     let identity_override = identity_override_warning(&ctx, args, &operation);
     if banner {
-        eprintln!("{}", ctx.identity_banner());
+        eprintln!("{}", ctx.operation_banner());
     }
     if let Some(warning) = identity_override.as_deref() {
         eprintln!("{warning}");
@@ -1080,7 +1097,7 @@ pub fn run_gh(
         ));
     }
     if should_display_banner(&ctx, "gh", args) {
-        eprintln!("{}", ctx.identity_banner());
+        eprintln!("{}", ctx.operation_banner());
     }
     let Some(profile) = ctx.profile.as_ref() else {
         if !ctx.warnings.is_empty() {
