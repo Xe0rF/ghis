@@ -269,7 +269,7 @@ fn run(cli: Cli) -> app::Result<i32> {
     match command {
         Commands::Tui => run_tui(cli.config.as_deref(), cli.profile.as_deref()),
         Commands::Status(args) => status(cli.config.as_deref(), cli.profile.as_deref(), args),
-        Commands::Discover(args) => discover(args.json),
+        Commands::Discover(args) => discover(cli.config.as_deref(), args.json),
         Commands::Profile { command } => profile_command(cli.config.as_deref(), command),
         Commands::Use { profile, repo } => {
             use_profile(cli.config.as_deref(), &profile, repo.as_deref())
@@ -371,9 +371,14 @@ fn status(path: Option<&Path>, explicit: Option<&str>, args: StatusArgs) -> app:
     Ok(0)
 }
 
-fn discover(json: bool) -> app::Result<i32> {
+fn discover(path: Option<&Path>, json: bool) -> app::Result<i32> {
     let discovery = github::discover_accounts(None)?;
-    let cache_warning = match ConfigPaths::discover() {
+    let cache_warning = match ConfigPaths::discover().and_then(|mut paths| {
+        if let Some(path) = path {
+            paths.set_config_file(path)?;
+        }
+        Ok(paths)
+    }) {
         Ok(paths) => cache_discovery(&paths, &discovery),
         Err(error) => Some(format!("无法确定 gh 账号缓存位置：{error}")),
     };

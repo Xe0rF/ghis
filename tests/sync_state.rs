@@ -1,6 +1,7 @@
 #![cfg(unix)]
 
 use assert_cmd::Command as AssertCommand;
+use ghis::config::ConfigPaths;
 use predicates::prelude::*;
 use serde_json::Value;
 use std::fs;
@@ -13,6 +14,12 @@ fn git(directory: &Path, args: &[&str]) {
         .args(args)
         .current_dir(directory)
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env_remove("GHIS_CONFIG")
+        .env_remove("GHIS_PROFILE")
+        .env_remove("GHIS_BANNER_SHOWN")
+        .env_remove("GHIS_WRAPPER_ACTIVE")
+        .env_remove("GHIS_BYPASS")
+        .env_remove("GHIS_DISABLE_CHPWD")
         .status()
         .expect("run git");
     assert!(status.success(), "git {args:?}");
@@ -38,6 +45,12 @@ git_email = "{email}"
 
 fn common_environment(command: &mut AssertCommand, root: &Path) {
     command
+        .env_remove("GHIS_CONFIG")
+        .env_remove("GHIS_PROFILE")
+        .env_remove("GHIS_BANNER_SHOWN")
+        .env_remove("GHIS_WRAPPER_ACTIVE")
+        .env_remove("GHIS_BYPASS")
+        .env_remove("GHIS_DISABLE_CHPWD")
         .env("HOME", root.join("home"))
         .env("XDG_CONFIG_HOME", root.join("xdg-config"))
         .env("XDG_CACHE_HOME", root.join("xdg-cache"))
@@ -181,21 +194,42 @@ fn sync_repairs_registered_repositories_and_keeps_custom_configs_isolated() {
         .success()
         .stdout(predicate::str::contains("清理 1 条失效记录"));
 
-    let registry_path = root.join("xdg-state/ghis/repositories.json");
-    let registry: Value = serde_json::from_slice(&fs::read(&registry_path).unwrap()).unwrap();
+    let mut paths_a = ConfigPaths::from_bases(
+        root.join("xdg-config"),
+        root.join("xdg-cache"),
+        root.join("xdg-state"),
+    );
+    paths_a.set_config_file(&config_a).unwrap();
+    let mut paths_b = ConfigPaths::from_bases(
+        root.join("xdg-config"),
+        root.join("xdg-cache"),
+        root.join("xdg-state"),
+    );
+    paths_b.set_config_file(&config_b).unwrap();
+
+    let registry_path = &paths_a.repositories_file;
+    let registry: Value = serde_json::from_slice(&fs::read(registry_path).unwrap()).unwrap();
     let records = registry["repositories"].as_array().unwrap();
     assert_eq!(records.len(), 1);
     assert_eq!(records[0]["profile"], "alpha");
-    let raw = fs::read_to_string(&registry_path).unwrap();
+    let raw = fs::read_to_string(registry_path).unwrap();
     assert!(!raw.contains("beta@example.test"));
     assert!(!raw.to_ascii_lowercase().contains("token"));
     assert_eq!(
-        fs::metadata(&registry_path).unwrap().permissions().mode() & 0o777,
+        fs::metadata(registry_path).unwrap().permissions().mode() & 0o777,
         0o600
     );
 
-    let log_path = root.join("xdg-state/ghis/ghis.log");
-    let log = fs::read_to_string(&log_path).unwrap();
+    let beta_registry: Value =
+        serde_json::from_slice(&fs::read(&paths_b.repositories_file).unwrap()).unwrap();
+    assert_eq!(
+        beta_registry["repositories"].as_array().unwrap().len(),
+        0,
+        "清理 beta 记录不能影响 alpha 配置的 state"
+    );
+
+    let log_path = &paths_a.log_file;
+    let log = fs::read_to_string(log_path).unwrap();
     assert!(log.contains("sync-repair"));
     assert!(!log.contains("alpha@example.test"));
     assert!(!log.to_ascii_lowercase().contains("token"));

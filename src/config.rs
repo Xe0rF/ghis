@@ -28,9 +28,11 @@ pub struct ConfigPaths {
     pub config_dir: PathBuf,
     /// The TOML configuration file.
     pub config_file: PathBuf,
-    /// `${XDG_CACHE_HOME:-$HOME/.cache}/ghis`.
+    /// `${XDG_CACHE_HOME:-$HOME/.cache}/ghis` (or a config-specific namespace
+    /// below it when `--config` points at a custom file).
     pub cache_dir: PathBuf,
-    /// `${XDG_STATE_HOME:-$HOME/.local/state}/ghis`.
+    /// `${XDG_STATE_HOME:-$HOME/.local/state}/ghis` (or a config-specific
+    /// namespace below it for a custom `--config`).
     pub state_dir: PathBuf,
     /// Generated Git config fragments.
     pub fragments_dir: PathBuf,
@@ -94,7 +96,9 @@ impl ConfigPaths {
     }
 
     /// Select an explicit config file and make its path independent of later
-    /// working-directory changes by generated Git helpers and hooks.
+    /// working-directory changes by generated Git helpers and hooks. Custom
+    /// files also receive one stable namespace for fragments, cache, and
+    /// state, so multiple config files cannot share side-channel data.
     pub fn set_config_file(&mut self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
         let path = path.as_ref();
         self.config_file = std::path::absolute(path).map_err(|source| ConfigError::Io {
@@ -109,19 +113,57 @@ impl ConfigPaths {
                 }
             })?;
         let fragments = self.config_dir.join("fragments");
-        self.fragments_dir = if self.config_file == default_file {
-            fragments
+        let cache_base = config_namespace_base(&self.cache_dir);
+        let state_base = config_namespace_base(&self.state_dir);
+        if self.config_file == default_file {
+            self.fragments_dir = fragments;
+            self.cache_dir = cache_base;
+            self.state_dir = state_base;
         } else {
-            let digest = Sha256::digest(self.config_file.as_os_str().as_encoded_bytes());
-            let mut namespace = String::with_capacity(64);
-            for byte in digest {
-                use std::fmt::Write as _;
-                write!(&mut namespace, "{byte:02x}")
-                    .expect("writing a digest to a string cannot fail");
-            }
-            fragments.join(format!("config-{namespace}"))
-        };
+            let namespace = config_namespace(&self.config_file);
+            self.fragments_dir = fragments.join(&namespace);
+            self.cache_dir = cache_base.join(&namespace);
+            self.state_dir = state_base.join(&namespace);
+        }
+        self.log_file = self.state_dir.join("ghis.log");
+        self.repositories_file = self.state_dir.join("repositories.json");
         Ok(())
+    }
+}
+
+/// Return the stable directory name used for an explicit configuration file.
+///
+/// A custom `--config` must isolate every ghis-owned side channel: generated
+/// Git fragments, account discovery cache, and repository/audit state. Keep
+/// the namespace derived from the absolute path so two files with the same
+/// basename cannot share data.
+fn config_namespace(path: &Path) -> String {
+    let digest = Sha256::digest(path.as_os_str().as_encoded_bytes());
+    let mut namespace = String::with_capacity(7 + 64);
+    namespace.push_str("config-");
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut namespace, "{byte:02x}").expect("writing a digest to a string cannot fail");
+    }
+    namespace
+}
+
+/// Strip a namespace previously added by [`ConfigPaths::set_config_file`].
+/// This keeps repeated calls on one `ConfigPaths` value idempotent and lets a
+/// caller switch back from a custom file to the default XDG configuration.
+fn config_namespace_base(path: &Path) -> PathBuf {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return path.to_path_buf();
+    };
+    let Some(digest) = name.strip_prefix("config-") else {
+        return path.to_path_buf();
+    };
+    if digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        path.parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| path.to_path_buf())
+    } else {
+        path.to_path_buf()
     }
 }
 
@@ -1392,25 +1434,71 @@ priority = 1
     }
 
     #[test]
-    fn custom_config_files_have_stable_isolated_fragment_directories() {
+    fn custom_config_files_have_stable_isolated_xdg_directories() {
         let mut first = ConfigPaths::from_bases("/tmp/config", "/tmp/cache", "/tmp/state");
         let default_fragments = first.fragments_dir.clone();
+        let default_cache = first.cache_dir.clone();
+        let default_state = first.state_dir.clone();
         first.set_config_file("/tmp/identity-a.toml").unwrap();
         assert!(first.fragments_dir.starts_with(&default_fragments));
         assert_ne!(first.fragments_dir, default_fragments);
+        assert!(first.cache_dir.starts_with(&default_cache));
+        assert_ne!(first.cache_dir, default_cache);
+        assert!(first.state_dir.starts_with(&default_state));
+        assert_ne!(first.state_dir, default_state);
+        assert_eq!(first.fragments_dir.file_name(), first.cache_dir.file_name());
+        assert_eq!(first.fragments_dir.file_name(), first.state_dir.file_name());
+        assert_eq!(
+            first.log_file,
+            first.state_dir.join("ghis.log"),
+            "state files must follow the custom namespace"
+        );
+        assert_eq!(
+            first.repositories_file,
+            first.state_dir.join("repositories.json"),
+            "state files must follow the custom namespace"
+        );
 
         let mut same = ConfigPaths::from_bases("/tmp/config", "/tmp/cache", "/tmp/state");
         same.set_config_file("/tmp/identity-a.toml").unwrap();
         assert_eq!(same.fragments_dir, first.fragments_dir);
+        assert_eq!(same.cache_dir, first.cache_dir);
+        assert_eq!(same.state_dir, first.state_dir);
 
         let mut other = ConfigPaths::from_bases("/tmp/config", "/tmp/cache", "/tmp/state");
         other.set_config_file("/tmp/identity-b.toml").unwrap();
         assert_ne!(other.fragments_dir, first.fragments_dir);
+        assert_ne!(other.cache_dir, first.cache_dir);
+        assert_ne!(other.state_dir, first.state_dir);
 
         let mut default = ConfigPaths::from_bases("/tmp/config", "/tmp/cache", "/tmp/state");
         default
             .set_config_file("/tmp/config/ghis/config.toml")
             .unwrap();
         assert_eq!(default.fragments_dir, default_fragments);
+        assert_eq!(default.cache_dir, default_cache);
+        assert_eq!(default.state_dir, default_state);
+    }
+
+    #[test]
+    fn switching_config_files_on_one_paths_value_does_not_nest_namespaces() {
+        let mut paths = ConfigPaths::from_bases("/tmp/config", "/tmp/cache", "/tmp/state");
+        let base_cache = paths.cache_dir.clone();
+        let base_state = paths.state_dir.clone();
+
+        paths.set_config_file("/tmp/identity-a.toml").unwrap();
+        let first_cache = paths.cache_dir.clone();
+        let first_state = paths.state_dir.clone();
+        paths.set_config_file("/tmp/identity-b.toml").unwrap();
+        assert!(paths.cache_dir.starts_with(&base_cache));
+        assert!(paths.state_dir.starts_with(&base_state));
+        assert!(!paths.cache_dir.starts_with(&first_cache));
+        assert!(!paths.state_dir.starts_with(&first_state));
+
+        paths
+            .set_config_file("/tmp/config/ghis/config.toml")
+            .unwrap();
+        assert_eq!(paths.cache_dir, base_cache);
+        assert_eq!(paths.state_dir, base_state);
     }
 }

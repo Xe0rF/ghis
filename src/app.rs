@@ -834,8 +834,10 @@ pub fn run_git(
             .arg("-c")
             .arg(format!("{helper_key}={helper}"));
     }
-    if let Some(path) = config_path {
-        command = command.env("GHIS_CONFIG", path.as_os_str());
+    if config_path.is_some() {
+        // Pass the resolved absolute path so hooks and nested wrappers keep
+        // the same custom cache/state namespace after Git changes directory.
+        command = command.env("GHIS_CONFIG", ctx.paths.config_file.as_os_str());
     }
     command = command.args(args[policy_index..].iter().cloned());
     if let Some(ssh_command) = execution_policy.ssh_command {
@@ -1077,8 +1079,8 @@ pub fn run_gh(
         let mut command = CommandSpec::new("gh")
             .args(args.iter().cloned())
             .current_dir(cwd);
-        if let Some(path) = config_path {
-            command = command.env("GHIS_CONFIG", path.as_os_str());
+        if config_path.is_some() {
+            command = command.env("GHIS_CONFIG", ctx.paths.config_file.as_os_str());
         }
         return Ok(SystemCommandRunner::new()
             .run_passthrough(&command)?
@@ -1123,8 +1125,8 @@ pub fn run_gh(
     if let Some(repository) = target_policy.repository_environment {
         command = command.env("GH_REPO", repository);
     }
-    if let Some(path) = config_path {
-        command = command.env("GHIS_CONFIG", path.as_os_str());
+    if config_path.is_some() {
+        command = command.env("GHIS_CONFIG", ctx.paths.config_file.as_os_str());
     }
     if let Some(ssh_command) = ssh_command {
         command = apply_managed_ssh_environment(command, ssh_command);
