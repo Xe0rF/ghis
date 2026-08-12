@@ -1856,6 +1856,48 @@ fn profile_noreply_rejects_enterprise_hosts_without_contacting_gh() {
 }
 
 #[test]
+fn config_commands_list_and_update_behavior_with_short_keys() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+
+    let mut list = isolated_ghis_command();
+    list.args(["config", "list", "--json"]);
+    for (key, value) in xdg_environment(&temp) {
+        list.env(key, value);
+    }
+    let output = list.output().expect("list behavior settings");
+    assert!(output.status.success());
+    let settings: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(settings.as_array().unwrap().len(), 6);
+
+    let mut set = isolated_ghis_command();
+    set.args(["config", "set", "display-identity", "never"]);
+    for (key, value) in xdg_environment(&temp) {
+        set.env(key, value);
+    }
+    set.assert()
+        .success()
+        .stdout(predicate::str::contains("behavior.display_identity=never"));
+
+    let mut get = isolated_ghis_command();
+    get.args(["config", "get", "behavior.display-identity"]);
+    for (key, value) in xdg_environment(&temp) {
+        get.env(key, value);
+    }
+    get.assert().success().stdout("never\n");
+
+    let mut unknown = isolated_ghis_command();
+    unknown.args(["config", "get", "missing"]);
+    for (key, value) in xdg_environment(&temp) {
+        unknown.env(key, value);
+    }
+    unknown
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("可用值"));
+}
+
+#[test]
 fn discover_and_doctor_refresh_the_same_redacted_account_cache() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let fake_bin = temp.path().join("bin");

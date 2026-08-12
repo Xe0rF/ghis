@@ -270,8 +270,15 @@ struct RuleArgs {
 
 #[derive(Debug, Subcommand)]
 enum ConfigCommand {
-    Get { key: String },
-    Set { key: String, value: String },
+    /// 列出可读取和修改的 behavior 设置
+    List(JsonArgs),
+    Get {
+        key: String,
+    },
+    Set {
+        key: String,
+        value: String,
+    },
 }
 
 fn main() {
@@ -793,8 +800,19 @@ fn rule_from_args(args: RuleArgs) -> Rule {
 fn config_command(path: Option<&Path>, command: ConfigCommand) -> app::Result<i32> {
     let (paths, config) = load_config(path)?;
     match command {
+        ConfigCommand::List(args) => {
+            let settings = behavior_settings(&config);
+            if args.json {
+                print_json(&settings)?;
+            } else {
+                for (key, value) in settings {
+                    println!("{key}={value}");
+                }
+            }
+        }
         ConfigCommand::Get { key } => println!("{}", get_behavior(&config, &key)?),
         ConfigCommand::Set { key, value } => {
+            let key = normalize_behavior_key(&key)?;
             update_config(&paths, |config| set_behavior(config, &key, &value))?;
             println!("已设置 behavior.{key}={value}")
         }
@@ -803,7 +821,7 @@ fn config_command(path: Option<&Path>, command: ConfigCommand) -> app::Result<i3
 }
 
 fn get_behavior(config: &Config, key: &str) -> app::Result<String> {
-    Ok(match key.trim_start_matches("behavior.") {
+    Ok(match normalize_behavior_key(key)?.as_str() {
         "default_profile" => config.behavior.default_profile.clone().unwrap_or_default(),
         "auto_bind" => config.behavior.auto_bind.to_string(),
         "unresolved" => match config.behavior.unresolved {
@@ -823,15 +841,13 @@ fn get_behavior(config: &Config, key: &str) -> app::Result<String> {
             DisplayIdentity::Never => "never".into(),
         },
         other => {
-            return Err(app::AppError::Message(format!(
-                "不支持的 behavior 设置 `{other}`"
-            )));
+            return Err(unknown_behavior_key(other));
         }
     })
 }
 
 fn set_behavior(config: &mut Config, key: &str, value: &str) -> app::Result<()> {
-    match key.trim_start_matches("behavior.") {
+    match normalize_behavior_key(key)?.as_str() {
         "default_profile" => {
             config.behavior.default_profile =
                 (!value.is_empty() && value != "none").then(|| value.into())
@@ -880,12 +896,44 @@ fn set_behavior(config: &mut Config, key: &str, value: &str) -> app::Result<()> 
             }
         }
         other => {
-            return Err(app::AppError::Message(format!(
-                "该设置在 v1 中不可修改：`{other}`"
-            )));
+            return Err(unknown_behavior_key(other));
         }
     }
     Ok(())
+}
+
+fn behavior_settings(config: &Config) -> Vec<(&'static str, String)> {
+    KNOWN_BEHAVIOR_KEYS
+        .iter()
+        .map(|key| Ok((*key, get_behavior(config, key)?)))
+        .collect::<app::Result<Vec<_>>>()
+        .expect("known behavior settings must be readable")
+}
+
+const KNOWN_BEHAVIOR_KEYS: [&str; 6] = [
+    "default_profile",
+    "auto_bind",
+    "unresolved",
+    "credential_failure",
+    "ssh_unmanaged",
+    "display_identity",
+];
+
+fn normalize_behavior_key(key: &str) -> app::Result<String> {
+    let key = key.trim().trim_start_matches("behavior.");
+    let key = key.replace('-', "_");
+    if KNOWN_BEHAVIOR_KEYS.contains(&key.as_str()) {
+        Ok(key)
+    } else {
+        Err(unknown_behavior_key(&key))
+    }
+}
+
+fn unknown_behavior_key(key: &str) -> app::AppError {
+    app::AppError::Message(format!(
+        "不支持的 behavior 设置 `{key}`；可用值：{}",
+        KNOWN_BEHAVIOR_KEYS.join("、")
+    ))
 }
 
 fn parse_bool(value: &str) -> app::Result<bool> {
@@ -2943,6 +2991,32 @@ fn write_stdout(bytes: &[u8]) -> app::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn behavior_keys_accept_prefix_and_hyphen_aliases() {
+        assert_eq!(
+            normalize_behavior_key("behavior.auto-bind").unwrap(),
+            "auto_bind"
+        );
+        assert_eq!(
+            normalize_behavior_key("display-identity").unwrap(),
+            "display_identity"
+        );
+        let error = normalize_behavior_key("unknown").unwrap_err().to_string();
+        assert!(error.contains("可用值"));
+        assert!(error.contains("default_profile"));
+    }
+
+    #[test]
+    fn every_listed_behavior_setting_is_readable() {
+        let config = Config::default();
+        let settings = behavior_settings(&config);
+        assert_eq!(settings.len(), KNOWN_BEHAVIOR_KEYS.len());
+        assert_eq!(
+            settings.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
+            KNOWN_BEHAVIOR_KEYS
+        );
+    }
 
     fn account(host: &str, login: &str) -> github::GhAccount {
         github::GhAccount {
