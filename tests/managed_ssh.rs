@@ -32,6 +32,22 @@ fn xdg_environment(root: &Path) -> [(String, PathBuf); 4] {
     ]
 }
 
+fn apply_environment(command: &mut AssertCommand, root: &Path) {
+    for key in [
+        "GHIS_CONFIG",
+        "GHIS_PROFILE",
+        "GHIS_BANNER_SHOWN",
+        "GHIS_WRAPPER_ACTIVE",
+        "GHIS_BYPASS",
+        "GHIS_DISABLE_CHPWD",
+    ] {
+        command.env_remove(key);
+    }
+    for (key, value) in xdg_environment(root) {
+        command.env(key, value);
+    }
+}
+
 #[test]
 fn managed_ssh_push_overrides_inherited_git_ssh_environment() {
     let temporary = tempfile::tempdir().expect("temporary directory");
@@ -195,9 +211,7 @@ agent_socket = {agent_socket:?}
     ])
     .env("PATH", &path)
     .env("GIT_CONFIG_GLOBAL", "/dev/null");
-    for (key, value) in xdg_environment(root) {
-        bind.env(key, value);
-    }
+    apply_environment(&mut bind, root);
     bind.assert().success();
 
     let inherited_command = format!("{} --wrong-identity", bad_ssh.display());
@@ -220,9 +234,7 @@ agent_socket = {agent_socket:?}
         .env("GIT_SSH", &bad_ssh)
         .env("GIT_SSH_COMMAND", &inherited_command)
         .env("GIT_SSH_VARIANT", "plink");
-    for (key, value) in xdg_environment(root) {
-        push.env(key, value);
-    }
+    apply_environment(&mut push, root);
     push.assert().failure();
 
     assert!(ssh_trace.is_file(), "managed ssh command did not run");
@@ -279,9 +291,7 @@ agent_socket = {agent_socket:?}
         .env("GIT_SSH", &bad_ssh)
         .env("GIT_SSH_COMMAND", inherited_command)
         .env("GIT_SSH_VARIANT", "plink");
-    for (key, value) in xdg_environment(root) {
-        gh_clone.env(key, value);
-    }
+    apply_environment(&mut gh_clone, root);
     gh_clone.assert().failure();
 
     assert!(
@@ -336,9 +346,7 @@ agent_socket = {agent_socket:?}
         .env("GIT_CONFIG_GLOBAL", &global_config)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("BAD_CREDENTIAL_TRACE", &bad_credential_trace);
-    for (key, value) in xdg_environment(root) {
-        explicit_override.env(key, value);
-    }
+    apply_environment(&mut explicit_override, root);
     explicit_override
         .assert()
         .failure()
@@ -359,9 +367,7 @@ agent_socket = {agent_socket:?}
         .env("GIT_CONFIG_GLOBAL", &global_config)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("BAD_CREDENTIAL_TRACE", &bad_credential_trace);
-    for (key, value) in xdg_environment(root) {
-        credential.env(key, value);
-    }
+    apply_environment(&mut credential, root);
     credential
         .assert()
         .success()
@@ -418,9 +424,7 @@ fingerprint = "SHA256:work"
         )
         .env("GIT_SSH_VARIANT", "plink")
         .env_remove("SSH_AUTH_SOCK");
-    for (key, value) in xdg_environment(root) {
-        remote_update.env(key, value);
-    }
+    apply_environment(&mut remote_update, root);
     remote_update.assert().failure();
     assert!(
         !bad_ssh_trace.exists(),

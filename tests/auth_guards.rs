@@ -33,6 +33,16 @@ fn xdg_environment(root: &Path) -> [(String, PathBuf); 4] {
 }
 
 fn apply_environment(command: &mut AssertCommand, root: &Path) {
+    for key in [
+        "GHIS_CONFIG",
+        "GHIS_PROFILE",
+        "GHIS_BANNER_SHOWN",
+        "GHIS_WRAPPER_ACTIVE",
+        "GHIS_BYPASS",
+        "GHIS_DISABLE_CHPWD",
+    ] {
+        command.env_remove(key);
+    }
     for (key, value) in xdg_environment(root) {
         command.env(key, value);
     }

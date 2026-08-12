@@ -35,6 +35,16 @@ fn environment(root: &Path, bin: &Path) -> Vec<(String, PathBuf)> {
 }
 
 fn apply_environment(command: &mut Command, values: &[(String, PathBuf)]) {
+    for key in [
+        "GHIS_CONFIG",
+        "GHIS_PROFILE",
+        "GHIS_BANNER_SHOWN",
+        "GHIS_WRAPPER_ACTIVE",
+        "GHIS_BYPASS",
+        "GHIS_DISABLE_CHPWD",
+    ] {
+        command.env_remove(key);
+    }
     command.envs(values.iter().map(|(key, value)| (key, value)));
 }
 
@@ -48,7 +58,13 @@ fn bind(root: &Path, bin: &Path, config: &Path, profile: &str, repository: &Path
             profile,
             "--repo",
         ])
-        .arg(repository);
+        .arg(repository)
+        .env_remove("GHIS_CONFIG")
+        .env_remove("GHIS_PROFILE")
+        .env_remove("GHIS_BANNER_SHOWN")
+        .env_remove("GHIS_WRAPPER_ACTIVE")
+        .env_remove("GHIS_BYPASS")
+        .env_remove("GHIS_DISABLE_CHPWD");
     for (key, value) in environment(root, bin) {
         command.env(key, value);
     }

@@ -11,6 +11,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
+const GHIS_CONTROL_ENV: [&str; 6] = [
+    "GHIS_CONFIG",
+    "GHIS_PROFILE",
+    "GHIS_BANNER_SHOWN",
+    "GHIS_WRAPPER_ACTIVE",
+    "GHIS_BYPASS",
+    "GHIS_DISABLE_CHPWD",
+];
+
 fn write_executable(path: &Path, body: &str) {
     fs::write(path, body).expect("write executable");
     let mut permissions = fs::metadata(path).expect("metadata").permissions();
@@ -26,6 +35,36 @@ fn prepend_path(directory: &Path) -> String {
     .expect("PATH")
     .to_string_lossy()
     .into_owned()
+}
+
+/// Construct a ghis child with caller-side selection state removed.
+///
+/// Integration tests always provide their own HOME/XDG roots below.  Clearing
+/// the ghis control variables as well prevents a developer's shell wrapper or
+/// custom config from leaking into a child process and writing real user
+/// state while the test suite is running.
+fn isolated_ghis_command() -> AssertCommand {
+    let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    clear_ghis_assert_environment(&mut command);
+    command
+}
+
+fn clear_ghis_assert_environment(command: &mut AssertCommand) {
+    for key in GHIS_CONTROL_ENV {
+        command.env_remove(key);
+    }
+}
+
+fn clear_ghis_environment(command: &mut Command) {
+    for key in GHIS_CONTROL_ENV {
+        command.env_remove(key);
+    }
+}
+
+fn isolated_git_command() -> AssertCommand {
+    let mut command = AssertCommand::new("git");
+    clear_ghis_assert_environment(&mut command);
+    command
 }
 
 fn xdg_environment(temp: &TempDir) -> [(String, PathBuf); 4] {
@@ -88,7 +127,7 @@ fi
 "#,
     );
 
-    let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut command = isolated_ghis_command();
     command
         .current_dir(temp.path())
         .args(["gh", "--", "api", "user"])
@@ -154,7 +193,7 @@ printf 'enterprise-account-ok\n'
 "#,
     );
 
-    let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut command = isolated_ghis_command();
     command
         .current_dir(temp.path())
         .args(["gh", "--", "api", "user"])
@@ -185,7 +224,7 @@ fn gh_wrapper_rejects_an_explicit_cross_host_target_before_token_lookup() {
         "#!/bin/sh\nprintf 'called\\n' > \"$FAKE_GH_TRACE\"\nexit 70\n",
     );
 
-    let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut command = isolated_ghis_command();
     command
         .current_dir(temp.path())
         .args(["gh", "--", "api", "--hostname", "other.example", "user"])
@@ -202,7 +241,7 @@ fn gh_wrapper_rejects_an_explicit_cross_host_target_before_token_lookup() {
         "gh ran before the target host was validated"
     );
 
-    let mut positional = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut positional = isolated_ghis_command();
     positional
         .current_dir(temp.path())
         .args([
@@ -226,7 +265,7 @@ fn gh_wrapper_rejects_an_explicit_cross_host_target_before_token_lookup() {
         "gh ran before its repository URL was validated"
     );
 
-    let mut item_url = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut item_url = isolated_ghis_command();
     item_url
         .current_dir(temp.path())
         .args([
@@ -262,7 +301,7 @@ fn gh_wrapper_rejects_an_explicit_cross_host_target_before_token_lookup() {
             "--source=other.example/acme/source",
         ],
     ] {
-        let mut guarded = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+        let mut guarded = isolated_ghis_command();
         guarded
             .current_dir(temp.path())
             .arg("gh")
@@ -277,7 +316,7 @@ fn gh_wrapper_rejects_an_explicit_cross_host_target_before_token_lookup() {
         assert!(!trace.exists(), "gh ran before every target was validated");
     }
 
-    let mut body_url = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut body_url = isolated_ghis_command();
     body_url
         .current_dir(temp.path())
         .args([
@@ -350,7 +389,7 @@ fn gh_wrapper_rejects_ambiguous_and_cross_host_targets_before_token_lookup() {
         vec!["my-custom-extension", "run"],
         vec!["extension", "exec", "my-custom-extension"],
     ] {
-        let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+        let mut command = isolated_ghis_command();
         command
             .current_dir(temp.path())
             .arg("gh")
@@ -408,7 +447,7 @@ printf 'run:%s repo=%s\n' "$*" "${GH_REPO-<unset>}" >> "$FAKE_GH_TRACE"
         vec!["repo", "fork", "--remote", "github.com/acme/project"],
         vec!["alias", "list"],
     ] {
-        let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+        let mut command = isolated_ghis_command();
         command
             .current_dir(temp.path())
             .arg("gh")
@@ -423,7 +462,7 @@ printf 'run:%s repo=%s\n' "$*" "${GH_REPO-<unset>}" >> "$FAKE_GH_TRACE"
         command.assert().success();
     }
 
-    let mut body = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut body = isolated_ghis_command();
     body.current_dir(temp.path())
         .args([
             "gh",
@@ -504,7 +543,7 @@ fi
             "https://github.com/acme/project/pull/12",
         ],
     ] {
-        let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+        let mut command = isolated_ghis_command();
         command
             .current_dir(&repository)
             .arg("gh")
@@ -590,7 +629,7 @@ fi
 "#,
     );
 
-    let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut command = isolated_ghis_command();
     command
         .current_dir(&repository)
         .args(["gh", "--", "pr", "list"])
@@ -619,7 +658,7 @@ fi
             .success()
     );
     fs::remove_file(&trace).expect("clear gh trace");
-    let mut mismatched = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut mismatched = isolated_ghis_command();
     mismatched
         .current_dir(&repository)
         .args(["gh", "--", "pr", "list"])
@@ -648,7 +687,7 @@ fn relative_git_c_is_forwarded_only_once() {
             .success()
     );
 
-    let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut command = isolated_ghis_command();
     command
         .current_dir(temp.path())
         .args(["git", "--", "-C", "repo", "status", "--short"]);
@@ -663,7 +702,7 @@ fn caller_identity_config_still_overrides_the_profile_fragment() {
     let temp = tempfile::tempdir().expect("temporary directory");
     write_default_profile(&temp);
 
-    let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut command = isolated_ghis_command();
     command.current_dir(temp.path()).args([
         "git",
         "--",
@@ -681,8 +720,7 @@ fn caller_identity_config_still_overrides_the_profile_fragment() {
 #[test]
 fn generated_zsh_wrapper_is_valid_and_preserves_git_exit_status() {
     let temp = tempfile::tempdir().expect("temporary directory");
-    let output = AssertCommand::cargo_bin("ghis")
-        .expect("ghis binary")
+    let output = isolated_ghis_command()
         .args(["init", "zsh"])
         .output()
         .expect("generate init");
@@ -690,8 +728,10 @@ fn generated_zsh_wrapper_is_valid_and_preserves_git_exit_status() {
     let init = temp.path().join("init.zsh");
     fs::write(&init, output.stdout).expect("init script");
 
+    let mut syntax = Command::new("zsh");
+    clear_ghis_environment(&mut syntax);
     assert!(
-        Command::new("zsh")
+        syntax
             .args(["-n"])
             .arg(&init)
             .status()
@@ -712,12 +752,11 @@ fn generated_zsh_wrapper_is_valid_and_preserves_git_exit_status() {
         .arg(&init)
         .current_dir(temp.path())
         .env("PATH", prepend_path(binary_dir))
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env_remove("GHIS_CONFIG")
-        .env_remove("GHIS_PROFILE");
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
     for (key, value) in xdg_environment(&temp) {
         command.env(key, value);
     }
+    clear_ghis_environment(&mut command);
     let status = command.status().expect("run wrapper");
     assert_eq!(status.code(), Some(1));
 }
@@ -775,7 +814,8 @@ exec "$GHIS_REAL_GIT" "$@"
             .expect("real git in PATH")
             .into_os_string()
     });
-    let output = Command::new("script")
+    let mut command = Command::new("script");
+    command
         .args(["-q", "-e", "-c"])
         .arg(&probe)
         .arg("/dev/null")
@@ -785,9 +825,9 @@ exec "$GHIS_REAL_GIT" "$@"
         .env("HOME", temp.path().join("home"))
         .env("XDG_CONFIG_HOME", temp.path().join("config"))
         .env("XDG_CACHE_HOME", temp.path().join("cache"))
-        .env("XDG_STATE_HOME", temp.path().join("state"))
-        .output()
-        .expect("run wrapper in a pseudo-terminal");
+        .env("XDG_STATE_HOME", temp.path().join("state"));
+    clear_ghis_environment(&mut command);
+    let output = command.output().expect("run wrapper in a pseudo-terminal");
 
     assert_eq!(output.status.code(), Some(130));
     assert!(String::from_utf8_lossy(&output.stdout).contains("tty-ok"));
@@ -813,7 +853,7 @@ fn setup_respects_zdotdir_and_requires_explicit_noninteractive_consent() {
         }
     };
 
-    let mut refused = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut refused = isolated_ghis_command();
     refused.arg("setup");
     configure(&mut refused);
     refused
@@ -821,7 +861,7 @@ fn setup_respects_zdotdir_and_requires_explicit_noninteractive_consent() {
         .failure()
         .stderr(predicate::str::contains("ghis setup --yes"));
 
-    let mut setup = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut setup = isolated_ghis_command();
     setup.args(["setup", "--yes"]);
     configure(&mut setup);
     setup.assert().success().stdout(predicate::str::contains(
@@ -832,7 +872,7 @@ fn setup_respects_zdotdir_and_requires_explicit_noninteractive_consent() {
     assert!(contents.contains(ghis::shell::START_MARKER));
     assert!(!home.join(".zshrc").exists());
 
-    let mut second = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut second = isolated_ghis_command();
     second.args(["setup", "--yes"]);
     configure(&mut second);
     second
@@ -840,7 +880,7 @@ fn setup_respects_zdotdir_and_requires_explicit_noninteractive_consent() {
         .success()
         .stdout(predicate::str::contains("无需更新"));
 
-    let mut uninstall = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut uninstall = isolated_ghis_command();
     uninstall.arg("uninstall");
     configure(&mut uninstall);
     uninstall.assert().success();
@@ -875,6 +915,7 @@ fn concurrent_profile_add_commands_keep_every_identity() {
         for (key, value) in xdg_environment(&temp) {
             command.env(key, value);
         }
+        clear_ghis_environment(&mut command);
         children.push(command.spawn().expect("spawn concurrent profile add"));
     }
 
@@ -905,7 +946,9 @@ fn completion_treats_a_closed_stdout_as_success() {
     drop(closed_reader);
     let writer: OwnedFd = writer.into();
 
-    let status = Command::new(assert_cmd::cargo::cargo_bin!("ghis"))
+    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("ghis"));
+    clear_ghis_environment(&mut command);
+    let status = command
         .args(["completion", "zsh"])
         .stdout(Stdio::from(writer))
         .status()
@@ -916,15 +959,16 @@ fn completion_treats_a_closed_stdout_as_success() {
 
 #[test]
 fn init_output_is_valid_when_piped_directly_to_zsh() {
-    let status = Command::new("zsh")
+    let mut command = Command::new("zsh");
+    command
         .args([
             "-f",
             "-c",
             "setopt pipefail; \"$GHIS_TEST_BIN\" init zsh | command zsh -n",
         ])
-        .env("GHIS_TEST_BIN", assert_cmd::cargo::cargo_bin!("ghis"))
-        .status()
-        .expect("pipe init into zsh");
+        .env("GHIS_TEST_BIN", assert_cmd::cargo::cargo_bin!("ghis"));
+    clear_ghis_environment(&mut command);
+    let status = command.status().expect("pipe init into zsh");
 
     assert!(status.success());
 }
@@ -968,8 +1012,7 @@ git_email = "work@example.test"
     )
     .expect("config");
 
-    let init_output = AssertCommand::cargo_bin("ghis")
-        .expect("ghis binary")
+    let init_output = isolated_ghis_command()
         .args(["init", "zsh"])
         .output()
         .expect("generate init");
@@ -995,6 +1038,7 @@ git_email = "work@example.test"
     for (key, value) in xdg_environment(&temp) {
         command.env(key, value);
     }
+    clear_ghis_environment(&mut command);
     let output = command.output().expect("run wrapped git");
 
     assert!(
@@ -1027,7 +1071,7 @@ fn deleted_repository_binding_never_falls_back_to_default_profile() {
     );
     write_default_profile(&temp);
 
-    let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut command = isolated_ghis_command();
     command
         .current_dir(&repository)
         .args(["git", "--", "var", "GIT_AUTHOR_IDENT"]);
@@ -1073,7 +1117,7 @@ printf 'must-not-be-returned\n'
     );
     write_default_profile(&temp);
 
-    let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut command = isolated_ghis_command();
     command
         .current_dir(&repository)
         .args(["credential-helper", "get"])
@@ -1139,7 +1183,7 @@ git_email = "work@example.test"
     )
     .expect("custom config");
 
-    let mut use_command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut use_command = isolated_ghis_command();
     use_command
         .current_dir(temp.path())
         .arg("--config")
@@ -1172,7 +1216,7 @@ exit 42
 "#,
     );
 
-    let mut credential = AssertCommand::new("git");
+    let mut credential = isolated_git_command();
     credential
         .current_dir(&repository)
         .args(["credential", "fill"])
@@ -1195,7 +1239,7 @@ exit 42
     assert_eq!(trace, "auth token --hostname github.com --user worker\n");
 
     if ghis::git::supports_named_hooks() {
-        let mut hook = AssertCommand::new("git");
+        let mut hook = isolated_git_command();
         hook.current_dir(&repository)
             .args(["hook", "run", "pre-push"])
             .env("GIT_CONFIG_GLOBAL", "/dev/null");
@@ -1238,7 +1282,7 @@ printf 'fallback-secret\n'
 "#,
     );
 
-    let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut command = isolated_ghis_command();
     command
         .current_dir(&repository)
         .arg("--config")
@@ -1299,7 +1343,7 @@ git_email = "work@example.test"
     )
     .expect("config");
 
-    let mut bind = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut bind = isolated_ghis_command();
     bind.current_dir(temp.path())
         .args(["use", "work", "--repo", "outer/repo"])
         .env("GIT_CONFIG_GLOBAL", "/dev/null");
@@ -1308,7 +1352,7 @@ git_email = "work@example.test"
     }
     bind.assert().success();
 
-    let mut equals_form = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut equals_form = isolated_ghis_command();
     equals_form
         .current_dir(temp.path())
         .args([
@@ -1330,7 +1374,7 @@ git_email = "work@example.test"
     }
     equals_form.assert().success().stdout("work@example.test\n");
 
-    let mut separated_form = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut separated_form = isolated_ghis_command();
     separated_form
         .current_dir(temp.path())
         .args([
@@ -1402,7 +1446,7 @@ git_email = "work@example.test"
     )
     .expect("config");
 
-    let mut commit = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut commit = isolated_ghis_command();
     commit
         .current_dir(&repository)
         .args(["git", "--", "ci", "--allow-empty", "-m", "alias commit"])
@@ -1418,7 +1462,7 @@ git_email = "work@example.test"
             "Work Identity <work@example.test>",
         ));
 
-    let mut alias_author = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut alias_author = isolated_ghis_command();
     alias_author
         .current_dir(&repository)
         .args([
@@ -1441,7 +1485,7 @@ git_email = "work@example.test"
             "作者=Alias Author <alias@example.test>",
         ));
 
-    let mut reuse_author = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut reuse_author = isolated_ghis_command();
     reuse_author
         .current_dir(&repository)
         .args(["git", "--", "commit", "--allow-empty", "-C", "HEAD"])
@@ -1469,7 +1513,7 @@ git_email = "work@example.test"
         "Alias Author|alias@example.test"
     );
 
-    let mut push = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut push = isolated_ghis_command();
     push.current_dir(&repository)
         .args(["git", "--", "publish"])
         .env("GIT_CONFIG_GLOBAL", "/dev/null");
@@ -1511,7 +1555,7 @@ git_email = "work@example.test"
     )
     .expect("config");
 
-    let mut commit = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut commit = isolated_ghis_command();
     commit
         .current_dir(&repository)
         .args([
@@ -1581,7 +1625,7 @@ fn direct_hook_banner_reports_git_resolved_author_and_committer() {
             .success()
     );
 
-    let mut bind = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut bind = isolated_ghis_command();
     bind.args([
         "use",
         "personal",
@@ -1594,7 +1638,7 @@ fn direct_hook_banner_reports_git_resolved_author_and_committer() {
     }
     bind.assert().success();
 
-    let mut hook = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut hook = isolated_ghis_command();
     hook.current_dir(&repository)
         .args(["hook", "--hook", "prepare-commit-msg"])
         .env("GIT_CONFIG_GLOBAL", "/dev/null")
@@ -1693,7 +1737,7 @@ printf 'gh version test\n'
 "#,
     );
 
-    let mut discover = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut discover = isolated_ghis_command();
     discover
         .args(["discover", "--json"])
         .env("PATH", prepend_path(&fake_bin))
@@ -1713,7 +1757,7 @@ printf 'gh version test\n'
         0o600
     );
 
-    let mut doctor = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut doctor = isolated_ghis_command();
     doctor
         .args(["doctor", "--json"])
         .env("PATH", prepend_path(&fake_bin))
@@ -1743,7 +1787,7 @@ exit 1
 "#,
     );
 
-    let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut command = isolated_ghis_command();
     command
         .args(["discover", "--json"])
         .env("PATH", prepend_path(&fake_bin));
