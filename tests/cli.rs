@@ -1689,7 +1689,7 @@ program = "/opt/1Password/op-ssh-sign"
     )
     .expect("config");
 
-    let mut edit = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    let mut edit = isolated_ghis_command();
     edit.args(["profile", "edit", "work", "--email", "new@example.test"]);
     for (key, value) in xdg_environment(&temp) {
         edit.env(key, value);
@@ -1983,4 +1983,54 @@ exit 1
     assert!(cached.offline);
     assert!(!cached.accounts[0].verified);
     assert_eq!(cached.accounts[0].state.as_deref(), Some("failure"));
+}
+
+#[test]
+fn profile_mutation_never_writes_an_inherited_ghis_config_path() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let outside_config = temp.path().join("sentinel/real-config.toml");
+    fs::create_dir_all(outside_config.parent().expect("sentinel parent"))
+        .expect("sentinel directory");
+    let sentinel = r#"version = 1
+
+[profiles.sentinel]
+host = "github.com"
+login = "sentinel"
+git_name = "Sentinel"
+git_email = "sentinel@example.test"
+"#;
+    fs::write(&outside_config, sentinel).expect("sentinel config");
+
+    let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    command
+        .args([
+            "profile",
+            "add",
+            "isolated",
+            "--login",
+            "isolated-user",
+            "--name",
+            "Isolated User",
+            "--email",
+            "isolated@example.test",
+        ])
+        .env("GHIS_CONFIG", &outside_config)
+        .env("GHIS_PROFILE", "sentinel");
+    clear_ghis_assert_environment(&mut command);
+    for (key, value) in xdg_environment(&temp) {
+        command.env(key, value);
+    }
+    command.assert().success();
+
+    assert_eq!(
+        fs::read_to_string(&outside_config).expect("sentinel remains"),
+        sentinel
+    );
+    assert!(
+        !outside_config.with_extension("toml.lock").exists(),
+        "an inherited config path must not even receive a lock file"
+    );
+    let isolated_config = temp.path().join("config/ghis/config.toml");
+    let config = Config::load(&isolated_config).expect("isolated config");
+    assert!(config.profiles.contains_key("isolated"));
 }
