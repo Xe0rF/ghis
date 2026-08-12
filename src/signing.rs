@@ -155,6 +155,29 @@ pub fn onepassword_socket_candidates() -> Vec<PathBuf> {
     paths
 }
 
+/// Whether a line starts with a supported SSH public-key algorithm. This is a
+/// cheap shape check; callers that need validation must still use
+/// [`fingerprint`], which delegates parsing to `ssh-keygen`.
+pub fn is_public_key_line(value: &str) -> bool {
+    let key_type = value.split_whitespace().next().unwrap_or_default();
+    key_type.starts_with("ssh-")
+        || key_type.starts_with("ecdsa-")
+        || key_type.starts_with("sk-")
+        || key_type.starts_with("rsa-sha2-")
+}
+
+/// Return the form Git expects for an inline SSH signing public key.
+pub fn git_signing_key_value(value: &str) -> String {
+    let trimmed = value.trim_start();
+    if trimmed.starts_with("key::") {
+        return trimmed.to_owned();
+    }
+    if is_public_key_line(trimmed) {
+        return format!("key::{trimmed}");
+    }
+    value.to_owned()
+}
+
 /// Query one SSH agent.  An unavailable agent is represented in `AgentInfo`
 /// rather than returned as an error so `doctor` can report all diagnostics at
 /// once.
@@ -349,27 +372,34 @@ pub fn inspect(config: &SigningProfile) -> SigningStatus {
 
 pub fn select_key(keys: &[AgentKey], config: &SigningProfile) -> Option<AgentKey> {
     let fingerprint = config.fingerprint.as_deref().map(str::trim);
-    let public_key = config.public_key.as_deref().map(key_material);
-    if fingerprint.is_some() || public_key.is_some() {
+    let public_key = config.public_key.as_deref().and_then(public_key_material);
+    if fingerprint.is_some() || config.public_key.is_some() {
         return keys
             .iter()
             .find(|key| {
                 fingerprint.is_none_or(|wanted| key.fingerprint.as_deref() == Some(wanted))
-                    && public_key
-                        .as_deref()
-                        .is_none_or(|wanted| key_material(&key.public_key) == wanted)
+                    && (config.public_key.is_none()
+                        || public_key.as_deref().is_some_and(|wanted| {
+                            public_key_material(&key.public_key).as_deref() == Some(wanted)
+                        }))
             })
             .cloned();
     }
     (keys.len() == 1).then(|| keys[0].clone())
 }
 
-fn key_material(public_key: &str) -> String {
-    public_key
-        .split_whitespace()
-        .take(2)
-        .collect::<Vec<_>>()
-        .join(" ")
+/// Normalize a public SSH key to its algorithm and base64 material. Comments
+/// are labels for humans and do not participate in key matching.
+pub fn public_key_material(public_key: &str) -> Option<String> {
+    let line = public_key
+        .lines()
+        .map(str::trim)
+        .map(|line| line.strip_prefix("key::").unwrap_or(line))
+        .find(|line| is_public_key_line(line))?;
+    let mut fields = line.split_whitespace();
+    let key_type = fields.next()?;
+    let encoded = fields.next()?;
+    Some(format!("{key_type} {encoded}"))
 }
 
 /// Whether a discovered or explicitly configured signing program is an
@@ -444,6 +474,54 @@ mod tests {
             "/run/user/1000/1Password/agent.sock"
         )));
         assert!(!is_onepassword_socket(Path::new("/tmp/ssh-agent.sock")));
+    }
+
+    #[test]
+    fn normalizes_public_key_material_without_its_comment() {
+        assert_eq!(
+            public_key_material("\n# local note\nssh-ed25519 AAAATEST user@example.test\n"),
+            Some("ssh-ed25519 AAAATEST".into())
+        );
+        assert_eq!(public_key_material("not an SSH key"), None);
+        assert_eq!(
+            public_key_material("key::ecdsa-sha2-nistp256 AAAATEST local comment"),
+            Some("ecdsa-sha2-nistp256 AAAATEST".into())
+        );
+    }
+
+    #[test]
+    fn git_signing_key_values_prefix_every_inline_key_shape() {
+        for value in [
+            "ssh-ed25519 AAAA inline",
+            "ecdsa-sha2-nistp256 AAAA inline",
+            "sk-ssh-ed25519@openssh.com AAAA inline",
+            "rsa-sha2-512 AAAA inline",
+        ] {
+            assert_eq!(git_signing_key_value(value), format!("key::{value}"));
+            assert_eq!(
+                git_signing_key_value(&format!("key::{value}")),
+                format!("key::{value}")
+            );
+        }
+        assert_eq!(
+            git_signing_key_value("/keys/signing key.pub"),
+            "/keys/signing key.pub"
+        );
+    }
+
+    #[test]
+    fn invalid_configured_public_key_never_falls_back_to_a_single_agent_key() {
+        let keys = vec![AgentKey {
+            key_type: "ssh-ed25519".into(),
+            public_key: "ssh-ed25519 AAAATEST agent".into(),
+            comment: Some("agent".into()),
+            fingerprint: Some("SHA256:agent".into()),
+        }];
+        let config = SigningProfile {
+            public_key: Some("not a public key".into()),
+            ..SigningProfile::default()
+        };
+        assert!(select_key(&keys, &config).is_none());
     }
 
     #[test]

@@ -651,7 +651,9 @@ fn profile_from_args(args: ProfileArgs, git_email: String) -> Profile {
         }),
         signing: SigningProfile {
             enabled: args.sign,
-            signing_key: args.signing_key,
+            signing_key: args
+                .signing_key
+                .map(|value| signing::git_signing_key_value(&value)),
             program: args.signing_program,
         },
     }
@@ -699,7 +701,7 @@ fn update_profile_from_args(profile: &mut Profile, args: ProfileEditArgs) {
         profile.signing.enabled = enabled;
     }
     if let Some(signing_key) = args.signing_key {
-        profile.signing.signing_key = Some(signing_key);
+        profile.signing.signing_key = Some(signing::git_signing_key_value(&signing_key));
     }
     if let Some(signing_program) = args.signing_program {
         profile.signing.program = Some(signing_program);
@@ -1261,7 +1263,7 @@ fn doctor_key_selector(
     Some(signing::SigningProfile {
         enabled: key_required,
         public_key,
-        fingerprint: ssh.and_then(|ssh| ssh.fingerprint.clone()),
+        fingerprint: app::profile_signing_fingerprint(profile),
         ..signing::SigningProfile::default()
     })
 }
@@ -1277,7 +1279,7 @@ fn profile_public_key_for_doctor(profile: &Profile) -> std::result::Result<Optio
         return Err("已启用签名，但未配置签名公钥".into());
     };
     let text = value.to_string_lossy();
-    if text.trim_start().starts_with("ssh-") {
+    if signing::is_public_key_line(text.trim_start()) {
         return Ok(Some(text.into_owned()));
     }
     if let Some(key) = text.trim_start().strip_prefix("key::") {

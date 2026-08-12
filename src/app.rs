@@ -1012,11 +1012,9 @@ fn validate_profile_operation(
 
 fn profile_public_key(profile: &Profile) -> Result<String> {
     if let Some(value) = profile.signing.signing_key.as_deref() {
-        if value.trim_start().starts_with("ssh-") {
-            return Ok(value.to_owned());
-        }
-        if let Some(value) = value.trim_start().strip_prefix("key::") {
-            return Ok(value.to_owned());
+        let inline = value.trim_start().strip_prefix("key::").unwrap_or(value);
+        if signing::is_public_key_line(inline) {
+            return Ok(inline.to_owned());
         }
         let path = signing::expand_user(Path::new(value));
         return fs::read_to_string(&path).map_err(|error| {
@@ -1042,9 +1040,20 @@ pub fn inspect_profile_signing(profile: &Profile) -> Result<signing::SigningStat
             .as_ref()
             .and_then(|ssh| ssh.agent_socket.clone()),
         public_key: Some(public_key),
-        fingerprint: profile.ssh.as_ref().and_then(|ssh| ssh.fingerprint.clone()),
+        fingerprint: profile_signing_fingerprint(profile),
         signing_program: profile.signing.program.clone(),
     }))
+}
+
+/// Reuse the SSH authentication fingerprint only when signing also reuses
+/// that public key. An explicit signing key can intentionally be different.
+pub fn profile_signing_fingerprint(profile: &Profile) -> Option<String> {
+    profile
+        .signing
+        .signing_key
+        .is_none()
+        .then(|| profile.ssh.as_ref().and_then(|ssh| ssh.fingerprint.clone()))
+        .flatten()
 }
 
 /// 执行一次带 profile token 的 gh 命令，token 只进入子进程环境。
@@ -2896,6 +2905,39 @@ mod tests {
             git_name: "Alice Example".into(),
             git_email: "alice@example.test".into(),
             ..Profile::default()
+        }
+    }
+
+    #[test]
+    fn explicit_signing_key_does_not_reuse_ssh_authentication_fingerprint() {
+        let mut profile = profile();
+        profile.ssh = Some(config::SshProfile {
+            mode: config::SshMode::OnePassword,
+            public_key: Some(PathBuf::from("/keys/authentication.pub")),
+            fingerprint: Some("SHA256:authentication".into()),
+            agent_socket: Some(PathBuf::from("/tmp/agent.sock")),
+        });
+        profile.signing.enabled = true;
+
+        assert_eq!(
+            profile_signing_fingerprint(&profile).as_deref(),
+            Some("SHA256:authentication")
+        );
+        profile.signing.signing_key = Some("/keys/signing.pub".into());
+        assert_eq!(profile_signing_fingerprint(&profile), None);
+    }
+
+    #[test]
+    fn runtime_signing_accepts_every_supported_inline_key_shape() {
+        for value in [
+            "ssh-ed25519 AAAA inline",
+            "ecdsa-sha2-nistp256 AAAA inline",
+            "sk-ssh-ed25519@openssh.com AAAA inline",
+            "rsa-sha2-512 AAAA inline",
+        ] {
+            let mut profile = profile();
+            profile.signing.signing_key = Some(format!("key::{value}"));
+            assert_eq!(profile_public_key(&profile).unwrap(), value);
         }
     }
 
