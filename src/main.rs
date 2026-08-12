@@ -1013,6 +1013,7 @@ struct ToolStatus {
 #[serde(rename_all = "snake_case")]
 enum DoctorShellIntegrationState {
     WrapperLoaded,
+    WrapperIncomplete,
     InstalledNotLoaded,
     RepositoryOnly,
     NotIntegrated,
@@ -1022,6 +1023,8 @@ enum DoctorShellIntegrationState {
 struct DoctorShellIntegration {
     state: DoctorShellIntegrationState,
     wrapper_loaded: bool,
+    wrapper_healthy: bool,
+    health_marker: Option<String>,
     setup_installed: bool,
     repository_bound: bool,
     advice: String,
@@ -1369,7 +1372,11 @@ fn doctor(
 }
 
 fn doctor_shell_integration(ctx: &AppContext) -> DoctorShellIntegration {
+    let health = shell::integration_health();
     let wrapper_loaded = shell::integration_is_loaded();
+    let wrapper_healthy = health == shell::IntegrationHealth::Healthy;
+    let health_marker = std::env::var_os(shell::HEALTH_ENV)
+        .map(|value| diagnostics::sanitize_display_text(&value.to_string_lossy()));
     let init_file = ctx.paths.config_dir.join("init.zsh");
     let setup_installed = std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -1382,10 +1389,12 @@ fn doctor_shell_integration(ctx: &AppContext) -> DoctorShellIntegration {
         .repository
         .as_ref()
         .is_some_and(repository_has_ghis_persistence);
-    let state = classify_shell_integration(wrapper_loaded, setup_installed, repository_bound);
+    let state = classify_shell_integration(health, setup_installed, repository_bound);
     DoctorShellIntegration {
         state,
         wrapper_loaded,
+        wrapper_healthy,
+        health_marker,
         setup_installed,
         repository_bound,
         advice: doctor_shell_integration_advice(state).into(),
@@ -1448,12 +1457,14 @@ fn is_ghis_credential_helper_marker(value: &str) -> bool {
 }
 
 fn classify_shell_integration(
-    wrapper_loaded: bool,
+    health: shell::IntegrationHealth,
     setup_installed: bool,
     repository_bound: bool,
 ) -> DoctorShellIntegrationState {
-    if wrapper_loaded {
+    if health == shell::IntegrationHealth::Healthy {
         DoctorShellIntegrationState::WrapperLoaded
+    } else if health == shell::IntegrationHealth::Incomplete {
+        DoctorShellIntegrationState::WrapperIncomplete
     } else if setup_installed {
         DoctorShellIntegrationState::InstalledNotLoaded
     } else if repository_bound {
@@ -1465,7 +1476,10 @@ fn classify_shell_integration(
 
 fn doctor_shell_integration_text(state: DoctorShellIntegrationState) -> &'static str {
     match state {
-        DoctorShellIntegrationState::WrapperLoaded => "当前 shell 已加载",
+        DoctorShellIntegrationState::WrapperLoaded => "当前 shell 已完整加载",
+        DoctorShellIntegrationState::WrapperIncomplete => {
+            "当前 shell marker 存在，但函数依赖不完整"
+        }
         DoctorShellIntegrationState::InstalledNotLoaded => "已安装，但当前 shell 未加载",
         DoctorShellIntegrationState::RepositoryOnly => "仅检测到仓库本地 ghis 配置",
         DoctorShellIntegrationState::NotIntegrated => "未安装或未接入",
@@ -1476,6 +1490,9 @@ fn doctor_shell_integration_advice(state: DoctorShellIntegrationState) -> &'stat
     match state {
         DoctorShellIntegrationState::WrapperLoaded => {
             "普通 git/gh 会经过 ghis；command git、绝对路径或 GHIS_BYPASS=1 仍可明确绕过 wrapper"
+        }
+        DoctorShellIntegrationState::WrapperIncomplete => {
+            "当前 shell 只继承了旧版/不完整 marker；重新 source init.zsh、运行 exec zsh 或新开终端"
         }
         DoctorShellIntegrationState::InstalledNotLoaded => {
             "运行 exec zsh 或新开终端后再试；ghis 不会替换当前 shell"
@@ -4116,19 +4133,23 @@ mod tests {
     #[test]
     fn shell_integration_state_prefers_loaded_then_installed_then_repository() {
         assert_eq!(
-            classify_shell_integration(true, true, true),
+            classify_shell_integration(shell::IntegrationHealth::Healthy, true, true,),
             DoctorShellIntegrationState::WrapperLoaded
         );
         assert_eq!(
-            classify_shell_integration(false, true, true),
+            classify_shell_integration(shell::IntegrationHealth::Incomplete, true, true,),
+            DoctorShellIntegrationState::WrapperIncomplete
+        );
+        assert_eq!(
+            classify_shell_integration(shell::IntegrationHealth::NotLoaded, true, true,),
             DoctorShellIntegrationState::InstalledNotLoaded
         );
         assert_eq!(
-            classify_shell_integration(false, false, true),
+            classify_shell_integration(shell::IntegrationHealth::NotLoaded, false, true,),
             DoctorShellIntegrationState::RepositoryOnly
         );
         assert_eq!(
-            classify_shell_integration(false, false, false),
+            classify_shell_integration(shell::IntegrationHealth::NotLoaded, false, false,),
             DoctorShellIntegrationState::NotIntegrated
         );
     }

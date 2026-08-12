@@ -77,7 +77,7 @@ fi
         std::iter::once(fake_bin).chain(std::env::split_paths(&inherited_path)),
     )
     .expect("joined PATH");
-    let run = |json: bool, integration: Option<&str>| {
+    let run = |json: bool, integration: Option<&str>, health: Option<&str>| {
         let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
         command
             .args(["--config", config_file.to_str().expect("UTF-8 config")])
@@ -100,17 +100,21 @@ fi
             .env_remove("GHIS_WRAPPER_ACTIVE")
             .env_remove("GHIS_BYPASS")
             .env_remove("GHIS_DISABLE_CHPWD")
-            .env_remove("GHIS_SHELL_INTEGRATION");
+            .env_remove("GHIS_SHELL_INTEGRATION")
+            .env_remove("GHIS_SHELL_INTEGRATION_HEALTH");
         if json {
             command.arg("--json");
         }
         if let Some(integration) = integration {
             command.env("GHIS_SHELL_INTEGRATION", integration);
         }
+        if let Some(health) = health {
+            command.env("GHIS_SHELL_INTEGRATION_HEALTH", health);
+        }
         command.output().expect("run doctor")
     };
 
-    let output = run(true, None);
+    let output = run(true, None, None);
     assert!(output.status.success());
     let report: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
     assert_eq!(report["shell_integration"]["state"], "repository_only");
@@ -118,24 +122,41 @@ fi
     assert_eq!(report["shell_integration"]["setup_installed"], false);
     assert_eq!(report["shell_integration"]["repository_bound"], true);
 
-    let output = run(false, None);
+    let output = run(false, None, None);
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("仅检测到仓库本地 ghis 配置"));
 
     let init_file = config_home.join("ghis/init.zsh");
     ghis::shell::setup(home.join(".zshrc"), &init_file, "ghis").expect("install shell files");
-    let output = run(true, None);
+    let output = run(true, None, None);
     assert!(output.status.success());
     let report: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
     assert_eq!(report["shell_integration"]["state"], "installed_not_loaded");
     assert_eq!(report["shell_integration"]["setup_installed"], true);
     assert_eq!(report["shell_integration"]["repository_bound"], true);
 
-    let output = run(true, Some("1"));
+    let output = run(true, Some("1"), None);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    assert_eq!(report["shell_integration"]["state"], "wrapper_incomplete");
+    assert_eq!(report["shell_integration"]["wrapper_loaded"], true);
+    assert_eq!(report["shell_integration"]["wrapper_healthy"], false);
+    assert_eq!(
+        report["shell_integration"]["health_marker"],
+        serde_json::Value::Null
+    );
+
+    let output = run(false, Some("1"), None);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("marker 存在，但函数依赖不完整"));
+
+    let output = run(true, Some("1"), Some("zsh-v2"));
     assert!(output.status.success());
     let report: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
     assert_eq!(report["shell_integration"]["state"], "wrapper_loaded");
     assert_eq!(report["shell_integration"]["wrapper_loaded"], true);
+    assert_eq!(report["shell_integration"]["wrapper_healthy"], true);
+    assert_eq!(report["shell_integration"]["health_marker"], "zsh-v2");
 }
 
 #[test]

@@ -778,6 +778,11 @@ pub fn run_git(
     explicit: Option<&str>,
     cwd: &Path,
 ) -> Result<i32> {
+    // The CLI wrapper invokes this command as `ghis git -- "$@"` so Clap can
+    // preserve arbitrary Git options. Remove that transport separator before
+    // handing arguments to Git; otherwise `ghis git -- --version` turns the
+    // version flag into a subcommand and Git reports a misleading `-c` error.
+    let args = args.strip_prefix(&["--".to_string()]).unwrap_or(args);
     let mut paths = ConfigPaths::discover()?;
     if let Some(path) = config_path {
         paths.set_config_file(path)?;
@@ -837,8 +842,9 @@ pub fn run_git(
     }
     // Keep identity fragments before caller options so an explicit
     // `-c user.name=...` still works (and is reported by the banner). Put the
-    // credential policy after caller options so it cannot be replaced inside
-    // the wrapper by a later `-c credential.helper=...`.
+    // credential policy after caller global options, but before Git's `--`
+    // option terminator/subcommand. Appending `-c` after `--` makes Git treat it
+    // as a command (notably for `git --version` and `ghis git -- --version`).
     command = command.args(args[..policy_index].iter().cloned());
     if let Some(profile) = ctx.profile.as_ref() {
         // Restrict the fail-closed helper to this Profile's GitHub host. Other
@@ -2241,7 +2247,11 @@ fn git_subcommand_index(args: &[String]) -> Option<usize> {
 }
 
 fn git_policy_insertion_index(args: &[String]) -> usize {
-    let subcommand = git_subcommand_index(args).unwrap_or(args.len());
+    let Some(subcommand) = git_subcommand_index(args) else {
+        // Commands such as `git --version` have no subcommand. Git's global
+        // `-c` options must precede these flags as well.
+        return 0;
+    };
     if subcommand > 0 && args.get(subcommand - 1).is_some_and(|arg| arg == "--") {
         subcommand - 1
     } else {

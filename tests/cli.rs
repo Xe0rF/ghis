@@ -736,6 +736,46 @@ fn caller_identity_config_still_overrides_the_profile_fragment() {
 }
 
 #[test]
+fn git_version_options_keep_injected_config_before_the_option_terminator() {
+    let mut direct = isolated_ghis_command();
+    direct.args(["git", "--", "--version"]);
+    direct
+        .assert()
+        .success()
+        .stdout(predicate::str::starts_with("git version "));
+
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let init = temp.path().join("init.zsh");
+    fs::write(&init, ghis::shell::zsh_init_script("ghis")).expect("init script");
+    let binary = assert_cmd::cargo::cargo_bin!("ghis");
+    let mut wrapped = Command::new("zsh");
+    wrapped
+        .args([
+            "-f",
+            "-c",
+            "source \"$GHIS_TEST_INIT\"; unfunction _ghis_dispatch _ghis_chpwd 2>/dev/null || true; git --version",
+        ])
+        .current_dir(&temp)
+        .env("GHIS_TEST_INIT", &init)
+        .env(
+            "PATH",
+            prepend_path(binary.parent().expect("binary directory")),
+        )
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    for (key, value) in xdg_environment(&temp) {
+        wrapped.env(key, value);
+    }
+    clear_ghis_environment(&mut wrapped);
+    let output = wrapped.output().expect("run wrapped git version");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).starts_with("git version "));
+}
+
+#[test]
 fn generated_zsh_wrapper_is_valid_and_preserves_git_exit_status() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let output = isolated_ghis_command()

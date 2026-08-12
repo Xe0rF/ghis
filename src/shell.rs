@@ -18,9 +18,14 @@ pub const START_MARKER: &str = "# >>> ghis setup >>>";
 /// End marker for the block owned by ghis in a zsh startup file.
 pub const END_MARKER: &str = "# <<< ghis setup <<<";
 /// Exported by the generated init script so child `ghis` processes can tell
-/// that this shell actually loaded the wrapper, rather than merely having a
-/// setup block on disk.
+/// that this shell sourced some version of the wrapper.
 pub const LOADED_ENV: &str = "GHIS_SHELL_INTEGRATION";
+/// Versioned shell-side health marker. Rust cannot inspect functions in its
+/// parent shell, so a generated init script only advertises a complete wrapper
+/// after all functions and hook dependencies have been defined.
+pub const HEALTH_ENV: &str = "GHIS_SHELL_INTEGRATION_HEALTH";
+/// Health marker emitted by the current generated integration.
+pub const HEALTHY_MARKER: &str = "zsh-v2";
 
 /// Resolve the zsh startup file using the same `ZDOTDIR` convention as zsh.
 pub fn zshrc_path(home: &Path, zdotdir: Option<&OsStr>) -> PathBuf {
@@ -81,43 +86,59 @@ pub fn zsh_init_script(binary: &str) -> String {
 # remain owned by the caller. Set GHIS_BYPASS=1 for one command when needed.
 
 typeset -gx GHIS_SHELL_INTEGRATION=1
+unset GHIS_SHELL_INTEGRATION_HEALTH
 
-_ghis_dispatch() {{
-  local _ghis_kind="$1"
+ghis_dispatch() {{
+  local ghis_kind="$1"
   shift
   if [[ "${{GHIS_BYPASS:-0}}" == 1 || "${{GHIS_WRAPPER_ACTIVE:-0}}" == 1 ]]; then
-    command "$_ghis_kind" "$@"
+    command "$ghis_kind" "$@"
     return $?
   fi
   if ! command -v {binary} >/dev/null 2>&1; then
-    command "$_ghis_kind" "$@"
+    command "$ghis_kind" "$@"
     return $?
   fi
-  GHIS_WRAPPER_ACTIVE=1 command {binary} "$_ghis_kind" -- "$@"
+  GHIS_WRAPPER_ACTIVE=1 command {binary} "$ghis_kind" -- "$@"
+}}
+
+# Keep the historical helper name for already-loaded callers and third-party
+# snippets, but make the wrapper itself depend only on the snapshot-safe name.
+_ghis_dispatch() {{
+  ghis_dispatch "$@"
 }}
 
 function git {{
-  _ghis_dispatch git "$@"
+  ghis_dispatch git "$@"
 }}
 
 function gh {{
-  _ghis_dispatch gh "$@"
+  ghis_dispatch gh "$@"
 }}
 
 # Refreshing this local state is optional and never performs network access.
 # A caller can set GHIS_DISABLE_CHPWD=1 when another chpwd hook owns this work.
 autoload -Uz add-zsh-hook 2>/dev/null || true
-_ghis_chpwd() {{
+ghis_chpwd() {{
   [[ "${{GHIS_DISABLE_CHPWD:-0}}" == 1 ]] && return 0
   # Keep only a local hint; this must never perform network I/O or print.
-  local _ghis_root
-  _ghis_root="$(GHIS_BYPASS=1 command git rev-parse --show-toplevel 2>/dev/null)"
-  typeset -g GHIS_REPO_ROOT="$_ghis_root"
+  local ghis_root
+  ghis_root="$(GHIS_BYPASS=1 command git rev-parse --show-toplevel 2>/dev/null)"
+  typeset -g GHIS_REPO_ROOT="$ghis_root"
+}}
+_ghis_chpwd() {{
+  ghis_chpwd "$@"
 }}
 if (( $+functions[add-zsh-hook] )); then
-  add-zsh-hook chpwd _ghis_chpwd
-  _ghis_chpwd
+  add-zsh-hook -d chpwd _ghis_chpwd 2>/dev/null || true
+  add-zsh-hook -d chpwd ghis_chpwd 2>/dev/null || true
+  add-zsh-hook chpwd ghis_chpwd
+  ghis_chpwd
 fi
+
+# Set this last: children can distinguish a legacy/partial environment marker
+# from a wrapper whose function dependencies were all initialized.
+typeset -gx GHIS_SHELL_INTEGRATION_HEALTH=zsh-v2
 "#
     )
 }
@@ -133,9 +154,28 @@ pub fn generate_init(binary: &str) -> String {
     zsh_init_script(binary)
 }
 
-/// Whether the current process was started from a shell that sourced the
-/// generated init script. This marker is diagnostic only and grants no trust
-/// or authorization by itself.
+/// Shell-side health visible to child processes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IntegrationHealth {
+    NotLoaded,
+    Incomplete,
+    Healthy,
+}
+
+/// Classify the inherited shell markers. Functions themselves live in the
+/// parent zsh process and cannot be queried by Rust, so the init script sets a
+/// versioned health marker only after defining every dependency.
+pub fn integration_health() -> IntegrationHealth {
+    let loaded = std::env::var_os(LOADED_ENV).as_deref() == Some(OsStr::new("1"));
+    let healthy = std::env::var_os(HEALTH_ENV).as_deref() == Some(OsStr::new(HEALTHY_MARKER));
+    match (loaded, healthy) {
+        (_, true) => IntegrationHealth::Healthy,
+        (true, false) => IntegrationHealth::Incomplete,
+        (false, false) => IntegrationHealth::NotLoaded,
+    }
+}
+
+/// Compatibility predicate for callers that only need the legacy loaded bit.
 pub fn integration_is_loaded() -> bool {
     std::env::var_os(LOADED_ENV).as_deref() == Some(OsStr::new("1"))
 }
@@ -424,6 +464,18 @@ mod tests {
             zshrc_path(Path::new("/home/alice"), None),
             PathBuf::from("/home/alice/.zshrc")
         );
+    }
+
+    #[test]
+    fn generated_helpers_use_snapshot_safe_names_and_keep_legacy_aliases() {
+        let script = zsh_init_script("ghis");
+        assert!(script.contains("ghis_dispatch()"));
+        assert!(script.contains("ghis_chpwd()"));
+        assert!(script.contains("_ghis_dispatch()"));
+        assert!(script.contains("_ghis_chpwd()"));
+        assert!(script.contains("ghis_dispatch git \"$@\""));
+        assert!(script.contains("GHIS_SHELL_INTEGRATION_HEALTH=zsh-v2"));
+        assert!(!script.contains("__ghis_dispatch"));
     }
 
     #[test]
