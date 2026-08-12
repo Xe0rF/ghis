@@ -1821,6 +1821,35 @@ esac
 }
 
 #[test]
+fn profile_mail_text_labels_the_account_and_indents_candidates() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).expect("bin directory");
+    write_executable(
+        &bin.join("gh"),
+        r#"#!/bin/sh
+case "$*" in
+  "auth token --hostname github.com --user alice") printf 'selected-token\n' ;;
+  "api user") printf '%s\n' '{"id":42,"login":"CanonicalLogin"}' ;;
+  "api user/emails") printf '%s\n' '[]' ;;
+  *) exit 84 ;;
+esac
+"#,
+    );
+
+    let mut mail = isolated_ghis_command();
+    mail.args(["profile", "mail", "personal"])
+        .env("PATH", prepend_path(&bin));
+    for (key, value) in xdg_environment(&temp) {
+        mail.env(key, value);
+    }
+    mail.assert().success().stdout(
+        "github.com/alice 的提交邮箱候选：\n  42+CanonicalLogin@users.noreply.github.com（GitHub noreply，已验证）\n",
+    );
+}
+
+#[test]
 fn profile_noreply_rejects_enterprise_hosts_without_contacting_gh() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let bin = temp.path().join("bin");

@@ -353,7 +353,8 @@ pub struct GhSshSigningKey {
     pub key: String,
 }
 
-/// Read the canonical login and numeric id for the selected gh account.
+/// Read the canonical login and numeric account id from GitHub's low-scope
+/// `/user` endpoint. The endpoint does not require the `user:email` scope.
 pub fn user_identity(host: &str, login: &str) -> Result<GhUser> {
     let value = api_json(host, login, "user")?;
     let id = value
@@ -366,8 +367,9 @@ pub fn user_identity(host: &str, login: &str) -> Result<GhUser> {
     Ok(GhUser { id, login })
 }
 
-/// Generate GitHub.com's ID-based noreply address. Enterprise hosts may use
-/// different address rules, so callers must choose an explicit email there.
+/// Generate GitHub.com's ID-based noreply address. GitHub Enterprise hosts
+/// are deliberately left to their server-provided email candidates because
+/// they do not share github.com's address rule.
 pub fn github_noreply_email(host: &str, login: &str) -> Result<Option<String>> {
     if normalize_host(host) != "github.com" {
         return Ok(None);
@@ -379,8 +381,9 @@ pub fn github_noreply_email(host: &str, login: &str) -> Result<Option<String>> {
     )
 }
 
-/// Build profile email candidates with noreply first. Reading `/user/emails`
-/// is optional because many existing gh tokens do not have `user:email`.
+/// Build the candidates used by profile creation. The noreply candidate is
+/// generated first without requiring email scope; `/user/emails` is optional
+/// and quietly degrades when the selected token cannot read it.
 pub fn profile_email_candidates(host: &str, login: &str) -> Result<Vec<EmailCandidate>> {
     let user = user_identity(host, login)?;
     let mut result = Vec::new();

@@ -583,7 +583,10 @@ fn profile_command(path: Option<&Path>, command: ProfileCommand) -> app::Result<
             let candidates = github::profile_email_candidates(&profile.host, &profile.login)?;
             if args.json {
                 print_json(&candidates)?;
+            } else if candidates.is_empty() {
+                println!("没有发现可用提交邮箱；请手工填写 `--email`。")
             } else {
+                println!("{}/{} 的提交邮箱候选：", profile.host, profile.login);
                 for candidate in candidates {
                     let mut labels = Vec::new();
                     if candidate.noreply {
@@ -595,13 +598,11 @@ fn profile_command(path: Option<&Path>, command: ProfileCommand) -> app::Result<
                     if candidate.verified {
                         labels.push("已验证");
                     }
-                    println!(
-                        "{}{}",
-                        candidate.email,
-                        (!labels.is_empty())
-                            .then(|| format!("（{}）", labels.join("，")))
-                            .unwrap_or_default()
-                    );
+                    if labels.is_empty() {
+                        println!("  {}", candidate.email);
+                    } else {
+                        println!("  {}（{}）", candidate.email, labels.join("，"));
+                    }
                 }
             }
         }
@@ -642,6 +643,7 @@ fn resolve_profile_email(
         });
     }
     explicit
+        .filter(|email| !email.trim().is_empty())
         .map(str::to_owned)
         .ok_or_else(|| app::AppError::Message("请提供 --email，或使用 --noreply（-N）".into()))
 }
@@ -4097,6 +4099,13 @@ fn write_stdout(bytes: &[u8]) -> app::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn explicit_profile_email_rejects_blank_input() {
+        let error = resolve_profile_email("github.com", "alice", Some("   "), false)
+            .expect_err("blank email must be rejected");
+        assert!(error.to_string().contains("请提供 --email"));
+    }
 
     #[test]
     fn shell_integration_state_prefers_loaded_then_installed_then_repository() {
