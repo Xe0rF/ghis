@@ -5,7 +5,7 @@ use ghis::config::{
     Config, ConfigPaths, CredentialFailurePolicy, DisplayIdentity, Profile, Rule, SigningProfile,
     SshMode, SshProfile, SshUnmanagedPolicy, UnresolvedPolicy,
 };
-use ghis::{credential, github, shell, signing, tui};
+use ghis::{credential, diagnostics, github, shell, signing, tui};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::fs;
@@ -976,6 +976,7 @@ struct DoctorReport {
     credential_available: Option<bool>,
     ssh_agent: Option<DoctorAgent>,
     signing_program: Option<DoctorSigningProgram>,
+    git_config: diagnostics::GitConfigReport,
     warnings: Vec<String>,
 }
 
@@ -1012,6 +1013,23 @@ struct DoctorSigningProgram {
 fn doctor(path: Option<&Path>, explicit: Option<&str>, json: bool) -> app::Result<i32> {
     let ctx = context(path, explicit, std::env::current_dir()?)?;
     let mut warnings = ctx.warnings.clone();
+    let diagnostic_cwd = ctx
+        .repository
+        .as_ref()
+        .map(|repository| repository.command_dir().to_path_buf())
+        .unwrap_or(std::env::current_dir()?);
+    let git_config = match diagnostics::scan_git_config(
+        &diagnostic_cwd,
+        ctx.profile.as_ref(),
+        ctx.remote.as_ref(),
+        ctx.identities.as_ref(),
+    ) {
+        Ok(report) => report,
+        Err(error) => {
+            warnings.push(format!("无法读取 Git 配置来源：{error}"));
+            diagnostics::GitConfigReport::default()
+        }
+    };
     let discovery = match github::discover_accounts(None) {
         Ok(discovery) => {
             if let Some(warning) = cache_discovery(&ctx.paths, &discovery) {
@@ -1158,6 +1176,7 @@ fn doctor(path: Option<&Path>, explicit: Option<&str>, json: bool) -> app::Resul
         credential_available,
         ssh_agent,
         signing_program,
+        git_config,
         warnings,
     };
     if json {
@@ -1213,6 +1232,13 @@ fn doctor(path: Option<&Path>, explicit: Option<&str>, json: bool) -> app::Resul
             );
         } else {
             println!("SSH 签名程序: 未发现");
+        }
+        println!(
+            "Git 配置冲突: {}",
+            diagnostics::summary_line(&report.git_config)
+        );
+        for item in &report.git_config.diagnostics {
+            println!("{}", diagnostics::render_row(item));
         }
         for warning in &report.warnings {
             eprintln!("警告：{warning}");
@@ -1834,7 +1860,7 @@ fn build_tui_local_snapshot(
             .as_ref()
             .and_then(|profile| profile.signing.program.as_deref()),
     );
-    let diagnostics = vec![
+    let mut diagnostics = vec![
         format!("Git\t{}", tool_text(&tool_status("git", &["--version"]))),
         format!("gh\t{}", tool_text(&tool_status("gh", &["--version"]))),
         format!("zsh\t{}", tool_text(&tool_status("zsh", &["--version"]))),
@@ -1852,6 +1878,21 @@ fn build_tui_local_snapshot(
                 .unwrap_or_else(|| "未发现".into())
         ),
     ];
+    match diagnostics::scan_git_config(
+        cwd,
+        ctx.profile.as_ref(),
+        ctx.remote.as_ref(),
+        ctx.identities.as_ref(),
+    ) {
+        Ok(report) => {
+            diagnostics.push(format!(
+                "Git 配置冲突\t{}",
+                diagnostics::summary_line(&report)
+            ));
+            diagnostics.extend(report.diagnostics.iter().map(diagnostics::render_row));
+        }
+        Err(error) => warnings.push(format!("无法读取 Git 配置来源：{error}")),
+    }
     Ok(TuiLocalSnapshot {
         repository,
         profile,

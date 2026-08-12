@@ -1,5 +1,5 @@
-//! Read-only diagnostics for Git settings that can alter identity,
-//! authentication, signing, or the effective remote.
+//! Read-only diagnostics for Git configuration that can alter identity,
+//! authentication, signing, or the actual remote used by an operation.
 
 use crate::config::{Profile, SshMode};
 use crate::git::{self, ConfigEntry, EffectiveIdentities};
@@ -8,6 +8,7 @@ use crate::signing;
 use serde::Serialize;
 use std::path::Path;
 
+/// Diagnostic severity shared by CLI JSON/text output and the TUI.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
@@ -26,6 +27,9 @@ impl Severity {
     }
 }
 
+/// One actionable configuration finding. Values are sanitized before they
+/// enter this public structure so JSON, logs, and TUI rows cannot expose an
+/// Authorization header or credential helper body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GitConfigDiagnostic {
     pub severity: Severity,
@@ -37,6 +41,7 @@ pub struct GitConfigDiagnostic {
     pub suggestion: String,
 }
 
+/// Structured report consumed by both front ends.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct GitConfigReport {
     pub info: usize,
@@ -47,6 +52,10 @@ pub struct GitConfigReport {
 
 impl GitConfigReport {
     fn from_diagnostics(diagnostics: Vec<GitConfigDiagnostic>) -> Self {
+        // Git's merged list is ordered by source and value. Keep that order:
+        // it is material for multi-valued credential helpers and URL rewrite
+        // precedence. Severity counts let the callers present a summary
+        // without rewriting the underlying configuration order.
         let info = diagnostics
             .iter()
             .filter(|item| item.severity == Severity::Info)
@@ -68,6 +77,7 @@ impl GitConfigReport {
     }
 }
 
+/// Compact summary suitable for a status row or a doctor heading.
 pub fn summary_line(report: &GitConfigReport) -> String {
     format!(
         "信息={} 警告={} 错误={}",
@@ -75,6 +85,7 @@ pub fn summary_line(report: &GitConfigReport) -> String {
     )
 }
 
+/// Render one finding for a text terminal or a filterable TUI list row.
 pub fn render_row(item: &GitConfigDiagnostic) -> String {
     format!(
         "{}\t{}={}\t范围={} 来源={}\t影响={}\t建议={}",
@@ -88,6 +99,7 @@ pub fn render_row(item: &GitConfigDiagnostic) -> String {
     )
 }
 
+/// Inspect Git's merged configuration without changing any setting.
 pub fn scan_git_config(
     cwd: &Path,
     profile: Option<&Profile>,
@@ -98,6 +110,8 @@ pub fn scan_git_config(
     Ok(scan_entries(&entries, profile, remote, identities))
 }
 
+/// Analyze entries already obtained from Git. This pure form keeps tests
+/// independent from the caller's real HOME and global Git configuration.
 pub fn scan_entries(
     entries: &[ConfigEntry],
     profile: Option<&Profile>,
@@ -105,6 +119,7 @@ pub fn scan_entries(
     identities: Option<&EffectiveIdentities>,
 ) -> GitConfigReport {
     let mut diagnostics = Vec::new();
+
     for entry in entries {
         if is_ghis_fragment(entry) {
             continue;
@@ -127,6 +142,7 @@ pub fn scan_entries(
             inspect_url_rewrite(entry, remote, &mut diagnostics);
         }
     }
+
     inspect_effective_identity(profile, identities, &mut diagnostics);
     GitConfigReport::from_diagnostics(diagnostics)
 }
@@ -136,20 +152,23 @@ fn inspect_identity_entry(
     profile: Option<&Profile>,
     diagnostics: &mut Vec<GitConfigDiagnostic>,
 ) {
-    let Some(profile) = profile else { return };
+    let Some(profile) = profile else {
+        return;
+    };
     let expected = if entry.key == "user.name" {
         &profile.git_name
     } else {
         &profile.git_email
     };
-    if entry.value.trim_end() != expected {
-        diagnostics.push(finding(
-            Severity::Warning,
-            entry,
-            "这个身份值与当前 Profile 不同，可能覆盖提交身份",
-            "确认其适用范围；ghis 只报告，不会删除现有配置",
-        ));
+    if entry.value.trim_end() == expected {
+        return;
     }
+    diagnostics.push(finding(
+        Severity::Warning,
+        entry,
+        "这个身份值与当前 Profile 不同，可能在未绑定仓库或显式覆盖时成为提交身份",
+        "保留前先确认其适用范围；ghis 不会自动删除全局、system 或仓库配置",
+    ));
 }
 
 fn inspect_signing_entry(
@@ -157,7 +176,9 @@ fn inspect_signing_entry(
     profile: Option<&Profile>,
     diagnostics: &mut Vec<GitConfigDiagnostic>,
 ) {
-    let Some(profile) = profile else { return };
+    let Some(profile) = profile else {
+        return;
+    };
     let value = entry.value.trim();
     let conflicts = match entry.key.as_str() {
         "commit.gpgsign" => {
@@ -167,7 +188,7 @@ fn inspect_signing_entry(
         "gpg.ssh.program" => {
             profile.signing.enabled
                 && expected_signing_program(profile)
-                    .is_some_and(|expected| value != expected.trim())
+                    .is_some_and(|expected| !same_config_value(value, &expected))
         }
         "user.signingkey" => {
             profile.signing.enabled
@@ -177,16 +198,21 @@ fn inspect_signing_entry(
         }
         _ => false,
     };
-    if conflicts {
-        diagnostics.push(finding(
-            Severity::Warning,
-            entry,
-            "这个设置可能覆盖当前 Profile 的 SSH signing 配置",
-            "把账号相关签名设置放进 Profile；ghis 不会改写全局配置",
-        ));
+    if !conflicts {
+        return;
     }
+    diagnostics.push(finding(
+        Severity::Warning,
+        entry,
+        "这个签名设置可能覆盖当前 Profile 的 SSH signing 配置或强制启用另一种签名方式",
+        "把账号相关签名设置放进 Profile；ghis 只报告，不会改写现有全局配置",
+    ));
 }
 
+/// The generated fragment uses an explicit signing key when supplied, and
+/// otherwise reuses the managed SSH public-key path. Keep that same fallback
+/// here so a matching global value is not reported as a conflict merely
+/// because the profile chose the authentication key for signing as well.
 fn profile_signing_key(profile: &Profile) -> Option<String> {
     profile.signing.signing_key.clone().or_else(|| {
         profile
@@ -195,6 +221,10 @@ fn profile_signing_key(profile: &Profile) -> Option<String> {
             .and_then(|ssh| ssh.public_key.as_ref())
             .map(|path| path.to_string_lossy().into_owned())
     })
+}
+
+fn same_config_value(actual: &str, expected: &str) -> bool {
+    actual.trim() == expected.trim()
 }
 
 fn expected_signing_program(profile: &Profile) -> Option<String> {
@@ -210,12 +240,17 @@ fn expected_signing_program(profile: &Profile) -> Option<String> {
 }
 
 fn same_signing_key(actual: &str, expected: &str) -> bool {
-    match (
-        signing::public_key_material(actual),
-        signing::public_key_material(expected),
-    ) {
+    let actual = actual.trim();
+    let expected = expected.trim();
+    let actual_material = actual
+        .strip_prefix("key::")
+        .and_then(signing::public_key_material);
+    let expected_material = expected
+        .strip_prefix("key::")
+        .and_then(signing::public_key_material);
+    match (actual_material, expected_material) {
         (Some(actual), Some(expected)) => actual == expected,
-        _ => actual.trim() == expected.trim(),
+        _ => same_config_value(actual, expected),
     }
 }
 
@@ -237,7 +272,7 @@ fn inspect_ssh_command(
         },
         entry,
         "core.sshCommand 会改变 SSH push 使用的程序、Agent 或 key",
-        "确认它没有固定到其他账号",
+        "确认它不会固定到其他账号；使用纳管 SSH 时应由 Profile fragment 提供连接设置",
     ));
 }
 
@@ -250,18 +285,24 @@ fn inspect_credential_helper(
     let managed = is_ghis_helper(&entry.value);
     let applies = entry_applies_to_host(entry, profile, remote);
     diagnostics.push(finding(
-        if managed || !applies {
+        if managed {
             Severity::Info
-        } else {
+        } else if applies {
             Severity::Warning
+        } else {
+            Severity::Info
         },
         entry,
         if managed {
-            "这是 ghis 安装的专用 credential helper"
+            "这是 ghis 安装的专用 credential helper；它会按当前 Profile 选择凭据"
         } else {
-            "helper 链顺序可能让 Git 尝试另一个账号"
+            "credential helper 参与凭据查找；错误的链顺序可能让 Git 尝试另一个账号"
         },
-        "检查 helper 的作用域、重置值和顺序",
+        if managed {
+            "确认它前面的空值重置和 helper 链顺序没有被其他配置覆盖"
+        } else {
+            "检查 helper 的作用域和顺序；绑定仓库会为 Profile 主机安装专用 helper"
+        },
     ));
 }
 
@@ -283,11 +324,11 @@ fn inspect_extra_header(
         },
         entry,
         if authorization {
-            "Authorization extraHeader 会绕过 credential helper"
+            "Authorization extraHeader 会绕过 credential helper，可能直接使用另一个账号的凭据"
         } else {
-            "HTTP extraHeader 会改变远端请求"
+            "HTTP extraHeader 会改变 Git 与远端的请求"
         },
-        "核对并手动移除不需要的 extraHeader；ghis 不显示其值",
+        "核对并手动移除不需要的 extraHeader；为防止泄露，ghis 不显示其值也不会自动清理",
     ));
 }
 
@@ -304,8 +345,8 @@ fn inspect_url_rewrite(
             Severity::Info
         },
         entry,
-        "URL rewrite 可能改变实际协议、主机或仓库",
-        "确认改写后的目标仍属于当前 Profile",
+        "URL rewrite 可能把显示的 remote 改写到另一个协议、主机或仓库",
+        "确认改写后的目标仍属于当前 Profile；ghis 不会修改 remote 或 URL rewrite",
     ));
 }
 
@@ -330,8 +371,11 @@ fn inspect_effective_identity(
             value: bounded(&format!("{} <{}>", identity.name, identity.email)),
             scope: "effective".into(),
             origin: "git var".into(),
-            impact: bounded(&format!("Git 最终使用的 {role} 与当前 Profile 不一致")),
-            suggestion: "在 commit 前检查环境变量、-c 参数和 local/worktree 配置".into(),
+            impact: bounded(&format!(
+                "Git 最终使用的 {role} 与当前 Profile 的 {} <{}> 不一致",
+                profile.git_name, profile.git_email
+            )),
+            suggestion: "在 commit 前检查环境变量、-c 参数以及 local/worktree 配置".into(),
         });
     }
 }
@@ -344,7 +388,7 @@ fn finding(
 ) -> GitConfigDiagnostic {
     GitConfigDiagnostic {
         severity,
-        key: bounded(&redact_url_userinfo(&entry.key)),
+        key: redact_key(&entry.key),
         value: display_value(entry),
         scope: bounded(&entry.scope),
         origin: bounded(&entry.origin),
@@ -355,9 +399,12 @@ fn finding(
 
 fn is_ghis_fragment(entry: &ConfigEntry) -> bool {
     let origin = entry.origin.replace('\\', "/").to_ascii_lowercase();
-    origin.contains("/ghis/fragments/")
+    origin.contains("/ghis/fragments/") || origin.contains("/ghis/fragments/config-")
 }
 
+/// Recognize only the command shape ghis writes for its managed helper. A
+/// loose substring check could hide an unrelated helper containing the words
+/// "ghis credential-helper".
 fn is_ghis_helper(value: &str) -> bool {
     let Some(command) = value.trim().strip_prefix('!') else {
         return false;
@@ -447,13 +494,14 @@ fn parse_git_bool(value: &str) -> Option<bool> {
 }
 
 fn display_value(entry: &ConfigEntry) -> String {
-    if is_extra_header(&entry.key) {
+    let key = entry.key.as_str();
+    if is_extra_header(key) {
         return "<已隐藏>".into();
     }
-    if entry.key == "core.sshcommand" {
+    if key == "core.sshcommand" {
         return "<SSH 命令内容已隐藏>".into();
     }
-    if is_credential_helper(&entry.key) {
+    if is_credential_helper(key) {
         let value = entry.value.trim();
         if value.is_empty() {
             return "<空值：重置 helper 链>".into();
@@ -465,12 +513,15 @@ fn display_value(entry: &ConfigEntry) -> String {
             value.split_whitespace().next().unwrap_or("<已隐藏>"),
         ));
     }
-    if entry.key == "user.signingkey"
-        && signing::public_key_material(entry.value.trim_start()).is_some()
+    if key == "user.signingkey" && signing::public_key_material(entry.value.trim_start()).is_some()
     {
         return "<SSH 公钥内容已隐藏>".into();
     }
     bounded(&redact_url_userinfo(entry.value.trim()))
+}
+
+fn redact_key(key: &str) -> String {
+    bounded(&redact_url_userinfo(key))
 }
 
 fn redact_url_userinfo(value: &str) -> String {
@@ -505,6 +556,12 @@ fn bounded(value: &str) -> String {
     }
 }
 
+/// Do not let a hostile Git config value create a new terminal line, inject an
+/// ANSI control sequence, or resize a TUI row. JSON would escape controls, but
+/// the text doctor output and TUI consume these fields directly.
+/// Escape terminal control characters before a value is rendered in text or
+/// TUI output. This is also used by the TUI for data returned by external
+/// agents and GitHub commands.
 pub fn sanitize_display_text(value: &str) -> String {
     let mut sanitized = String::with_capacity(value.len());
     for character in value.chars() {
@@ -548,7 +605,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_effective_identity_mismatch_and_redacts_auth_headers() {
+    fn reports_effective_identity_mismatch_as_error() {
         let identities = EffectiveIdentities {
             author: GitIdentity {
                 name: "Other".into(),
@@ -561,25 +618,58 @@ mod tests {
                 raw: String::new(),
             },
         };
+        let report = scan_entries(&[], Some(&profile()), None, Some(&identities));
+        assert_eq!(report.errors, 1);
+        assert_eq!(report.diagnostics[0].key, "effective.author");
+    }
+
+    #[test]
+    fn redacts_authorization_and_shell_helper_values() {
         let report = scan_entries(
-            &[entry(
-                "global",
-                "file:/tmp/config",
-                "http.https://github.com.extraheader",
-                "Authorization: basic top-secret",
-            )],
+            &[
+                entry(
+                    "global",
+                    "file:/tmp/config",
+                    "http.https://github.com.extraheader",
+                    "Authorization: basic top-secret",
+                ),
+                entry(
+                    "global",
+                    "file:/tmp/config",
+                    "credential.helper",
+                    "!printf password=top-secret",
+                ),
+            ],
             Some(&profile()),
             None,
-            Some(&identities),
+            None,
         );
-        assert_eq!(report.errors, 2);
+        assert_eq!(report.errors, 1);
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("top-secret"));
         assert!(json.contains("<已隐藏>"));
     }
 
     #[test]
-    fn keeps_multivalue_helper_order_and_hides_commands() {
+    fn redacts_userinfo_from_non_shell_credential_helpers() {
+        let report = scan_entries(
+            &[entry(
+                "global",
+                "file:/tmp/config",
+                "credential.helper",
+                "https://user:secret@example.test/helper --flag",
+            )],
+            Some(&profile()),
+            None,
+            None,
+        );
+        let value = &report.diagnostics[0].value;
+        assert!(!value.contains("secret"));
+        assert!(value.contains("<已隐藏>@example.test"));
+    }
+
+    #[test]
+    fn keeps_scope_origin_and_multivalue_helper_order() {
         let report = scan_entries(
             &[
                 entry(
@@ -598,46 +688,129 @@ mod tests {
                     "global",
                     "file:/home/test/.gitconfig",
                     "credential.helper",
-                    "!printf password=top-secret",
+                    "store",
                 ),
             ],
             Some(&profile()),
             None,
             None,
         );
-        assert_eq!(report.diagnostics.len(), 3);
-        assert_eq!(report.diagnostics[0].value, "cache");
-        assert!(report.diagnostics[1].value.contains("重置 helper 链"));
-        assert!(report.diagnostics[2].value.contains("内容已隐藏"));
+        assert_eq!(report.warnings, 3);
         assert!(
-            !serde_json::to_string(&report)
-                .unwrap()
-                .contains("top-secret")
+            report
+                .diagnostics
+                .iter()
+                .any(|item| item.scope == "system" && item.origin == "file:/etc/gitconfig")
+        );
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|item| item.value.contains("重置 helper 链"))
+        );
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .map(|item| item.value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["cache", "<空值：重置 helper 链>", "store"]
         );
     }
 
     #[test]
-    fn ignores_generated_fragments_and_matches_inline_key_comments() {
-        let mut configured = profile();
-        configured.signing.enabled = true;
-        configured.signing.signing_key =
-            Some("key::ecdsa-sha2-nistp256 AAAATEST profile comment".into());
+    fn scopes_authentication_settings_to_an_exact_host() {
         let report = scan_entries(
             &[
                 entry(
-                    "worktree",
-                    "file:/home/test/.config/ghis/fragments/work.gitconfig",
-                    "user.name",
-                    "Other",
+                    "global",
+                    "file:/tmp/config",
+                    "credential.https://notgithub.com.helper",
+                    "store",
                 ),
                 entry(
                     "global",
                     "file:/tmp/config",
-                    "user.signingkey",
-                    "key::ecdsa-sha2-nistp256 AAAATEST other comment",
+                    "credential.https://github.com.helper",
+                    "store",
                 ),
             ],
-            Some(&configured),
+            Some(&profile()),
+            None,
+            None,
+        );
+        assert_eq!(report.diagnostics[0].severity, Severity::Info);
+        assert_eq!(report.diagnostics[1].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn reports_proxy_authorization_and_hides_ssh_command_contents() {
+        let report = scan_entries(
+            &[
+                entry(
+                    "global",
+                    "file:/tmp/config",
+                    "http.https://github.com/.extraheader",
+                    "Proxy-Authorization: Basic proxy-secret",
+                ),
+                entry(
+                    "global",
+                    "file:/tmp/config",
+                    "core.sshcommand",
+                    "ssh -o ProxyCommand='echo ssh-command-secret'",
+                ),
+            ],
+            Some(&profile()),
+            None,
+            None,
+        );
+        assert_eq!(report.diagnostics[0].severity, Severity::Error);
+        assert_eq!(report.diagnostics[0].value, "<已隐藏>");
+        assert_eq!(report.diagnostics[1].value, "<SSH 命令内容已隐藏>");
+        assert!(
+            !serde_json::to_string(&report)
+                .unwrap()
+                .contains("ssh-command-secret")
+        );
+    }
+
+    #[test]
+    fn does_not_silently_hide_an_unrelated_helper_with_ghis_words() {
+        let report = scan_entries(
+            &[
+                entry(
+                    "worktree",
+                    "file:.git/config.worktree",
+                    "credential.https://github.com.helper",
+                    "!printf 'ghis credential-helper'",
+                ),
+                entry(
+                    "worktree",
+                    "file:.git/config.worktree",
+                    "credential.https://github.com.helper",
+                    "!'/usr/bin/ghis' --config '/tmp/ghis.toml' credential-helper",
+                ),
+            ],
+            Some(&profile()),
+            None,
+            None,
+        );
+        assert_eq!(report.diagnostics.len(), 2);
+        assert_eq!(report.diagnostics[0].severity, Severity::Warning);
+        assert_eq!(report.diagnostics[1].severity, Severity::Info);
+        assert_eq!(report.diagnostics[0].value, "<shell helper，内容已隐藏>");
+    }
+
+    #[test]
+    fn ignores_ghis_generated_fragment_entries() {
+        let report = scan_entries(
+            &[entry(
+                "worktree",
+                "file:/home/test/.config/ghis/fragments/work.gitconfig",
+                "user.name",
+                "Other",
+            )],
+            Some(&profile()),
             None,
             None,
         );
@@ -645,11 +818,216 @@ mod tests {
     }
 
     #[test]
-    fn escapes_terminal_controls_and_redacts_url_userinfo() {
-        assert_eq!(sanitize_display_text("a\n\u{1b}[2J"), "a\\n\\u{001B}[2J");
-        assert_eq!(
-            redact_url_userinfo("https://user:secret@example.test/path"),
-            "https://<已隐藏>@example.test/path"
+    fn ignores_profile_matching_ssh_signing_settings() {
+        let mut configured = profile();
+        configured.signing.enabled = true;
+        configured.signing.signing_key = Some("/keys/alice-signing.pub".into());
+        configured.signing.program = Some("/opt/1Password/op-ssh-sign".into());
+
+        let report = scan_entries(
+            &[
+                entry("global", "file:/tmp/config", "commit.gpgsign", "true"),
+                entry("global", "file:/tmp/config", "gpg.format", "ssh"),
+                entry(
+                    "global",
+                    "file:/tmp/config",
+                    "gpg.ssh.program",
+                    " /opt/1Password/op-ssh-sign ",
+                ),
+                entry(
+                    "global",
+                    "file:/tmp/config",
+                    "user.signingkey",
+                    " /keys/alice-signing.pub ",
+                ),
+            ],
+            Some(&configured),
+            None,
+            None,
         );
+
+        assert!(report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn reports_only_mismatched_profile_signing_settings() {
+        let mut configured = profile();
+        configured.signing.enabled = true;
+        configured.signing.signing_key = Some("/keys/alice-signing.pub".into());
+        configured.signing.program = Some("/opt/1Password/op-ssh-sign".into());
+
+        let report = scan_entries(
+            &[
+                entry(
+                    "global",
+                    "file:/tmp/config",
+                    "gpg.ssh.program",
+                    "/usr/bin/ssh-keygen",
+                ),
+                entry(
+                    "global",
+                    "file:/tmp/config",
+                    "user.signingkey",
+                    "/keys/other-signing.pub",
+                ),
+            ],
+            Some(&configured),
+            None,
+            None,
+        );
+
+        assert_eq!(report.warnings, 2);
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .map(|diagnostic| diagnostic.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gpg.ssh.program", "user.signingkey"]
+        );
+    }
+
+    #[test]
+    fn compares_inline_signing_material_without_comments_and_redacts_all_key_shapes() {
+        let mut configured = profile();
+        configured.signing.enabled = true;
+        configured.signing.signing_key =
+            Some("key::ecdsa-sha2-nistp256 AAAATEST profile comment".into());
+
+        let report = scan_entries(
+            &[entry(
+                "global",
+                "file:/tmp/config",
+                "user.signingkey",
+                "key::ecdsa-sha2-nistp256 AAAATEST global comment",
+            )],
+            Some(&configured),
+            None,
+            None,
+        );
+
+        assert!(report.diagnostics.is_empty());
+        let diagnostic = finding(
+            Severity::Warning,
+            &entry(
+                "global",
+                "file:/tmp/config",
+                "user.signingkey",
+                "sk-ssh-ed25519@openssh.com AAAASECRET local comment",
+            ),
+            "impact",
+            "suggestion",
+        );
+        assert_eq!(diagnostic.value, "<SSH 公钥内容已隐藏>");
+        assert!(
+            !serde_json::to_string(&diagnostic)
+                .unwrap()
+                .contains("AAAASECRET")
+        );
+        let prefixed = finding(
+            Severity::Warning,
+            &entry(
+                "global",
+                "file:/tmp/config",
+                "user.signingkey",
+                "key::ecdsa-sha2-nistp256 AAAAPREFIXED local comment",
+            ),
+            "impact",
+            "suggestion",
+        );
+        assert_eq!(prefixed.value, "<SSH 公钥内容已隐藏>");
+        assert!(
+            !serde_json::to_string(&prefixed)
+                .unwrap()
+                .contains("AAAAPREFIXED")
+        );
+    }
+
+    #[test]
+    fn accepts_managed_ssh_key_as_the_default_signing_key() {
+        let mut configured = profile();
+        configured.signing.enabled = true;
+        configured.ssh = Some(crate::config::SshProfile {
+            mode: SshMode::OnePassword,
+            public_key: Some("/keys/authentication.pub".into()),
+            ..crate::config::SshProfile::default()
+        });
+
+        let report = scan_entries(
+            &[entry(
+                "global",
+                "file:/tmp/config",
+                "user.signingkey",
+                "/keys/authentication.pub",
+            )],
+            Some(&configured),
+            None,
+            None,
+        );
+
+        assert!(report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn ignores_inert_key_and_program_when_profile_signing_is_disabled() {
+        let report = scan_entries(
+            &[
+                entry(
+                    "global",
+                    "file:/tmp/config",
+                    "gpg.ssh.program",
+                    "/opt/1Password/op-ssh-sign",
+                ),
+                entry(
+                    "global",
+                    "file:/tmp/config",
+                    "user.signingkey",
+                    "/keys/alice-signing.pub",
+                ),
+            ],
+            Some(&profile()),
+            None,
+            None,
+        );
+
+        assert!(report.diagnostics.is_empty());
+    }
+
+    #[test]
+    fn redacts_userinfo_embedded_in_url_rewrite_keys_and_values() {
+        let diagnostic = finding(
+            Severity::Warning,
+            &entry(
+                "global",
+                "file:/tmp/config",
+                "url.https://token@example.test/.insteadof",
+                "https://secret@example.test/",
+            ),
+            "impact",
+            "suggestion",
+        );
+        assert!(!diagnostic.key.contains("token"));
+        assert!(!diagnostic.value.contains("secret"));
+    }
+
+    #[test]
+    fn sanitizes_control_characters_in_config_provenance_and_values() {
+        let diagnostic = finding(
+            Severity::Warning,
+            &entry(
+                "global\t",
+                "file:/tmp/evil\u{1b}[2J",
+                "user.name",
+                "Alice\nwarning\r\t\u{7}",
+            ),
+            "impact\nwith newline",
+            "suggestion\u{1b}[31m",
+        );
+        let rendered = render_row(&diagnostic);
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(!rendered.contains('\u{7}'));
+        assert!(!rendered.contains("Alice\nwarning"));
+        assert!(rendered.contains("Alice\\nwarning\\r\\t\\u{0007}"));
+        assert!(rendered.contains("file:/tmp/evil\\u{001B}[2J"));
     }
 }
