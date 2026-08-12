@@ -13,7 +13,7 @@ optdepends=(
   'openssh: SSH remotes and SSH commit signing diagnostics'
 )
 source=("file://${startdir}/../../dist/ghis-v${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
-sha256sums=('b8a222cd70fc32fe20a9436103632a83f1a67c22fb7da2d2505619d7e19d2547')
+sha256sums=('6d47960868951b34914b1e96f7f2b888d8c5f20c21b1cdafbc939af1244d8b0e')
 
 package() {
   local release_dir="${srcdir}/ghis-v${pkgver}-x86_64-unknown-linux-gnu"
