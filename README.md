@@ -95,7 +95,7 @@ ghis agent setup claude --yes
 ghis agent status claude
 ```
 
-Codex launcher 使用 CLI 的 `developer_instructions` 注入；两者都不依赖 MCP、skill 或联网文档。上下文不包含 token、私钥、SSH socket、raw remote URL 或 Doctor 诊断。agent 在具体 `git`/`gh` 操作遇到阻力时，再从 shell 运行 `ghis check` 或 `ghis doctor` 获取结构化修复信息。
+Codex launcher 使用 CLI 的 `developer_instructions` 注入；运行 `ghis setup` 后，zsh 中直接输入 `codex` 也会透明转发到该 launcher。两者都不依赖 MCP、skill 或联网文档。上下文不包含 token、私钥、SSH socket、raw remote URL 或 Doctor 诊断。agent 在具体 `git`/`gh` 操作遇到阻力时，再从 shell 运行 `ghis check` 或 `ghis doctor` 获取结构化修复信息。
 
 完整的配置、规则、1Password、SSH 签名、安全边界、Shell 说明和排障方法见 [Wiki](../../wiki)。
 

@@ -150,13 +150,13 @@ fi
     assert!(output.status.success());
     assert!(String::from_utf8_lossy(&output.stdout).contains("marker 存在，但函数依赖不完整"));
 
-    let output = run(true, Some("1"), Some("zsh-v2"));
+    let output = run(true, Some("1"), Some("zsh-v3"));
     assert!(output.status.success());
     let report: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
     assert_eq!(report["shell_integration"]["state"], "wrapper_loaded");
     assert_eq!(report["shell_integration"]["wrapper_loaded"], true);
     assert_eq!(report["shell_integration"]["wrapper_healthy"], true);
-    assert_eq!(report["shell_integration"]["health_marker"], "zsh-v2");
+    assert_eq!(report["shell_integration"]["health_marker"], "zsh-v3");
 }
 
 #[test]

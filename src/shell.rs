@@ -25,7 +25,7 @@ pub const LOADED_ENV: &str = "GHIS_SHELL_INTEGRATION";
 /// after all functions and hook dependencies have been defined.
 pub const HEALTH_ENV: &str = "GHIS_SHELL_INTEGRATION_HEALTH";
 /// Health marker emitted by the current generated integration.
-pub const HEALTHY_MARKER: &str = "zsh-v2";
+pub const HEALTHY_MARKER: &str = "zsh-v3";
 
 /// Resolve the zsh startup file using the same `ZDOTDIR` convention as zsh.
 pub fn zshrc_path(home: &Path, zdotdir: Option<&OsStr>) -> PathBuf {
@@ -116,6 +116,20 @@ function gh {{
   ghis_dispatch gh "$@"
 }}
 
+# Codex has no SessionStart hook equivalent. Route an ordinary `codex` launch
+# through ghis so developer instructions are rendered from the current cwd.
+function codex {{
+  if [[ "${{GHIS_BYPASS:-0}}" == 1 || "${{GHIS_AGENT_WRAPPER_ACTIVE:-0}}" == 1 ]]; then
+    command codex "$@"
+    return $?
+  fi
+  if ! command -v {binary} >/dev/null 2>&1; then
+    command codex "$@"
+    return $?
+  fi
+  GHIS_AGENT_WRAPPER_ACTIVE=1 command {binary} agent run codex -- "$@"
+}}
+
 # Refreshing this local state is optional and never performs network access.
 # A caller can set GHIS_DISABLE_CHPWD=1 when another chpwd hook owns this work.
 autoload -Uz add-zsh-hook 2>/dev/null || true
@@ -138,7 +152,7 @@ fi
 
 # Set this last: children can distinguish a legacy/partial environment marker
 # from a wrapper whose function dependencies were all initialized.
-typeset -gx GHIS_SHELL_INTEGRATION_HEALTH=zsh-v2
+typeset -gx GHIS_SHELL_INTEGRATION_HEALTH=zsh-v3
 "#
     )
 }
@@ -474,7 +488,10 @@ mod tests {
         assert!(script.contains("_ghis_dispatch()"));
         assert!(script.contains("_ghis_chpwd()"));
         assert!(script.contains("ghis_dispatch git \"$@\""));
-        assert!(script.contains("GHIS_SHELL_INTEGRATION_HEALTH=zsh-v2"));
+        assert!(script.contains("function codex"));
+        assert!(script.contains("agent run codex -- \"$@\""));
+        assert!(script.contains("GHIS_AGENT_WRAPPER_ACTIVE"));
+        assert!(script.contains("GHIS_SHELL_INTEGRATION_HEALTH=zsh-v3"));
         assert!(!script.contains("__ghis_dispatch"));
     }
 

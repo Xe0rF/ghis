@@ -965,6 +965,62 @@ fn generated_zsh_wrapper_is_valid_and_preserves_git_exit_status() {
 }
 
 #[test]
+fn codex_wrapper_routes_direct_launch_and_allows_explicit_bypass() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir_all(&fake_bin).expect("fake bin");
+    let trace = temp.path().join("codex-trace");
+    write_executable(
+        &fake_bin.join("codex"),
+        r#"#!/bin/sh
+printf '%s\n' "$@" > "$CODEX_TRACE"
+"#,
+    );
+    let init = temp.path().join("init.zsh");
+    let ghis_bin = assert_cmd::cargo::cargo_bin!("ghis");
+    fs::write(
+        &init,
+        ghis::shell::zsh_init_script(&ghis_bin.to_string_lossy()),
+    )
+    .expect("init");
+    let path = std::env::join_paths(std::iter::once(fake_bin.clone()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .expect("PATH");
+    let mut command = Command::new("zsh");
+    command
+        .args(["-f", "-c", "source \"$GHIS_TEST_INIT\"; codex --model test"])
+        .current_dir(temp.path())
+        .env("GHIS_TEST_INIT", &init)
+        .env("CODEX_TRACE", &trace)
+        .env("PATH", &path);
+    for (key, value) in xdg_environment(&temp) {
+        command.env(key, value);
+    }
+    clear_ghis_environment(&mut command);
+    assert!(command.status().expect("run wrapped codex").success());
+    let arguments = fs::read_to_string(&trace).expect("trace");
+    assert!(arguments.contains("developer_instructions=ghis session context"));
+    assert!(arguments.contains("--model\ntest"));
+
+    let mut bypass = Command::new("zsh");
+    bypass
+        .args([
+            "-f",
+            "-c",
+            "source \"$GHIS_TEST_INIT\"; GHIS_BYPASS=1 codex --model raw",
+        ])
+        .current_dir(temp.path())
+        .env("GHIS_TEST_INIT", &init)
+        .env("CODEX_TRACE", &trace)
+        .env("PATH", path);
+    clear_ghis_environment(&mut bypass);
+    assert!(bypass.status().expect("run bypassed codex").success());
+    assert_eq!(fs::read_to_string(trace).expect("trace"), "--model\nraw\n");
+}
+
+#[test]
 fn zsh_wrapper_preserves_tty_and_sigint_status() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let fake_bin = temp.path().join("fake-bin");
