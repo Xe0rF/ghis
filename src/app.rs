@@ -1046,7 +1046,8 @@ pub fn inspect_profile_signing(profile: &Profile) -> Result<signing::SigningStat
 }
 
 /// Reuse the SSH authentication fingerprint only when signing also reuses
-/// that public key. An explicit signing key can intentionally be different.
+/// that public key. An explicit `signing_key` may intentionally select a
+/// different key from the same Agent.
 pub fn profile_signing_fingerprint(profile: &Profile) -> Option<String> {
     profile
         .signing

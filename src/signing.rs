@@ -88,6 +88,15 @@ pub struct AgentInfo {
     pub error: Option<String>,
 }
 
+/// A public-key file discovered under the user's SSH directory. Only `.pub`
+/// files are opened; private-key filenames and contents are never inspected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PublicKeyFile {
+    pub path: PathBuf,
+    pub public_key: String,
+    pub fingerprint: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SigningProgram {
     pub path: PathBuf,
@@ -155,6 +164,72 @@ pub fn onepassword_socket_candidates() -> Vec<PathBuf> {
     paths
 }
 
+/// Discover public key material from the conventional `~/.ssh` directory.
+/// This is intentionally a read-only lookup used by the TUI to offer choices
+/// instead of asking users to paste key material or point at a private key.
+pub fn discover_public_key_files() -> Vec<PublicKeyFile> {
+    let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
+        return Vec::new();
+    };
+    discover_public_key_files_in(&home.join(".ssh"))
+}
+
+pub fn discover_public_key_files_in(directory: &Path) -> Vec<PublicKeyFile> {
+    let Ok(entries) = fs::read_dir(directory) else {
+        return Vec::new();
+    };
+    let mut keys = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if path.extension().and_then(|value| value.to_str()) != Some("pub")
+                || !entry.file_type().ok()?.is_file()
+            {
+                return None;
+            }
+            load_public_key_file(&path).ok()
+        })
+        .collect::<Vec<_>>();
+    keys.sort_by(|left, right| left.path.cmp(&right.path));
+    keys
+}
+
+/// Load one explicitly selected public-key file.
+///
+/// Requiring a regular `.pub` file before opening it prevents the profile
+/// editor from accidentally treating a conventional private-key path as
+/// public material. `ssh-keygen` then performs the actual key validation and
+/// fingerprint calculation.
+pub fn load_public_key_file(path: &Path) -> Result<PublicKeyFile> {
+    let path = expand_user(path);
+    if path.extension().and_then(|value| value.to_str()) != Some("pub") {
+        return Err(SigningError::InvalidKey(format!(
+            "{} is not a .pub file",
+            path.display()
+        )));
+    }
+    let metadata = fs::symlink_metadata(&path)?;
+    if !metadata.file_type().is_file() {
+        return Err(SigningError::InvalidKey(format!(
+            "{} is not a regular public-key file",
+            path.display()
+        )));
+    }
+    let text = fs::read_to_string(&path)?;
+    let public_key = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .filter(|line| is_public_key_line(line))
+        .ok_or_else(|| SigningError::InvalidKey(path.display().to_string()))?;
+    let fingerprint = fingerprint(public_key)?;
+    Ok(PublicKeyFile {
+        path,
+        public_key: public_key.to_owned(),
+        fingerprint: Some(fingerprint),
+    })
+}
+
 /// Whether a line starts with a supported SSH public-key algorithm. This is a
 /// cheap shape check; callers that need validation must still use
 /// [`fingerprint`], which delegates parsing to `ssh-keygen`.
@@ -167,6 +242,11 @@ pub fn is_public_key_line(value: &str) -> bool {
 }
 
 /// Return the form Git expects for an inline SSH signing public key.
+///
+/// Git accepts paths directly, but literal public keys must use the `key::`
+/// marker. Some Git versions happen to recognize a bare `ssh-*` key while
+/// treating ECDSA, FIDO, and RSA-SHA2 keys as filenames, so always emit the
+/// explicit form for every supported inline key shape.
 pub fn git_signing_key_value(value: &str) -> String {
     let trimmed = value.trim_start();
     if trimmed.starts_with("key::") {
@@ -388,8 +468,9 @@ pub fn select_key(keys: &[AgentKey], config: &SigningProfile) -> Option<AgentKey
     (keys.len() == 1).then(|| keys[0].clone())
 }
 
-/// Normalize a public SSH key to its algorithm and base64 material. Comments
-/// are labels for humans and do not participate in key matching.
+/// Normalize a public SSH key to the type and base64 fields GitHub stores.
+/// Comments identify a local key for humans but are not part of its public
+/// material, so they must not affect matching.
 pub fn public_key_material(public_key: &str) -> Option<String> {
     let line = public_key
         .lines()
@@ -522,6 +603,45 @@ mod tests {
             ..SigningProfile::default()
         };
         assert!(select_key(&keys, &config).is_none());
+    }
+
+    #[test]
+    fn discovers_only_public_key_files_without_opening_private_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        fs::write(
+            directory.path().join("work.pub"),
+            concat!(
+                "ssh-ed25519 ",
+                "AAAAC3NzaC1lZDI1NTE5AAAAIORNiyIAB0NMF693WD7pB4vSv8uiK6PwYOPNBow9qa7t ",
+                "work\n"
+            ),
+        )
+        .unwrap();
+        fs::write(directory.path().join("work"), "private material\n").unwrap();
+        fs::write(directory.path().join("notes.pub"), "not a key\n").unwrap();
+
+        let keys = discover_public_key_files_in(directory.path());
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].path.file_name().unwrap(), "work.pub");
+        assert!(keys[0].public_key.ends_with(" work"));
+        assert!(
+            keys[0]
+                .fingerprint
+                .as_deref()
+                .is_some_and(|value| { value.starts_with("SHA256:") })
+        );
+    }
+
+    #[test]
+    fn explicit_public_key_loader_rejects_non_pub_and_invalid_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let private = directory.path().join("signing-key");
+        let invalid = directory.path().join("invalid.pub");
+        fs::write(&private, "private material\n").unwrap();
+        fs::write(&invalid, "not a public key\n").unwrap();
+
+        assert!(load_public_key_file(&private).is_err());
+        assert!(load_public_key_file(&invalid).is_err());
     }
 
     #[test]

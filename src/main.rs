@@ -1930,6 +1930,20 @@ impl TuiWorkers {
         self.send(TuiWorkerJob::Emails { host, login })
     }
 
+    fn inspect_agent(&self, socket: Option<PathBuf>) -> io::Result<()> {
+        self.send(TuiWorkerJob::InspectAgent {
+            socket,
+            submitted_ssh: None,
+        })
+    }
+
+    fn inspect_agent_for_ssh(&self, socket: PathBuf, submitted_ssh: String) -> io::Result<()> {
+        self.send(TuiWorkerJob::InspectAgent {
+            socket: Some(socket),
+            submitted_ssh: Some(submitted_ssh),
+        })
+    }
+
     fn bind(
         &self,
         path: Option<PathBuf>,
@@ -1977,6 +1991,10 @@ enum TuiWorkerJob {
         host: String,
         login: String,
     },
+    InspectAgent {
+        socket: Option<PathBuf>,
+        submitted_ssh: Option<String>,
+    },
     Bind {
         path: Option<PathBuf>,
         id: String,
@@ -2008,6 +2026,28 @@ fn run_tui_worker(receiver: Receiver<TuiWorkerJob>, sender: Sender<TuiWorkerResu
                 TuiWorkerResult::Emails {
                     host,
                     login,
+                    result,
+                }
+            }
+            TuiWorkerJob::InspectAgent {
+                socket,
+                submitted_ssh,
+            } => {
+                let result = (|| {
+                    let socket = signing::discover_agent_socket(socket.as_deref());
+                    let agent = match socket.as_ref() {
+                        Some(socket) => Some(signing::inspect_agent(socket)?),
+                        None => None,
+                    };
+                    Ok(TuiAgentDiscovery {
+                        socket,
+                        agent,
+                        public_keys: signing::discover_public_key_files(),
+                        signing_program: signing::discover_signing_program(None),
+                    })
+                })();
+                TuiWorkerResult::Agent {
+                    submitted_ssh,
                     result,
                 }
             }
@@ -2064,10 +2104,22 @@ enum TuiWorkerResult {
         login: String,
         result: github::Result<Vec<github::EmailCandidate>>,
     },
+    Agent {
+        submitted_ssh: Option<String>,
+        result: app::Result<TuiAgentDiscovery>,
+    },
     RepositoryMutation {
         operation: TuiRepositoryMutation,
         result: app::Result<TuiLocalSnapshot>,
     },
+}
+
+#[derive(Debug)]
+struct TuiAgentDiscovery {
+    socket: Option<PathBuf>,
+    agent: Option<signing::AgentInfo>,
+    public_keys: Vec<signing::PublicKeyFile>,
+    signing_program: Option<signing::SigningProgram>,
 }
 
 #[derive(Debug)]
@@ -2086,8 +2138,7 @@ struct TuiLocalSnapshot {
 
 #[derive(Debug, Clone)]
 enum TuiPending {
-    AddProfile,
-    EditProfile(String),
+    ProfileWizard(Box<TuiProfileWizard>),
     AddRule,
     EditRule(String),
     DeleteProfile(String),
@@ -2097,22 +2148,165 @@ enum TuiPending {
         login: String,
         bind_after_create: bool,
     },
-    InputDiscoveredProfile {
-        host: String,
-        login: String,
-        bind_after_create: bool,
-    },
-    ConfirmDiscoveredProfile(TuiProfileDraft),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct TuiProfileDraft {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TuiProfileWizardPhase {
+    Account,
+    Ssh,
+    Signing,
+}
+
+/// Four-stage Profile editor state. The fourth stage is the existing confirm
+/// mode; keeping the draft in memory means no partial profile is written when
+/// the user cancels at any point.
+#[derive(Debug, Clone)]
+struct TuiProfileWizard {
     id: String,
+    original_id: Option<String>,
+    original_profile: Option<Profile>,
     host: String,
     login: String,
     git_name: String,
     git_email: String,
+    ssh: Option<SshProfile>,
+    signing: SigningProfile,
     bind_after_create: bool,
+    phase: TuiProfileWizardPhase,
+    agent: Option<signing::AgentInfo>,
+    agent_socket: Option<PathBuf>,
+    public_keys: Vec<signing::PublicKeyFile>,
+    signing_program: Option<signing::SigningProgram>,
+}
+
+#[derive(Debug, Clone)]
+struct TuiResolvedSigningKey {
+    config_value: String,
+    public_key: String,
+    fingerprint: String,
+}
+
+impl TuiProfileWizard {
+    fn new(
+        host: impl Into<String>,
+        login: impl Into<String>,
+        git_email: impl Into<String>,
+        bind_after_create: bool,
+    ) -> Self {
+        Self {
+            id: String::new(),
+            original_id: None,
+            original_profile: None,
+            host: github::normalize_host(&host.into()),
+            login: login.into(),
+            git_name: String::new(),
+            git_email: git_email.into(),
+            ssh: None,
+            signing: SigningProfile::default(),
+            bind_after_create,
+            phase: TuiProfileWizardPhase::Account,
+            agent: None,
+            agent_socket: None,
+            public_keys: Vec::new(),
+            signing_program: None,
+        }
+    }
+
+    fn from_profile(id: &str, profile: &Profile) -> Self {
+        Self {
+            id: id.into(),
+            original_id: Some(id.into()),
+            original_profile: Some(profile.clone()),
+            host: profile.host.clone(),
+            login: profile.login.clone(),
+            git_name: profile.git_name.clone(),
+            git_email: profile.git_email.clone(),
+            ssh: profile.ssh.clone(),
+            signing: profile.signing.clone(),
+            bind_after_create: false,
+            phase: TuiProfileWizardPhase::Account,
+            agent: None,
+            agent_socket: profile
+                .ssh
+                .as_ref()
+                .and_then(|ssh| ssh.agent_socket.clone()),
+            public_keys: Vec::new(),
+            signing_program: None,
+        }
+    }
+
+    fn account_input(&self) -> String {
+        format!(
+            "{}|{}|{}|{}|{}",
+            self.id, self.host, self.login, self.git_name, self.git_email
+        )
+    }
+
+    fn ssh_input(&self) -> String {
+        let Some(ssh) = self.ssh.as_ref() else {
+            return "external".into();
+        };
+        if ssh.mode == SshMode::External {
+            return "external".into();
+        }
+        let mode = match ssh.mode {
+            SshMode::External => "external",
+            SshMode::OnePassword => "one-password",
+            SshMode::Managed => "managed",
+        };
+        format!(
+            "{}|{}|{}",
+            mode,
+            ssh.public_key
+                .as_deref()
+                .map(|path| path.to_string_lossy())
+                .unwrap_or_default(),
+            ssh.agent_socket
+                .as_deref()
+                .map(|path| path.to_string_lossy())
+                .unwrap_or_default()
+        )
+    }
+
+    fn signing_input(&self) -> String {
+        if !self.signing.enabled {
+            return "off".into();
+        }
+        let key = self
+            .signing
+            .signing_key
+            .clone()
+            .or_else(|| {
+                self.ssh
+                    .as_ref()
+                    .and_then(|ssh| ssh.public_key.as_deref())
+                    .map(|path| path.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default();
+        let program = self
+            .signing
+            .program
+            .as_deref()
+            .map(|path| path.to_string_lossy().into_owned())
+            .or_else(|| {
+                self.signing_program
+                    .as_ref()
+                    .map(|program| program.path.to_string_lossy().into_owned())
+            })
+            .unwrap_or_default();
+        format!("on|{key}|{program}")
+    }
+
+    fn profile(&self) -> Profile {
+        Profile {
+            host: self.host.clone(),
+            login: self.login.clone(),
+            git_name: self.git_name.clone(),
+            git_email: self.git_email.clone(),
+            ssh: self.ssh.clone(),
+            signing: self.signing.clone(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2598,9 +2792,15 @@ fn handle_tui_action(
             state.status = "设置已更新".into();
         }
         tui::Action::Add if state.view == tui::View::Profiles => {
-            *pending = Some(TuiPending::AddProfile);
+            let mut wizard = TuiProfileWizard::new("github.com", "", "", false);
+            wizard.id = "新身份".into();
+            *pending = Some(TuiPending::ProfileWizard(Box::new(wizard.clone())));
             state.details.clear();
-            begin_tui_input(state, "ID|GitHub 登录名|提交姓名|提交邮箱", "");
+            begin_tui_input(
+                state,
+                "第一段：ID|主机|GitHub 登录名|提交姓名|提交邮箱",
+                &wizard.account_input(),
+            );
         }
         tui::Action::Edit if state.view == tui::View::Profiles => {
             let (_, config) = load_config(path)?;
@@ -2613,12 +2813,13 @@ fn handle_tui_action(
                 .profiles
                 .get(&id)
                 .ok_or_else(|| app::AppError::Message(format!("身份配置 `{id}` 不存在")))?;
-            let initial = format!(
-                "{id}|{}|{}|{}",
-                profile.login, profile.git_name, profile.git_email
+            let wizard = TuiProfileWizard::from_profile(&id, profile);
+            *pending = Some(TuiPending::ProfileWizard(Box::new(wizard.clone())));
+            begin_tui_input(
+                state,
+                "第一段：ID|主机|GitHub 登录名|提交姓名|提交邮箱",
+                &wizard.account_input(),
             );
-            *pending = Some(TuiPending::EditProfile(id));
-            begin_tui_input(state, "ID|GitHub 登录名|提交姓名|提交邮箱", &initial);
         }
         tui::Action::Add if state.view == tui::View::Rules => {
             *pending = Some(TuiPending::AddRule);
@@ -2674,44 +2875,8 @@ fn handle_tui_action(
         tui::Action::SubmitInput => {
             let operation = pending.take();
             match operation {
-                Some(TuiPending::InputDiscoveredProfile {
-                    host,
-                    login,
-                    bind_after_create,
-                }) => {
-                    let draft = match parse_tui_profile_draft(
-                        &state.input,
-                        &host,
-                        &login,
-                        bind_after_create,
-                    ) {
-                        Ok(draft) => draft,
-                        Err(error) => {
-                            *pending = Some(TuiPending::InputDiscoveredProfile {
-                                host,
-                                login,
-                                bind_after_create,
-                            });
-                            state.mode = tui::Mode::Insert;
-                            return Err(error);
-                        }
-                    };
-                    state.set_input(format!(
-                        "创建 `{}`：{} <{}>，账号 {}/{}{}",
-                        draft.id,
-                        draft.git_name,
-                        draft.git_email,
-                        draft.host,
-                        draft.login,
-                        if draft.bind_after_create {
-                            "，并绑定当前仓库"
-                        } else {
-                            ""
-                        }
-                    ));
-                    state.mode = tui::Mode::Confirm;
-                    state.status = "请检查身份信息，按 y 或 Enter 确认创建".into();
-                    *pending = Some(TuiPending::ConfirmDiscoveredProfile(draft));
+                Some(TuiPending::ProfileWizard(wizard)) => {
+                    submit_tui_profile_wizard(state, *wizard, pending, workers, active_workers)?;
                 }
                 operation => {
                     apply_tui_input(operation, &state.input, path)?;
@@ -2745,20 +2910,22 @@ fn handle_tui_action(
                 schedule_tui_local_refresh(state, active_workers, action_context)?;
                 state.status = format!("已删除身份配置 `{id}`");
             }
-            Some(TuiPending::ConfirmDiscoveredProfile(draft)) => {
-                save_tui_profile_draft(path, &draft)?;
-                if draft.bind_after_create {
-                    let ctx = context(path, Some(&draft.id), cwd)?;
-                    app::bind_repository(&ctx, &draft.id)?;
+            Some(TuiPending::ProfileWizard(wizard)) => {
+                save_tui_profile_wizard(path, &wizard)?;
+                if wizard.bind_after_create {
+                    let ctx = context(path, Some(&wizard.id), cwd)?;
+                    app::bind_repository(&ctx, &wizard.id)?;
                 }
                 reload_tui_config_views(state, path, discovery.as_ref())?;
                 schedule_tui_local_refresh(state, active_workers, action_context)?;
                 state.details.clear();
                 state.input.clear();
-                state.status = if draft.bind_after_create {
-                    format!("已创建并绑定身份配置 `{}`", draft.id)
+                state.status = if wizard.bind_after_create {
+                    format!("已创建并绑定身份配置 `{}`", wizard.id)
+                } else if wizard.original_id.is_some() {
+                    format!("已更新身份配置 `{}`", wizard.id)
                 } else {
-                    format!("已创建身份配置 `{}`", draft.id)
+                    format!("已创建身份配置 `{}`", wizard.id)
                 };
             }
             _ => {}
@@ -2780,6 +2947,443 @@ fn handle_tui_action(
         _ => {}
     }
     Ok(())
+}
+
+fn submit_tui_profile_wizard(
+    state: &mut tui::AppState,
+    mut wizard: TuiProfileWizard,
+    pending: &mut Option<TuiPending>,
+    workers: &TuiWorkers,
+    active_workers: &mut usize,
+) -> app::Result<()> {
+    match wizard.phase {
+        TuiProfileWizardPhase::Account => {
+            if let Err(error) = parse_tui_wizard_account(&mut wizard, &state.input) {
+                *pending = Some(TuiPending::ProfileWizard(Box::new(wizard)));
+                state.mode = tui::Mode::Insert;
+                return Err(error);
+            }
+            let socket = wizard
+                .ssh
+                .as_ref()
+                .and_then(|ssh| ssh.agent_socket.clone())
+                .or_else(|| wizard.agent_socket.clone());
+            workers.inspect_agent(socket)?;
+            *active_workers += 1;
+            state.loading = true;
+            state.details = vec![
+                format!("第一段完成：{}/{}", wizard.host, wizard.login),
+                "正在后台发现 SSH Agent、公钥文件和签名程序".into(),
+            ];
+            state.status = "第二段准备中；完成后可选择 SSH key，或输入 external 跳过".into();
+            wizard.phase = TuiProfileWizardPhase::Ssh;
+            *pending = Some(TuiPending::ProfileWizard(Box::new(wizard)));
+        }
+        TuiProfileWizardPhase::Ssh => {
+            if let Some(socket) = tui_agent_socket_needing_inspection(&wizard, &state.input) {
+                let submitted_ssh = state.input.clone();
+                workers.inspect_agent_for_ssh(socket.clone(), submitted_ssh)?;
+                *active_workers += 1;
+                state.loading = true;
+                state.status = format!(
+                    "正在后台检查自定义 SSH Agent socket `{}`",
+                    diagnostics::sanitize_display_text(&socket.display().to_string())
+                );
+                state.details = vec![
+                    "自定义 Agent socket 尚未检查；检查完成后会继续第三段".into(),
+                    format!(
+                        "socket：{}",
+                        diagnostics::sanitize_display_text(&socket.display().to_string())
+                    ),
+                ];
+                *pending = Some(TuiPending::ProfileWizard(Box::new(wizard)));
+                return Ok(());
+            }
+            if let Err(error) = parse_tui_wizard_ssh(&mut wizard, &state.input) {
+                *pending = Some(TuiPending::ProfileWizard(Box::new(wizard)));
+                state.mode = tui::Mode::Insert;
+                return Err(error);
+            }
+            begin_tui_signing_stage(state, &mut wizard);
+            *pending = Some(TuiPending::ProfileWizard(Box::new(wizard)));
+        }
+        TuiProfileWizardPhase::Signing => {
+            if let Err(error) = parse_tui_wizard_signing(&mut wizard, &state.input) {
+                *pending = Some(TuiPending::ProfileWizard(Box::new(wizard)));
+                state.mode = tui::Mode::Insert;
+                return Err(error);
+            }
+            state.details = tui_profile_wizard_preview(&wizard);
+            state.set_input(format!("保存身份配置 `{}`", wizard.id));
+            state.mode = tui::Mode::Confirm;
+            state.status = "第四段：检查完整变更；按 y 或 Enter 保存，按 n 或 Esc 取消".into();
+            *pending = Some(TuiPending::ProfileWizard(Box::new(wizard)));
+        }
+    }
+    Ok(())
+}
+
+fn begin_tui_signing_stage(state: &mut tui::AppState, wizard: &mut TuiProfileWizard) {
+    wizard.phase = TuiProfileWizardPhase::Signing;
+    let initial = wizard.signing_input();
+    begin_tui_input(
+        state,
+        "第三段：off，或 on|签名公钥序号/路径|签名程序（程序留空则自动发现）",
+        &initial,
+    );
+    state.details = tui_profile_wizard_key_details(wizard);
+}
+
+fn tui_agent_socket_needing_inspection(wizard: &TuiProfileWizard, input: &str) -> Option<PathBuf> {
+    if wizard
+        .original_profile
+        .as_ref()
+        .is_some_and(|original| original.ssh == wizard.ssh && input.trim() == wizard.ssh_input())
+    {
+        return None;
+    }
+    let fields = input.split('|').map(str::trim).collect::<Vec<_>>();
+    let mode = fields.first().copied().unwrap_or_default();
+    if !matches!(mode, "one-password" | "1password" | "op" | "managed") {
+        return None;
+    }
+    let requested = fields
+        .get(2)
+        .filter(|value| !value.is_empty())
+        .map(|value| signing::expand_user(Path::new(value)))?;
+    let inspected = wizard
+        .agent
+        .as_ref()
+        .filter(|agent| agent.available)
+        .map(|agent| signing::expand_user(&agent.socket));
+    (inspected.as_ref() != Some(&requested)).then_some(requested)
+}
+
+fn parse_tui_wizard_account(wizard: &mut TuiProfileWizard, input: &str) -> app::Result<()> {
+    let fields = input.split('|').map(str::trim).collect::<Vec<_>>();
+    if fields.len() != 5 || fields.iter().any(|field| field.is_empty()) {
+        return Err(app::AppError::Message(
+            "第一段需要 ID|主机|GitHub 登录名|提交姓名|提交邮箱，五项都不能为空".into(),
+        ));
+    }
+    if wizard
+        .original_id
+        .as_deref()
+        .is_some_and(|id| id != fields[0])
+    {
+        return Err(app::AppError::Message(
+            "为避免已有仓库绑定失效，编辑时不能修改 Profile ID".into(),
+        ));
+    }
+    wizard.id = fields[0].into();
+    wizard.host = github::normalize_host(fields[1]);
+    wizard.login = fields[2].into();
+    wizard.git_name = fields[3].into();
+    wizard.git_email = fields[4].into();
+    Ok(())
+}
+
+fn parse_tui_wizard_ssh(wizard: &mut TuiProfileWizard, input: &str) -> app::Result<()> {
+    if wizard
+        .original_profile
+        .as_ref()
+        .is_some_and(|original| original.ssh == wizard.ssh && input.trim() == wizard.ssh_input())
+    {
+        return Ok(());
+    }
+    let fields = input.split('|').map(str::trim).collect::<Vec<_>>();
+    let mode = fields.first().copied().unwrap_or_default();
+    if matches!(mode, "" | "skip" | "external") {
+        if fields.len() != 1 {
+            return Err(app::AppError::Message(
+                "第二段选择 external 时不需要填写公钥或 Agent socket".into(),
+            ));
+        }
+        wizard.ssh = None;
+        return Ok(());
+    }
+    if !(2..=3).contains(&fields.len()) {
+        return Err(app::AppError::Message(
+            "第二段使用 external 跳过，或填写 one-password|公钥序号/路径[|Agent socket]".into(),
+        ));
+    }
+    let mode = match mode {
+        "one-password" | "1password" | "op" => SshMode::OnePassword,
+        "managed" => SshMode::Managed,
+        _ => {
+            return Err(app::AppError::Message(
+                "SSH 模式只支持 external、one-password 或 managed".into(),
+            ));
+        }
+    };
+    let socket = if fields.get(2).is_none_or(|value| value.is_empty()) {
+        wizard.agent_socket.clone()
+    } else {
+        Some(signing::expand_user(Path::new(fields[2])))
+    }
+    .ok_or_else(|| app::AppError::Message("没有发现 SSH Agent socket".into()))?;
+    let agent = wizard
+        .agent
+        .as_ref()
+        .filter(|agent| agent.available)
+        .ok_or_else(|| app::AppError::Message("所选 SSH Agent 不可用".into()))?;
+    if signing::expand_user(&agent.socket) != socket {
+        return Err(app::AppError::Message(format!(
+            "Agent socket `{}` 尚未经过后台检查；请先等待检查完成后重试",
+            diagnostics::sanitize_display_text(&socket.display().to_string())
+        )));
+    }
+    let public_key = resolve_tui_public_key_file(wizard, fields[1])?;
+    let fingerprint = public_key
+        .fingerprint
+        .as_deref()
+        .ok_or_else(|| app::AppError::Message("所选公钥没有可验证的 SHA-256 指纹".into()))?;
+    ensure_tui_key_matches_agent(agent, &public_key.public_key, fingerprint)?;
+    wizard.agent_socket = Some(socket.clone());
+    wizard.ssh = Some(SshProfile {
+        mode,
+        public_key: Some(public_key.path.clone()),
+        fingerprint: public_key.fingerprint.clone(),
+        agent_socket: Some(socket),
+    });
+    Ok(())
+}
+
+fn resolve_tui_public_key_file(
+    wizard: &TuiProfileWizard,
+    value: &str,
+) -> app::Result<signing::PublicKeyFile> {
+    if value.is_empty() {
+        return Err(app::AppError::Message("请选择一个 .pub 公钥文件".into()));
+    }
+    if let Ok(index) = value.parse::<usize>() {
+        if index == 0 {
+            return Err(app::AppError::Message("公钥序号从 1 开始".into()));
+        }
+        return wizard
+            .public_keys
+            .get(index - 1)
+            .cloned()
+            .ok_or_else(|| app::AppError::Message(format!("公钥序号 `{value}` 不存在")));
+    }
+    let path = signing::expand_user(Path::new(value));
+    signing::load_public_key_file(&path).map_err(|error| {
+        app::AppError::Message(format!("无法使用公钥文件 {}：{error}", path.display()))
+    })
+}
+
+fn parse_tui_wizard_signing(wizard: &mut TuiProfileWizard, input: &str) -> app::Result<()> {
+    if wizard.original_profile.as_ref().is_some_and(|original| {
+        original.signing == wizard.signing && input.trim() == wizard.signing_input()
+    }) {
+        return Ok(());
+    }
+    let fields = input.split('|').map(str::trim).collect::<Vec<_>>();
+    match fields.first().copied().unwrap_or_default() {
+        "" | "off" | "false" => {
+            if fields.len() != 1 {
+                return Err(app::AppError::Message(
+                    "第三段关闭签名时只需填写 off".into(),
+                ));
+            }
+            wizard.signing = SigningProfile::default();
+            Ok(())
+        }
+        "on" | "true" => {
+            if !(2..=3).contains(&fields.len()) {
+                return Err(app::AppError::Message(
+                    "第三段使用 off，或填写 on|签名公钥序号/路径|签名程序".into(),
+                ));
+            }
+            let signing_key = resolve_tui_signing_key(wizard, fields[1])?;
+            let agent = wizard
+                .agent
+                .as_ref()
+                .filter(|agent| agent.available)
+                .ok_or_else(|| app::AppError::Message("SSH Agent 不可用，不能开启签名".into()))?;
+            ensure_tui_key_matches_agent(agent, &signing_key.public_key, &signing_key.fingerprint)?;
+            let program = fields
+                .get(2)
+                .filter(|value| !value.is_empty())
+                .map(|value| signing::SigningProgram {
+                    path: signing::expand_user(Path::new(value)),
+                    onepassword: value.to_ascii_lowercase().contains("op-ssh-sign"),
+                })
+                .or_else(|| {
+                    wizard
+                        .signing
+                        .program
+                        .clone()
+                        .map(|path| signing::SigningProgram {
+                            onepassword: path
+                                .to_string_lossy()
+                                .to_ascii_lowercase()
+                                .contains("op-ssh-sign"),
+                            path,
+                        })
+                })
+                .or_else(|| wizard.signing_program.clone())
+                .ok_or_else(|| app::AppError::Message("未发现 SSH signing program".into()))?;
+            if !signing::signing_program_available(&program) {
+                return Err(app::AppError::Message(format!(
+                    "签名程序 {} 不可执行",
+                    program.path.display()
+                )));
+            }
+            wizard.signing = SigningProfile {
+                enabled: true,
+                signing_key: Some(signing_key.config_value),
+                program: Some(program.path),
+            };
+            Ok(())
+        }
+        _ => Err(app::AppError::Message(
+            "第三段只接受 off，或 on|签名公钥序号/路径|签名程序".into(),
+        )),
+    }
+}
+
+fn resolve_tui_signing_key(
+    wizard: &TuiProfileWizard,
+    value: &str,
+) -> app::Result<TuiResolvedSigningKey> {
+    if value.is_empty() {
+        return Err(app::AppError::Message("请选择一个签名公钥".into()));
+    }
+    let inline = value.strip_prefix("key::").unwrap_or(value);
+    if inline.starts_with("ssh-")
+        || inline.starts_with("ecdsa-")
+        || inline.starts_with("sk-")
+        || inline.starts_with("rsa-sha2-")
+    {
+        let fingerprint = signing::fingerprint(inline)
+            .map_err(|error| app::AppError::Message(format!("内联签名公钥无效：{error}")))?;
+        return Ok(TuiResolvedSigningKey {
+            config_value: signing::git_signing_key_value(value),
+            public_key: inline.into(),
+            fingerprint,
+        });
+    }
+    let key = resolve_tui_public_key_file(wizard, value)?;
+    Ok(TuiResolvedSigningKey {
+        config_value: key.path.to_string_lossy().into_owned(),
+        public_key: key.public_key,
+        fingerprint: key
+            .fingerprint
+            .expect("validated public-key files always have a fingerprint"),
+    })
+}
+
+fn ensure_tui_key_matches_agent(
+    agent: &signing::AgentInfo,
+    public_key: &str,
+    fingerprint: &str,
+) -> app::Result<()> {
+    let selector = signing::SigningProfile {
+        public_key: Some(public_key.into()),
+        fingerprint: Some(fingerprint.into()),
+        ..signing::SigningProfile::default()
+    };
+    if signing::select_key(&agent.keys, &selector).is_none() {
+        return Err(app::AppError::Message(
+            "所选 .pub 文件与 SSH Agent 中的 key 不匹配".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn tui_profile_wizard_key_details(wizard: &TuiProfileWizard) -> Vec<String> {
+    let mut details = vec![format!(
+        "第二段结果：SSH 远程连接={}；第三段单独选择签名公钥",
+        wizard
+            .ssh
+            .as_ref()
+            .map(|ssh| match ssh.mode {
+                SshMode::External => "external",
+                SshMode::OnePassword => "one-password",
+                SshMode::Managed => "managed",
+            })
+            .unwrap_or("external")
+    )];
+    details.extend(tui_agent_discovery_details(wizard));
+    if !wizard.signing.enabled
+        && let Some(path) = wizard
+            .ssh
+            .as_ref()
+            .and_then(|ssh| ssh.public_key.as_deref())
+    {
+        details.push(format!(
+            "复用第二段公钥开启签名：on|{}|",
+            diagnostics::sanitize_display_text(&path.display().to_string())
+        ));
+    }
+    if let Some(program) = wizard.signing_program.as_ref() {
+        details.push(format!(
+            "自动发现签名程序：{}",
+            diagnostics::sanitize_display_text(&program.path.display().to_string())
+        ));
+    } else {
+        details.push("自动发现签名程序：未找到".into());
+    }
+    details
+}
+
+fn tui_profile_wizard_preview(wizard: &TuiProfileWizard) -> Vec<String> {
+    let ssh = wizard.ssh.as_ref();
+    let mut preview = vec![
+        format!(
+            "账号：{}/{}",
+            diagnostics::sanitize_display_text(&wizard.host),
+            diagnostics::sanitize_display_text(&wizard.login)
+        ),
+        format!(
+            "提交：{} <{}>",
+            diagnostics::sanitize_display_text(&wizard.git_name),
+            diagnostics::sanitize_display_text(&wizard.git_email)
+        ),
+        format!(
+            "SSH 连接：{}",
+            ssh.map(|ssh| match ssh.mode {
+                SshMode::External => "external",
+                SshMode::OnePassword => "one-password",
+                SshMode::Managed => "managed",
+            })
+            .unwrap_or("external")
+        ),
+        format!(
+            "SSH 公钥：{}",
+            ssh.and_then(|ssh| ssh.public_key.as_deref())
+                .map(|path| diagnostics::sanitize_display_text(&path.to_string_lossy()))
+                .unwrap_or_else(|| "不纳管".into())
+        ),
+        format!(
+            "提交签名：{}",
+            if wizard.signing.enabled {
+                "SSH signing 已开启"
+            } else {
+                "关闭"
+            }
+        ),
+    ];
+    if wizard.signing.enabled {
+        preview.push(format!(
+            "签名公钥：{}",
+            diagnostics::sanitize_display_text(
+                wizard.signing.signing_key.as_deref().unwrap_or("未配置")
+            )
+        ));
+        preview.push(format!(
+            "签名程序：{}",
+            wizard
+                .signing
+                .program
+                .as_deref()
+                .map(|path| diagnostics::sanitize_display_text(&path.to_string_lossy()))
+                .unwrap_or_else(|| "未配置".into())
+        ));
+    }
+    preview.push("尚未写入配置；确认后将原子保存并同步 Profile fragment".into());
+    preview
 }
 
 fn receive_tui_worker_results(
@@ -2893,31 +3497,92 @@ fn receive_tui_worker_results(
                     .first()
                     .map(|candidate| candidate.email.as_str())
                     .unwrap_or_default();
+                let mut wizard = TuiProfileWizard::new(&host, &login, email, bind_after_create);
+                wizard.id = id;
+                wizard.git_name = login.clone();
                 state.details = tui_email_candidate_details(&host, &login, &candidates);
                 begin_tui_input(
                     state,
-                    "编辑 id|提交姓名|提交邮箱，回车后再次确认",
-                    &format!("{id}|{login}|{email}"),
+                    "第一段：ID|主机|GitHub 登录名|提交姓名|提交邮箱",
+                    &wizard.account_input(),
                 );
                 state.status = if candidates.is_empty() {
-                    "没有可预填的邮箱；请手动填写提交邮箱，回车后确认"
+                    "没有可预填的邮箱；请补全提交邮箱后继续四段式配置"
                 } else if candidates
                     .first()
                     .is_some_and(|candidate| candidate.noreply)
                 {
-                    "已预填 GitHub noreply 邮箱；可继续编辑，回车后确认"
+                    "已预填 GitHub noreply 邮箱；可编辑后继续 SSH 与签名设置"
                 } else {
-                    "已预填首选邮箱；可继续编辑，回车后确认"
+                    "已预填首选邮箱；可编辑后继续 SSH 与签名设置"
                 }
                 .into();
                 if let Some(warning) = warning {
                     state.warnings.push(warning);
                 }
-                *pending = Some(TuiPending::InputDiscoveredProfile {
-                    host,
-                    login,
-                    bind_after_create,
-                });
+                *pending = Some(TuiPending::ProfileWizard(Box::new(wizard)));
+            }
+            TuiWorkerResult::Agent {
+                submitted_ssh,
+                result,
+            } => {
+                let Some(TuiPending::ProfileWizard(wizard)) = pending.take() else {
+                    continue;
+                };
+                let mut wizard = *wizard;
+                match result {
+                    Ok(discovery_result) => {
+                        wizard.agent_socket = discovery_result.socket;
+                        wizard.agent = discovery_result.agent;
+                        wizard.public_keys = discovery_result.public_keys;
+                        wizard.signing_program = discovery_result.signing_program;
+                        if let Some(input) = submitted_ssh {
+                            match parse_tui_wizard_ssh(&mut wizard, &input) {
+                                Ok(()) => {
+                                    begin_tui_signing_stage(state, &mut wizard);
+                                    state.status =
+                                        "自定义 SSH Agent 检查完成；进入第三段签名设置".into();
+                                }
+                                Err(error) => {
+                                    let error_text =
+                                        diagnostics::sanitize_display_text(&error.to_string());
+                                    state.details = tui_agent_discovery_details(&wizard);
+                                    begin_tui_input(
+                                        state,
+                                        "第二段：external，或 one-password|公钥序号/路径|Agent socket",
+                                        &input,
+                                    );
+                                    state.status = format!("第二段校验失败：{error_text}");
+                                    state.warnings.push(error_text);
+                                }
+                            }
+                        } else {
+                            state.details = tui_agent_discovery_details(&wizard);
+                            let initial = wizard.ssh_input();
+                            begin_tui_input(
+                                state,
+                                "第二段：external，或 one-password|公钥序号/路径|Agent socket",
+                                &initial,
+                            );
+                            state.status =
+                                "已完成只读发现；选择列表中的 .pub，或输入 external 跳过 SSH"
+                                    .into();
+                        }
+                    }
+                    Err(error) => {
+                        let error_text = diagnostics::sanitize_display_text(&error.to_string());
+                        state.warnings.push(format!("SSH 发现失败：{error_text}"));
+                        state.details =
+                            vec!["SSH Agent/.pub 发现失败；仍可选择 external 跳过 SSH".into()];
+                        let initial = submitted_ssh.unwrap_or_else(|| wizard.ssh_input());
+                        begin_tui_input(
+                            state,
+                            "第二段：external，或 one-password|公钥序号/路径|Agent socket",
+                            &initial,
+                        );
+                    }
+                }
+                *pending = Some(TuiPending::ProfileWizard(Box::new(wizard)));
             }
             TuiWorkerResult::RepositoryMutation { operation, result } => match result {
                 Ok(snapshot) => {
@@ -2955,7 +3620,11 @@ fn tui_email_candidate_details(
     candidates: &[github::EmailCandidate],
 ) -> Vec<String> {
     let mut details = vec![
-        format!("待创建账号：{host}/{login}"),
+        format!(
+            "待创建账号：{}/{}",
+            diagnostics::sanitize_display_text(host),
+            diagnostics::sanitize_display_text(login)
+        ),
         "提交邮箱候选：".into(),
     ];
     if candidates.is_empty() {
@@ -2963,20 +3632,93 @@ fn tui_email_candidate_details(
     } else {
         details.extend(candidates.iter().map(|candidate| {
             let mut labels = Vec::new();
-            if candidate.primary {
-                labels.push("首选");
-            }
             if candidate.noreply {
                 labels.push("GitHub noreply");
+            }
+            if candidate.primary {
+                labels.push("首选");
             }
             if candidate.verified {
                 labels.push("已验证");
             }
             if labels.is_empty() {
-                format!("  {}", candidate.email)
+                format!("  {}", diagnostics::sanitize_display_text(&candidate.email))
             } else {
-                format!("  {}（{}）", candidate.email, labels.join("，"))
+                format!(
+                    "  {}（{}）",
+                    diagnostics::sanitize_display_text(&candidate.email),
+                    labels.join("，")
+                )
             }
+        }));
+    }
+    details
+}
+
+fn tui_agent_discovery_details(wizard: &TuiProfileWizard) -> Vec<String> {
+    let socket = wizard
+        .agent_socket
+        .as_deref()
+        .map(|path| diagnostics::sanitize_display_text(&path.to_string_lossy()))
+        .unwrap_or_else(|| "未发现".into());
+    let mut details = vec![format!("SSH Agent：{socket}")];
+    if let Some(agent) = wizard.agent.as_ref() {
+        details.push(format!(
+            "Agent 状态：{}，{} 把 key",
+            if agent.available {
+                "可用"
+            } else {
+                "不可用"
+            },
+            agent.keys.len()
+        ));
+        if let Some(error) = agent.error.as_deref() {
+            details.push(format!(
+                "Agent 错误：{}",
+                diagnostics::sanitize_display_text(error)
+            ));
+        }
+        if !agent.keys.is_empty() {
+            details.push("Agent 中的公钥：".into());
+            details.extend(agent.keys.iter().map(|key| {
+                format!(
+                    "  {} · {} · {}",
+                    diagnostics::sanitize_display_text(&key.key_type),
+                    diagnostics::sanitize_display_text(key.comment.as_deref().unwrap_or("无注释")),
+                    diagnostics::sanitize_display_text(
+                        key.fingerprint.as_deref().unwrap_or("无指纹")
+                    )
+                )
+            }));
+        }
+    }
+    if wizard.public_keys.is_empty() {
+        details.push("~/.ssh 中未发现有效 .pub 文件".into());
+    } else {
+        details.push("可选公钥（输入序号或完整路径）：".into());
+        details.extend(wizard.public_keys.iter().enumerate().map(|(index, key)| {
+            let matched = wizard.agent.as_ref().is_some_and(|agent| {
+                signing::select_key(
+                    &agent.keys,
+                    &signing::SigningProfile {
+                        public_key: Some(key.public_key.clone()),
+                        fingerprint: key.fingerprint.clone(),
+                        ..signing::SigningProfile::default()
+                    },
+                )
+                .is_some()
+            });
+            format!(
+                "  {}. {} · {} · {}",
+                index + 1,
+                diagnostics::sanitize_display_text(&key.path.display().to_string()),
+                diagnostics::sanitize_display_text(key.fingerprint.as_deref().unwrap_or("无指纹")),
+                if matched {
+                    "Agent 已匹配"
+                } else {
+                    "Agent 未匹配"
+                }
+            )
         }));
     }
     details
@@ -3023,50 +3765,44 @@ fn suggested_tui_profile_id(config: &Config, host: &str, login: &str) -> String 
     unreachable!("有限配置不可能耗尽所有数字后缀")
 }
 
-fn parse_tui_profile_draft(
-    input: &str,
-    host: &str,
-    login: &str,
-    bind_after_create: bool,
-) -> app::Result<TuiProfileDraft> {
-    let fields = input.split('|').map(str::trim).collect::<Vec<_>>();
-    if fields.len() != 3 || fields.iter().any(|field| field.is_empty()) {
-        return Err(app::AppError::Message(
-            "Profile 输入需要 id|提交姓名|提交邮箱，三项都不能为空".into(),
-        ));
-    }
-    Ok(TuiProfileDraft {
-        id: fields[0].into(),
-        host: github::normalize_host(host),
-        login: login.into(),
-        git_name: fields[1].into(),
-        git_email: fields[2].into(),
-        bind_after_create,
-    })
+fn save_tui_profile_wizard(path: Option<&Path>, wizard: &TuiProfileWizard) -> app::Result<()> {
+    let (paths, _) = load_config(path)?;
+    save_tui_profile_wizard_at_paths(&paths, wizard)
 }
 
-fn save_tui_profile_draft(path: Option<&Path>, draft: &TuiProfileDraft) -> app::Result<()> {
-    let (paths, _) = load_config(path)?;
-    let (config, ()) = update_config(&paths, |config| {
-        if config.profiles.contains_key(&draft.id) {
-            return Err(app::AppError::Message(format!(
-                "Profile `{}` 已存在，请返回后换一个 ID",
-                draft.id
-            )));
+fn save_tui_profile_wizard_at_paths(
+    paths: &ConfigPaths,
+    wizard: &TuiProfileWizard,
+) -> app::Result<()> {
+    let profile = wizard.profile();
+    let (config, ()) = update_config(paths, |config| {
+        if let Some(original) = wizard.original_id.as_deref() {
+            let current = config
+                .profiles
+                .get_mut(original)
+                .ok_or_else(|| app::AppError::Message(format!("Profile `{original}` 已不存在")))?;
+            if wizard
+                .original_profile
+                .as_ref()
+                .is_some_and(|expected| current != expected)
+            {
+                return Err(app::AppError::Message(format!(
+                    "Profile `{original}` 在编辑期间已被其他操作修改；未覆盖，请重新打开向导"
+                )));
+            }
+            *current = profile;
+        } else {
+            if config.profiles.contains_key(&wizard.id) {
+                return Err(app::AppError::Message(format!(
+                    "Profile `{}` 已存在，请返回后换一个 ID",
+                    wizard.id
+                )));
+            }
+            config.profiles.insert(wizard.id.clone(), profile);
         }
-        config.profiles.insert(
-            draft.id.clone(),
-            Profile {
-                host: draft.host.clone(),
-                login: draft.login.clone(),
-                git_name: draft.git_name.clone(),
-                git_email: draft.git_email.clone(),
-                ..Profile::default()
-            },
-        );
         Ok(())
     })?;
-    app::sync_fragments(&paths, &config)?;
+    app::sync_fragments(paths, &config)?;
     Ok(())
 }
 
@@ -3094,11 +3830,10 @@ fn apply_tui_input(
     };
     if matches!(
         &operation,
-        TuiPending::DeleteRule(_)
+        TuiPending::ProfileWizard(_)
+            | TuiPending::DeleteRule(_)
             | TuiPending::DeleteProfile(_)
             | TuiPending::LoadingDiscoveredProfile { .. }
-            | TuiPending::InputDiscoveredProfile { .. }
-            | TuiPending::ConfirmDiscoveredProfile(_)
     ) {
         return Ok(());
     }
@@ -3118,49 +3853,6 @@ fn apply_tui_input_at_paths(
 ) -> app::Result<()> {
     let (config, ()) = update_config(paths, |config| {
         match operation {
-            TuiPending::AddProfile => {
-                let fields = input.split('|').map(str::trim).collect::<Vec<_>>();
-                if fields.len() != 4 || fields.iter().any(|field| field.is_empty()) {
-                    return Err(app::AppError::Message(
-                        "Profile 输入需要 id|login|name|email".into(),
-                    ));
-                }
-                if config.profiles.contains_key(fields[0]) {
-                    return Err(app::AppError::Message(format!(
-                        "Profile `{}` 已存在",
-                        fields[0]
-                    )));
-                }
-                config.profiles.insert(
-                    fields[0].into(),
-                    Profile {
-                        host: "github.com".into(),
-                        login: fields[1].into(),
-                        git_name: fields[2].into(),
-                        git_email: fields[3].into(),
-                        ..Profile::default()
-                    },
-                );
-            }
-            TuiPending::EditProfile(previous) => {
-                let fields = input.split('|').map(str::trim).collect::<Vec<_>>();
-                if fields.len() != 4 || fields.iter().any(|field| field.is_empty()) {
-                    return Err(app::AppError::Message(
-                        "Profile 输入需要 id|login|name|email".into(),
-                    ));
-                }
-                if previous != fields[0] {
-                    return Err(app::AppError::Message(
-                        "为避免仓库绑定失效，TUI 编辑时不能修改 Profile ID".into(),
-                    ));
-                }
-                let profile = config.profiles.get_mut(&previous).ok_or_else(|| {
-                    app::AppError::Message(format!("Profile `{previous}` 不存在"))
-                })?;
-                profile.login = fields[1].into();
-                profile.git_name = fields[2].into();
-                profile.git_email = fields[3].into();
-            }
             TuiPending::AddRule => {
                 let rule = parse_tui_rule(input)?;
                 if config.rules.iter().any(|existing| existing.id == rule.id) {
@@ -3492,6 +4184,53 @@ mod tests {
         );
     }
 
+    fn executable_test_program(path: &Path) -> signing::SigningProgram {
+        fs::write(path, "#!/bin/sh\nexit 0\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            permissions.set_mode(0o755);
+            fs::set_permissions(path, permissions).unwrap();
+        }
+        signing::SigningProgram {
+            path: path.into(),
+            onepassword: true,
+        }
+    }
+
+    fn wizard_key(
+        path: impl Into<PathBuf>,
+        material: &str,
+        fingerprint: &str,
+    ) -> signing::PublicKeyFile {
+        signing::PublicKeyFile {
+            path: path.into(),
+            public_key: material.into(),
+            fingerprint: Some(fingerprint.into()),
+        }
+    }
+
+    fn agent_key(material: &str, fingerprint: &str) -> signing::AgentKey {
+        let mut fields = material.split_whitespace();
+        signing::AgentKey {
+            key_type: fields.next().unwrap().into(),
+            public_key: material.into(),
+            comment: Some("同名签名 key".into()),
+            fingerprint: Some(fingerprint.into()),
+        }
+    }
+
+    fn wizard_agent(keys: Vec<signing::AgentKey>) -> signing::AgentInfo {
+        signing::AgentInfo {
+            socket: PathBuf::from("/tmp/ghis-test-agent.sock"),
+            source: signing::AgentSource::OnePassword,
+            available: true,
+            keys,
+            error: None,
+        }
+    }
+
     fn account(host: &str, login: &str) -> github::GhAccount {
         github::GhAccount {
             host: host.into(),
@@ -3543,19 +4282,391 @@ mod tests {
 
     #[test]
     fn discovered_profile_draft_preserves_account_host_and_user_edits() {
-        let draft = parse_tui_profile_draft(
-            "work identity|Work Name|work@example.test",
-            "Git.Example.Com.",
-            "worker",
-            true,
+        let mut wizard = TuiProfileWizard::new("Git.Example.Com.", "worker", "", true);
+        parse_tui_wizard_account(
+            &mut wizard,
+            "work identity|Git.Example.Com.|worker|Work Name|work@example.test",
         )
         .unwrap();
-        assert_eq!(draft.id, "work identity");
-        assert_eq!(draft.host, "git.example.com");
-        assert_eq!(draft.login, "worker");
-        assert_eq!(draft.git_name, "Work Name");
-        assert_eq!(draft.git_email, "work@example.test");
-        assert!(draft.bind_after_create);
+        assert_eq!(wizard.id, "work identity");
+        assert_eq!(wizard.host, "git.example.com");
+        assert_eq!(wizard.login, "worker");
+        assert_eq!(wizard.git_name, "Work Name");
+        assert_eq!(wizard.git_email, "work@example.test");
+        assert!(wizard.bind_after_create);
+    }
+
+    #[test]
+    fn signing_stage_uses_a_separate_key_when_ssh_is_external() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = "ssh-ed25519 AAAAFIRST 同名签名 key";
+        let second = "ssh-ed25519 AAAASECOND 同名签名 key";
+        let mut wizard = TuiProfileWizard::new("github.com", "alice", "a@example.test", false);
+        wizard.agent = Some(wizard_agent(vec![
+            agent_key(first, "SHA256:first"),
+            agent_key(second, "SHA256:second"),
+        ]));
+        wizard.agent_socket = wizard.agent.as_ref().map(|agent| agent.socket.clone());
+        wizard.public_keys = vec![
+            wizard_key(
+                directory.path().join("authentication.pub"),
+                first,
+                "SHA256:first",
+            ),
+            wizard_key(
+                directory.path().join("signing.pub"),
+                second,
+                "SHA256:second",
+            ),
+        ];
+        wizard.signing_program = Some(executable_test_program(
+            &directory.path().join("op-ssh-sign"),
+        ));
+
+        parse_tui_wizard_ssh(&mut wizard, "external").unwrap();
+        parse_tui_wizard_signing(&mut wizard, "on|2|").unwrap();
+
+        assert!(wizard.ssh.is_none(), "HTTPS profile must stay SSH-external");
+        assert!(wizard.signing.enabled);
+        assert_eq!(
+            wizard.signing.signing_key.as_deref(),
+            Some(
+                directory
+                    .path()
+                    .join("signing.pub")
+                    .to_string_lossy()
+                    .as_ref()
+            )
+        );
+    }
+
+    #[test]
+    fn external_ssh_profile_round_trips_through_tui_input() {
+        let profile = Profile {
+            login: "alice".into(),
+            git_name: "Alice".into(),
+            git_email: "a@example.test".into(),
+            ssh: Some(SshProfile {
+                mode: SshMode::External,
+                ..SshProfile::default()
+            }),
+            ..Profile::default()
+        };
+        let mut wizard = TuiProfileWizard::from_profile("personal", &profile);
+        let input = wizard.ssh_input();
+        assert_eq!(input, "external");
+        parse_tui_wizard_ssh(&mut wizard, &input).unwrap();
+        assert_eq!(wizard.ssh, profile.ssh);
+    }
+
+    #[test]
+    fn unchanged_ssh_and_signing_settings_can_be_kept_without_live_agent() {
+        let profile = Profile {
+            login: "alice".into(),
+            git_name: "Alice".into(),
+            git_email: "a@example.test".into(),
+            ssh: Some(SshProfile {
+                mode: SshMode::OnePassword,
+                public_key: Some("/keys/authentication.pub".into()),
+                fingerprint: Some("SHA256:authentication".into()),
+                agent_socket: Some("/tmp/op-agent.sock".into()),
+            }),
+            signing: SigningProfile {
+                enabled: true,
+                signing_key: Some("/keys/signing.pub".into()),
+                program: Some("/opt/1Password/op-ssh-sign".into()),
+            },
+            ..Profile::default()
+        };
+        let mut wizard = TuiProfileWizard::from_profile("personal", &profile);
+        let ssh_input = wizard.ssh_input();
+        let signing_input = wizard.signing_input();
+        wizard.agent = Some(signing::AgentInfo {
+            socket: "/tmp/op-agent.sock".into(),
+            source: signing::AgentSource::OnePassword,
+            available: false,
+            keys: Vec::new(),
+            error: Some("agent offline".into()),
+        });
+
+        parse_tui_wizard_ssh(&mut wizard, &ssh_input).unwrap();
+        parse_tui_wizard_signing(&mut wizard, &signing_input).unwrap();
+        assert_eq!(wizard.ssh, profile.ssh);
+        assert_eq!(wizard.signing, profile.signing);
+    }
+
+    #[test]
+    fn custom_agent_socket_is_marked_for_background_inspection() {
+        let mut wizard = TuiProfileWizard::new("github.com", "alice", "a@example.test", false);
+        let socket = PathBuf::from("/tmp/custom-agent.sock");
+        assert_eq!(
+            tui_agent_socket_needing_inspection(
+                &wizard,
+                "one-password|/keys/authentication.pub|/tmp/custom-agent.sock"
+            ),
+            Some(socket.clone())
+        );
+        wizard.agent = Some(signing::AgentInfo {
+            socket,
+            source: signing::AgentSource::OnePassword,
+            available: true,
+            keys: Vec::new(),
+            error: None,
+        });
+        assert_eq!(
+            tui_agent_socket_needing_inspection(
+                &wizard,
+                "one-password|/keys/authentication.pub|/tmp/custom-agent.sock"
+            ),
+            None
+        );
+        wizard.agent.as_mut().unwrap().available = false;
+        assert_eq!(
+            tui_agent_socket_needing_inspection(
+                &wizard,
+                "one-password|/keys/authentication.pub|/tmp/custom-agent.sock"
+            ),
+            Some(PathBuf::from("/tmp/custom-agent.sock"))
+        );
+    }
+
+    #[test]
+    fn tui_agent_details_escape_external_control_characters() {
+        let mut wizard = TuiProfileWizard::new("github.com", "alice", "a@example.test", false);
+        wizard.agent_socket = Some(PathBuf::from("/tmp/agent\n.sock"));
+        wizard.agent = Some(signing::AgentInfo {
+            socket: PathBuf::from("/tmp/agent\n.sock"),
+            source: signing::AgentSource::OnePassword,
+            available: false,
+            keys: vec![signing::AgentKey {
+                key_type: "ssh-ed25519\u{1b}[31m".into(),
+                public_key: "ssh-ed25519 AAAA".into(),
+                comment: Some("comment\nwith-break".into()),
+                fingerprint: Some("SHA256:fingerprint".into()),
+            }],
+            error: Some("agent\u{1b}[2J failed".into()),
+        });
+        let rendered = tui_agent_discovery_details(&wizard).join("\n");
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(rendered.contains("\\u{001B}"));
+        assert!(rendered.contains("\\n"));
+    }
+
+    #[test]
+    fn signing_stage_handles_zero_one_and_mismatched_agent_keys() {
+        let directory = tempfile::tempdir().unwrap();
+        let program = executable_test_program(&directory.path().join("op-ssh-sign"));
+        let selected = wizard_key(
+            directory.path().join("signing.pub"),
+            "ssh-ed25519 AAAASELECTED signing",
+            "SHA256:selected",
+        );
+        let mut wizard = TuiProfileWizard::new("github.com", "alice", "a@example.test", false);
+        wizard.public_keys = vec![selected.clone()];
+        wizard.signing_program = Some(program.clone());
+        wizard.agent = Some(wizard_agent(Vec::new()));
+        assert!(parse_tui_wizard_signing(&mut wizard, "on|1|").is_err());
+
+        wizard.agent = Some(wizard_agent(vec![agent_key(
+            "ssh-ed25519 AAAADIFFERENT signing",
+            "SHA256:different",
+        )]));
+        assert!(parse_tui_wizard_signing(&mut wizard, "on|1|").is_err());
+
+        wizard.agent = Some(wizard_agent(vec![agent_key(
+            &selected.public_key,
+            selected.fingerprint.as_deref().unwrap(),
+        )]));
+        parse_tui_wizard_signing(&mut wizard, "on|1|").unwrap();
+        assert!(wizard.signing.enabled);
+    }
+
+    #[test]
+    fn signing_stage_rejects_an_unavailable_program() {
+        let directory = tempfile::tempdir().unwrap();
+        let key = wizard_key(
+            directory.path().join("signing.pub"),
+            "ssh-ed25519 AAAASELECTED signing",
+            "SHA256:selected",
+        );
+        let mut wizard = TuiProfileWizard::new("github.com", "alice", "a@example.test", false);
+        wizard.agent = Some(wizard_agent(vec![agent_key(
+            &key.public_key,
+            key.fingerprint.as_deref().unwrap(),
+        )]));
+        wizard.public_keys = vec![key];
+        let missing = directory.path().join("missing-op-ssh-sign");
+
+        let error = parse_tui_wizard_signing(&mut wizard, &format!("on|1|{}", missing.display()))
+            .unwrap_err();
+        assert!(error.to_string().contains("不可执行"));
+        assert!(!wizard.signing.enabled);
+    }
+
+    #[test]
+    fn managed_ssh_key_is_only_a_default_for_existing_signing_config() {
+        let profile = Profile {
+            login: "alice".into(),
+            git_name: "Alice".into(),
+            git_email: "a@example.test".into(),
+            ssh: Some(SshProfile {
+                mode: SshMode::OnePassword,
+                public_key: Some(PathBuf::from("/keys/authentication.pub")),
+                fingerprint: Some("SHA256:authentication".into()),
+                agent_socket: Some(PathBuf::from("/tmp/agent.sock")),
+            }),
+            signing: SigningProfile {
+                enabled: true,
+                signing_key: None,
+                program: Some(PathBuf::from("/opt/1Password/op-ssh-sign")),
+            },
+            ..Profile::default()
+        };
+        let wizard = TuiProfileWizard::from_profile("personal", &profile);
+
+        assert_eq!(
+            wizard.signing_input(),
+            "on|/keys/authentication.pub|/opt/1Password/op-ssh-sign"
+        );
+    }
+
+    #[test]
+    fn doctor_recognizes_supported_inline_signing_key_prefixes() {
+        for value in [
+            "ssh-ed25519 AAAA inline",
+            "ecdsa-sha2-nistp256 AAAA inline",
+            "sk-ssh-ed25519@openssh.com AAAA inline",
+            "rsa-sha2-512 AAAA inline",
+        ] {
+            let profile = Profile {
+                signing: SigningProfile {
+                    enabled: true,
+                    signing_key: Some(value.into()),
+                    ..SigningProfile::default()
+                },
+                ..Profile::default()
+            };
+            assert_eq!(
+                profile_public_key_for_doctor(&profile).unwrap(),
+                Some(value.into())
+            );
+        }
+    }
+
+    #[test]
+    fn cancelling_profile_wizard_does_not_write_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        Config::default().save(&config_path).unwrap();
+        let workers = TuiWorkers::new().unwrap();
+        let action_context = TuiActionContext {
+            workers: &workers,
+            path: Some(&config_path),
+            explicit: None,
+            cwd: directory.path(),
+            cache_path: &directory.path().join("accounts.json"),
+        };
+        let mut state = tui::AppState::default();
+        state.mode = tui::Mode::Insert;
+        let mut pending = Some(TuiPending::ProfileWizard(Box::new(TuiProfileWizard::new(
+            "github.com",
+            "alice",
+            "a@example.test",
+            false,
+        ))));
+        let mut discovery = None;
+        let mut active_workers = 0;
+
+        handle_tui_action(
+            &mut state,
+            tui::Action::Cancel,
+            &mut pending,
+            &mut discovery,
+            &mut active_workers,
+            &action_context,
+        )
+        .unwrap();
+
+        assert!(pending.is_none());
+        assert!(Config::load(&config_path).unwrap().profiles.is_empty());
+    }
+
+    #[test]
+    fn saving_edited_wizard_preserves_profiles_added_after_it_opened() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        let mut paths = ConfigPaths::from_bases(
+            directory.path().join("xdg-config"),
+            directory.path().join("xdg-cache"),
+            directory.path().join("xdg-state"),
+        );
+        paths.set_config_file(&config_path).unwrap();
+        let original = Profile {
+            login: "alice".into(),
+            git_name: "Alice".into(),
+            git_email: "a@example.test".into(),
+            ..Profile::default()
+        };
+        let mut config = Config::default();
+        config.profiles.insert("personal".into(), original.clone());
+        config.save(&config_path).unwrap();
+        let mut wizard = TuiProfileWizard::from_profile("personal", &original);
+        wizard.git_name = "Alice Updated".into();
+
+        let mut changed_while_open = Config::load(&config_path).unwrap();
+        changed_while_open.profiles.insert(
+            "work".into(),
+            Profile {
+                login: "worker".into(),
+                git_name: "Worker".into(),
+                git_email: "worker@example.test".into(),
+                ..Profile::default()
+            },
+        );
+        changed_while_open.save(&config_path).unwrap();
+
+        save_tui_profile_wizard_at_paths(&paths, &wizard).unwrap();
+        let saved = Config::load(&config_path).unwrap();
+        assert_eq!(saved.profiles.len(), 2);
+        assert_eq!(saved.profiles["personal"].git_name, "Alice Updated");
+        assert_eq!(saved.profiles["work"].login, "worker");
+    }
+
+    #[test]
+    fn saving_edited_wizard_rejects_same_profile_changes_after_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let config_path = directory.path().join("config.toml");
+        let mut paths = ConfigPaths::from_bases(
+            directory.path().join("xdg-config"),
+            directory.path().join("xdg-cache"),
+            directory.path().join("xdg-state"),
+        );
+        paths.set_config_file(&config_path).unwrap();
+        let original = Profile {
+            login: "alice".into(),
+            git_name: "Alice".into(),
+            git_email: "a@example.test".into(),
+            ..Profile::default()
+        };
+        let mut config = Config::default();
+        config.profiles.insert("personal".into(), original.clone());
+        config.save(&config_path).unwrap();
+        let mut wizard = TuiProfileWizard::from_profile("personal", &original);
+        wizard.git_name = "Alice from wizard".into();
+
+        let mut changed = Config::load(&config_path).unwrap();
+        changed.profiles.get_mut("personal").unwrap().git_email =
+            "alice-changed@example.test".into();
+        changed.save(&config_path).unwrap();
+
+        let error = save_tui_profile_wizard_at_paths(&paths, &wizard).unwrap_err();
+        assert!(error.to_string().contains("在编辑期间已被其他操作修改"));
+        let saved = Config::load(&config_path).unwrap();
+        assert_eq!(
+            saved.profiles["personal"].git_email,
+            "alice-changed@example.test"
+        );
+        assert_eq!(saved.profiles["personal"].git_name, "Alice");
     }
 
     #[test]
