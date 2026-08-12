@@ -970,6 +970,7 @@ struct DoctorReport {
     git: ToolStatus,
     gh: ToolStatus,
     zsh: ToolStatus,
+    shell_integration: DoctorShellIntegration,
     accounts: Vec<DoctorAccount>,
     repository: Option<String>,
     profile: Option<String>,
@@ -984,6 +985,24 @@ struct DoctorReport {
 struct ToolStatus {
     available: bool,
     version: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DoctorShellIntegrationState {
+    WrapperLoaded,
+    InstalledNotLoaded,
+    RepositoryOnly,
+    NotIntegrated,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorShellIntegration {
+    state: DoctorShellIntegrationState,
+    wrapper_loaded: bool,
+    setup_installed: bool,
+    repository_bound: bool,
+    advice: String,
 }
 
 #[derive(Serialize)]
@@ -1013,6 +1032,7 @@ struct DoctorSigningProgram {
 fn doctor(path: Option<&Path>, explicit: Option<&str>, json: bool) -> app::Result<i32> {
     let ctx = context(path, explicit, std::env::current_dir()?)?;
     let mut warnings = ctx.warnings.clone();
+    let shell_integration = doctor_shell_integration(&ctx);
     let diagnostic_cwd = ctx
         .repository
         .as_ref()
@@ -1155,6 +1175,7 @@ fn doctor(path: Option<&Path>, explicit: Option<&str>, json: bool) -> app::Resul
         git: tool_status("git", &["--version"]),
         gh: tool_status("gh", &["--version"]),
         zsh: tool_status("zsh", &["--version"]),
+        shell_integration,
         accounts: discovery
             .as_ref()
             .map(|item| {
@@ -1185,6 +1206,11 @@ fn doctor(path: Option<&Path>, explicit: Option<&str>, json: bool) -> app::Resul
         println!("Git: {}", tool_text(&report.git));
         println!("gh: {}", tool_text(&report.gh));
         println!("zsh: {}", tool_text(&report.zsh));
+        println!(
+            "Shell wrapper: {}",
+            doctor_shell_integration_text(report.shell_integration.state)
+        );
+        println!("Shell 提示: {}", report.shell_integration.advice);
         println!("gh 账号: {}", report.accounts.len());
         println!(
             "当前 profile: {}",
@@ -1245,6 +1271,127 @@ fn doctor(path: Option<&Path>, explicit: Option<&str>, json: bool) -> app::Resul
         }
     }
     Ok(0)
+}
+
+fn doctor_shell_integration(ctx: &AppContext) -> DoctorShellIntegration {
+    let wrapper_loaded = shell::integration_is_loaded();
+    let init_file = ctx.paths.config_dir.join("init.zsh");
+    let setup_installed = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| {
+            let zshrc = shell::zshrc_path(&home, std::env::var_os("ZDOTDIR").as_deref());
+            shell::integration_is_installed(&zshrc, &init_file, "ghis")
+        })
+        .unwrap_or(false);
+    let repository_bound = ctx
+        .repository
+        .as_ref()
+        .is_some_and(repository_has_ghis_persistence);
+    let state = classify_shell_integration(wrapper_loaded, setup_installed, repository_bound);
+    DoctorShellIntegration {
+        state,
+        wrapper_loaded,
+        setup_installed,
+        repository_bound,
+        advice: doctor_shell_integration_advice(state).into(),
+    }
+}
+
+fn repository_has_ghis_persistence(repository: &ghis::repo::Repository) -> bool {
+    if ghis::repo::local_config(repository, app::PROFILE_CONFIG_KEY)
+        .ok()
+        .flatten()
+        .is_some()
+    {
+        return true;
+    }
+
+    let include_keys = ghis::repo::local_config_keys_matching(
+        repository,
+        r"^(include\.path|includeif\..*\.path)$",
+    )
+    .unwrap_or_default();
+    if include_keys.iter().any(|key| {
+        ghis::repo::local_config_values(repository, key)
+            .unwrap_or_default()
+            .iter()
+            .any(|value| path_is_ghis_fragment(value))
+    }) {
+        return true;
+    }
+
+    let helper_keys =
+        ghis::repo::local_config_keys_matching(repository, r"^credential\..*\.helper$")
+            .unwrap_or_default();
+    if helper_keys.iter().any(|key| {
+        ghis::repo::local_config_values(repository, key)
+            .unwrap_or_default()
+            .iter()
+            .any(|value| is_ghis_credential_helper_marker(value))
+    }) {
+        return true;
+    }
+
+    ghis::repo::local_config_keys_matching(
+        repository,
+        r"^hook\.ghis-[^.]+\.(command|event|enabled|parallel)$",
+    )
+    .map(|keys| !keys.is_empty())
+    .unwrap_or(false)
+}
+
+fn path_is_ghis_fragment(value: &str) -> bool {
+    value
+        .replace('\\', "/")
+        .to_ascii_lowercase()
+        .contains("/ghis/fragments/")
+}
+
+fn is_ghis_credential_helper_marker(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    value.contains("credential-helper") && value.contains("ghis")
+}
+
+fn classify_shell_integration(
+    wrapper_loaded: bool,
+    setup_installed: bool,
+    repository_bound: bool,
+) -> DoctorShellIntegrationState {
+    if wrapper_loaded {
+        DoctorShellIntegrationState::WrapperLoaded
+    } else if setup_installed {
+        DoctorShellIntegrationState::InstalledNotLoaded
+    } else if repository_bound {
+        DoctorShellIntegrationState::RepositoryOnly
+    } else {
+        DoctorShellIntegrationState::NotIntegrated
+    }
+}
+
+fn doctor_shell_integration_text(state: DoctorShellIntegrationState) -> &'static str {
+    match state {
+        DoctorShellIntegrationState::WrapperLoaded => "当前 shell 已加载",
+        DoctorShellIntegrationState::InstalledNotLoaded => "已安装，但当前 shell 未加载",
+        DoctorShellIntegrationState::RepositoryOnly => "仅检测到仓库本地 ghis 配置",
+        DoctorShellIntegrationState::NotIntegrated => "未安装或未接入",
+    }
+}
+
+fn doctor_shell_integration_advice(state: DoctorShellIntegrationState) -> &'static str {
+    match state {
+        DoctorShellIntegrationState::WrapperLoaded => {
+            "普通 git/gh 会经过 ghis；command git、绝对路径或 GHIS_BYPASS=1 仍可明确绕过 wrapper"
+        }
+        DoctorShellIntegrationState::InstalledNotLoaded => {
+            "运行 exec zsh 或新开终端后再试；ghis 不会替换当前 shell"
+        }
+        DoctorShellIntegrationState::RepositoryOnly => {
+            "普通 Git 仍会读取该仓库已有的 include/helper/hook，但没有 wrapper 的本次解析和注入"
+        }
+        DoctorShellIntegrationState::NotIntegrated => {
+            "普通 git/gh 不会经过 ghis；需要时先运行 ghis setup 并重新加载 zsh"
+        }
+    }
 }
 
 fn doctor_key_selector(
@@ -1382,6 +1529,13 @@ fn setup(args: SetupArgs) -> app::Result<i32> {
     );
     if let Some(backup) = report.backup {
         println!("原文件备份：{}", backup.display());
+    }
+    if shell::integration_is_loaded() {
+        println!("当前 shell 已加载 ghis wrapper。");
+    } else {
+        println!(
+            "当前 shell 尚未加载；运行 `exec zsh` 或新开终端后生效，ghis 不会自动替换 shell。"
+        );
     }
     Ok(0)
 }
@@ -1860,10 +2014,18 @@ fn build_tui_local_snapshot(
             .as_ref()
             .and_then(|profile| profile.signing.program.as_deref()),
     );
+    let shell_integration = doctor_shell_integration(&ctx);
+    if !shell_integration.wrapper_loaded {
+        warnings.push(shell_integration.advice.clone());
+    }
     let mut diagnostics = vec![
         format!("Git\t{}", tool_text(&tool_status("git", &["--version"]))),
         format!("gh\t{}", tool_text(&tool_status("gh", &["--version"]))),
         format!("zsh\t{}", tool_text(&tool_status("zsh", &["--version"]))),
+        format!(
+            "Shell wrapper\t{}",
+            doctor_shell_integration_text(shell_integration.state)
+        ),
         format!(
             "SSH Agent\t{}",
             agent
@@ -3034,6 +3196,66 @@ fn write_stdout(bytes: &[u8]) -> app::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shell_integration_state_prefers_loaded_then_installed_then_repository() {
+        assert_eq!(
+            classify_shell_integration(true, true, true),
+            DoctorShellIntegrationState::WrapperLoaded
+        );
+        assert_eq!(
+            classify_shell_integration(false, true, true),
+            DoctorShellIntegrationState::InstalledNotLoaded
+        );
+        assert_eq!(
+            classify_shell_integration(false, false, true),
+            DoctorShellIntegrationState::RepositoryOnly
+        );
+        assert_eq!(
+            classify_shell_integration(false, false, false),
+            DoctorShellIntegrationState::NotIntegrated
+        );
+    }
+
+    #[test]
+    fn repository_integration_detects_each_persistent_ghis_artifact() {
+        for (key, value) in [
+            (
+                "includeIf.gitdir:/tmp/other.path",
+                "/tmp/config/ghis/fragments/work.gitconfig",
+            ),
+            (
+                "credential.https://github.com.helper",
+                "!'/usr/bin/ghis' --config '/tmp/config.toml' credential-helper",
+            ),
+            ("hook.ghis-pre-push.event", "pre-push"),
+        ] {
+            let directory = tempfile::tempdir().expect("temporary repository");
+            let init = std::process::Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(directory.path())
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .status()
+                .expect("git init");
+            assert!(init.success());
+            let repository = ghis::repo::discover(directory.path()).expect("discover repository");
+            assert!(!repository_has_ghis_persistence(&repository));
+
+            let configured = std::process::Command::new("git")
+                .args(["config", "--local", key, value])
+                .current_dir(directory.path())
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .status()
+                .expect("write local config");
+            assert!(configured.success(), "failed to write {key}");
+            assert!(
+                repository_has_ghis_persistence(&repository),
+                "failed to detect {key}"
+            );
+        }
+    }
 
     #[test]
     fn behavior_keys_accept_prefix_and_hyphen_aliases() {

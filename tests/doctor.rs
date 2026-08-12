@@ -31,6 +31,114 @@ fn git_ok(cwd: &Path, args: &[&str]) {
 }
 
 #[test]
+fn doctor_text_and_json_distinguish_repository_installed_and_loaded_shell_states() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let repository = temp.path().join("repo");
+    let fake_bin = temp.path().join("bin");
+    let home = temp.path().join("home");
+    let config_home = temp.path().join("config");
+    let cache_home = temp.path().join("cache");
+    let state_home = temp.path().join("state");
+    let runtime_home = temp.path().join("runtime");
+    let config_file = config_home.join("ghis/config.toml");
+    fs::create_dir_all(&fake_bin).expect("fake bin");
+    fs::create_dir_all(&home).expect("home");
+    fs::create_dir_all(&runtime_home).expect("runtime");
+    fs::create_dir_all(config_file.parent().expect("config parent")).expect("config directory");
+    fs::write(&config_file, "version = 1\n").expect("ghis config");
+    git_ok(
+        temp.path(),
+        &["init", "-q", repository.to_str().expect("UTF-8 path")],
+    );
+    git_ok(
+        &repository,
+        &[
+            "config",
+            "--local",
+            "credential.https://github.com.helper",
+            "!'/usr/bin/ghis' --config '/tmp/ghis.toml' credential-helper",
+        ],
+    );
+    executable(
+        &fake_bin.join("gh"),
+        r#"#!/bin/sh
+if [ "$1" = "--version" ]; then
+  printf '%s\n' 'gh version test'
+elif [ "$1" = "auth" ] && [ "$2" = "status" ]; then
+  printf '%s\n' '{"hosts":{}}'
+else
+  exit 64
+fi
+"#,
+    );
+
+    let inherited_path = std::env::var_os("PATH").expect("PATH");
+    let path = std::env::join_paths(
+        std::iter::once(fake_bin).chain(std::env::split_paths(&inherited_path)),
+    )
+    .expect("joined PATH");
+    let run = |json: bool, integration: Option<&str>| {
+        let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+        command
+            .args(["--config", config_file.to_str().expect("UTF-8 config")])
+            .arg("doctor")
+            .current_dir(&repository)
+            .env("PATH", &path)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_CACHE_HOME", &cache_home)
+            .env("XDG_STATE_HOME", &state_home)
+            .env("XDG_RUNTIME_DIR", &runtime_home)
+            .env("UID", "999999999")
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env_remove("GIT_CONFIG_NOSYSTEM")
+            .env_remove("SSH_AUTH_SOCK")
+            .env_remove("GHIS_CONFIG")
+            .env_remove("GHIS_PROFILE")
+            .env_remove("GHIS_BANNER_SHOWN")
+            .env_remove("GHIS_WRAPPER_ACTIVE")
+            .env_remove("GHIS_BYPASS")
+            .env_remove("GHIS_DISABLE_CHPWD")
+            .env_remove("GHIS_SHELL_INTEGRATION");
+        if json {
+            command.arg("--json");
+        }
+        if let Some(integration) = integration {
+            command.env("GHIS_SHELL_INTEGRATION", integration);
+        }
+        command.output().expect("run doctor")
+    };
+
+    let output = run(true, None);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    assert_eq!(report["shell_integration"]["state"], "repository_only");
+    assert_eq!(report["shell_integration"]["wrapper_loaded"], false);
+    assert_eq!(report["shell_integration"]["setup_installed"], false);
+    assert_eq!(report["shell_integration"]["repository_bound"], true);
+
+    let output = run(false, None);
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stdout).contains("仅检测到仓库本地 ghis 配置"));
+
+    let init_file = config_home.join("ghis/init.zsh");
+    ghis::shell::setup(home.join(".zshrc"), &init_file, "ghis").expect("install shell files");
+    let output = run(true, None);
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    assert_eq!(report["shell_integration"]["state"], "installed_not_loaded");
+    assert_eq!(report["shell_integration"]["setup_installed"], true);
+    assert_eq!(report["shell_integration"]["repository_bound"], true);
+
+    let output = run(true, Some("1"));
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    assert_eq!(report["shell_integration"]["state"], "wrapper_loaded");
+    assert_eq!(report["shell_integration"]["wrapper_loaded"], true);
+}
+
+#[test]
 fn doctor_checks_credential_agent_key_and_signing_program_without_leaking_token() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let fake_bin = temp.path().join("bin");

@@ -17,6 +17,10 @@ use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 pub const START_MARKER: &str = "# >>> ghis setup >>>";
 /// End marker for the block owned by ghis in a zsh startup file.
 pub const END_MARKER: &str = "# <<< ghis setup <<<";
+/// Exported by the generated init script so child `ghis` processes can tell
+/// that this shell actually loaded the wrapper, rather than merely having a
+/// setup block on disk.
+pub const LOADED_ENV: &str = "GHIS_SHELL_INTEGRATION";
 
 /// Resolve the zsh startup file using the same `ZDOTDIR` convention as zsh.
 pub fn zshrc_path(home: &Path, zdotdir: Option<&OsStr>) -> PathBuf {
@@ -76,6 +80,8 @@ pub fn zsh_init_script(binary: &str) -> String {
 # The functions are intentionally wrappers, so aliases and all TTY streams
 # remain owned by the caller. Set GHIS_BYPASS=1 for one command when needed.
 
+typeset -gx GHIS_SHELL_INTEGRATION=1
+
 _ghis_dispatch() {{
   local _ghis_kind="$1"
   shift
@@ -125,6 +131,25 @@ pub fn zsh_wrapper_script(binary: &str) -> String {
 /// Compatibility name used by setup/diagnostic commands.
 pub fn generate_init(binary: &str) -> String {
     zsh_init_script(binary)
+}
+
+/// Whether the current process was started from a shell that sourced the
+/// generated init script. This marker is diagnostic only and grants no trust
+/// or authorization by itself.
+pub fn integration_is_loaded() -> bool {
+    std::env::var_os(LOADED_ENV).as_deref() == Some(OsStr::new("1"))
+}
+
+/// Check that both generated files still contain exactly the setup ghis would
+/// install now. This is read-only and does not imply the current shell sourced
+/// either file.
+pub fn integration_is_installed(zshrc: &Path, init_file: &Path, binary: &str) -> bool {
+    let expected_init = zsh_init_script(binary);
+    let expected_block = managed_block(init_file);
+    fs::read_to_string(init_file).ok().as_deref() == Some(expected_init.as_str())
+        && fs::read_to_string(zshrc)
+            .ok()
+            .is_some_and(|contents| contents.contains(expected_block.trim_end()))
 }
 
 /// Generate zsh glue for the wrapped commands.
@@ -427,6 +452,7 @@ mod tests {
         let report = setup(&zshrc, &init, "ghis").expect("setup");
         assert!(report.changed);
         assert!(report.backup.is_some());
+        assert!(integration_is_installed(&zshrc, &init, "ghis"));
         assert!(
             fs::read_to_string(&zshrc)
                 .expect("read")
@@ -437,6 +463,7 @@ mod tests {
         assert!(uninstall(&zshrc).expect("uninstall"));
         let after_uninstall = fs::read_to_string(&zshrc).expect("read");
         assert!(!after_uninstall.contains(START_MARKER));
+        assert!(!integration_is_installed(&zshrc, &init, "ghis"));
         assert_eq!(after_uninstall, "export TEST=1\n");
         assert!(!uninstall(&zshrc).expect("second uninstall"));
         assert_eq!(fs::read_to_string(&zshrc).expect("read"), after_uninstall);
