@@ -2544,42 +2544,43 @@ fn apply_tui_config_views(
             )
         }),
     );
-    state.set_view_items(
-        tui::View::Settings,
-        [
-            format!(
-                "auto_bind\t{}",
-                if config.behavior.auto_bind {
-                    "开启"
-                } else {
-                    "关闭"
-                }
-            ),
-            format!(
-                "default_profile\t{}",
-                config.behavior.default_profile.as_deref().unwrap_or("无")
-            ),
-            format!(
-                "display_identity\t{}",
-                display_identity_value(config.behavior.display_identity)
-            ),
-            format!(
-                "unresolved\t{}",
-                match config.behavior.unresolved {
-                    UnresolvedPolicy::WarnAndContinue => "warn-and-continue",
-                    UnresolvedPolicy::Fail => "fail",
-                }
-            ),
-            "credential_failure\tfail（v1 固定）".into(),
-            format!(
-                "ssh_unmanaged\t{}",
-                match config.behavior.ssh_unmanaged {
-                    SshUnmanagedPolicy::WarnAndContinue => "warn-and-continue",
-                    SshUnmanagedPolicy::Fail => "fail",
-                }
-            ),
-        ],
-    );
+    state.set_view_items(tui::View::Settings, tui_setting_rows(config));
+}
+
+fn tui_setting_rows(config: &Config) -> Vec<String> {
+    vec![
+        format!(
+            "auto_bind\t{}\n  含义：唯一规则匹配后自动绑定当前仓库",
+            if config.behavior.auto_bind {
+                "开启"
+            } else {
+                "关闭"
+            }
+        ),
+        format!(
+            "default_profile\t{}\n  含义：无绑定且无规则匹配时使用的默认 Profile",
+            config.behavior.default_profile.as_deref().unwrap_or("无")
+        ),
+        format!(
+            "display_identity\t{}\n  含义：控制执行 Git 或 gh 操作前何时显示 Profile",
+            display_identity_value(config.behavior.display_identity)
+        ),
+        format!(
+            "unresolved\t{}\n  含义：无法唯一解析 Profile 时继续警告或停止操作",
+            match config.behavior.unresolved {
+                UnresolvedPolicy::WarnAndContinue => "warn-and-continue",
+                UnresolvedPolicy::Fail => "fail",
+            }
+        ),
+        "credential_failure\tfail（v1 固定）\n  含义：凭据不可用时停止，防止回退到其他账号".into(),
+        format!(
+            "ssh_unmanaged\t{}\n  含义：Profile 未纳管 SSH key 时继续警告或停止操作",
+            match config.behavior.ssh_unmanaged {
+                SshUnmanagedPolicy::WarnAndContinue => "warn-and-continue",
+                SshUnmanagedPolicy::Fail => "fail",
+            }
+        ),
+    ]
 }
 
 fn tui_diagnostics_with_accounts(
@@ -4196,6 +4197,19 @@ mod tests {
             settings.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
             KNOWN_BEHAVIOR_KEYS
         );
+    }
+
+    #[test]
+    fn tui_settings_keep_descriptions_inside_each_selectable_row() {
+        let mut config = Config::default();
+        config.behavior.default_profile = Some("personal".into());
+        let rows = tui_setting_rows(&config);
+
+        assert_eq!(rows.len(), KNOWN_BEHAVIOR_KEYS.len());
+        assert!(rows.iter().all(|row| row.contains("\n  含义：")));
+        assert!(rows[0].starts_with("auto_bind\t开启\n"));
+        assert!(rows[1].starts_with("default_profile\tpersonal\n"));
+        assert!(rows[4].contains("防止回退到其他账号"));
     }
 
     fn executable_test_program(path: &Path) -> signing::SigningProgram {

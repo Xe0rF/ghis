@@ -578,7 +578,7 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
         .items
         .iter()
         .filter(|item| query.is_empty() || item.to_lowercase().contains(&query))
-        .map(|item| ListItem::new(item.as_str()))
+        .map(|item| ListItem::new(render_list_row(item)))
         .collect::<Vec<_>>();
     let empty = filtered.is_empty();
     let item_count = filtered.len();
@@ -632,6 +632,10 @@ fn render_body(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
             .wrap(Wrap { trim: true }),
         columns[1],
     );
+}
+
+fn render_list_row(item: &str) -> String {
+    item.replace('\t', "  ")
 }
 
 fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
@@ -836,6 +840,34 @@ mod tests {
         ]);
         state.details = vec!["解析来源：仓库绑定".into(), "凭据状态：可用".into()];
         state
+    }
+
+    #[test]
+    fn list_rows_render_tabs_as_visible_spacing() {
+        assert_eq!(
+            render_list_row("Git\tgit version test"),
+            "Git  git version test"
+        );
+        assert_eq!(
+            render_list_row("警告\tuser.email 范围=global"),
+            "警告  user.email 范围=global"
+        );
+    }
+
+    #[test]
+    fn multiline_setting_description_renders_below_its_value() {
+        let mut state = bound_state();
+        state.view = View::Settings;
+        state.set_items([
+            "auto_bind\t开启\n  含义：唯一规则匹配后自动绑定当前仓库",
+            "default_profile\tpersonal\n  含义：无匹配时使用的默认 Profile",
+        ]);
+
+        let rendered = snapshot_text(&state);
+        assert!(rendered.contains("› auto_bind  开启"));
+        assert!(rendered.contains("  含义：唯一规则匹配后自动绑定当前仓库"));
+        assert!(rendered.contains("  default_profile  personal"));
+        assert!(rendered.contains("  含义：无匹配时使用的默认 Profile"));
     }
 
     #[test]
