@@ -1722,6 +1722,140 @@ program = "/opt/1Password/op-ssh-sign"
 }
 
 #[test]
+fn profile_add_noreply_uses_canonical_github_login_without_email_scope() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let bin = temp.path().join("bin");
+    let trace = temp.path().join("gh.trace");
+    fs::create_dir_all(&bin).expect("bin directory");
+    write_executable(
+        &bin.join("gh"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_GH_TRACE"
+case "$*" in
+  "auth token --hostname github.com --user input-login") printf 'selected-token\n' ;;
+  "api user")
+    [ "$GH_TOKEN" = selected-token ] || exit 81
+    [ "$GH_HOST" = github.com ] || exit 82
+    printf '%s\n' '{"id":12345678,"login":"Xe0rF"}'
+    ;;
+  *) exit 83 ;;
+esac
+"#,
+    );
+
+    let mut add = isolated_ghis_command();
+    add.args([
+        "profile",
+        "add",
+        "personal",
+        "--login",
+        "input-login",
+        "--name",
+        "Xe0rF",
+        "--github-noreply",
+    ])
+    .env("PATH", prepend_path(&bin))
+    .env("FAKE_GH_TRACE", &trace);
+    for (key, value) in xdg_environment(&temp) {
+        add.env(key, value);
+    }
+    add.assert().success();
+
+    let config = Config::load(temp.path().join("config/ghis/config.toml")).expect("config");
+    assert_eq!(
+        config.profiles["personal"].git_email,
+        "12345678+Xe0rF@users.noreply.github.com"
+    );
+    let trace = fs::read_to_string(trace).expect("gh trace");
+    assert!(trace.contains("api user\n"));
+    assert!(!trace.contains("user/emails"));
+    assert!(!trace.contains("selected-token"));
+}
+
+#[test]
+fn profile_mail_lists_noreply_when_email_endpoint_has_no_scope() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).expect("bin directory");
+    write_executable(
+        &bin.join("gh"),
+        r#"#!/bin/sh
+case "$*" in
+  "auth token --hostname github.com --user alice") printf 'selected-token\n' ;;
+  "api user") printf '%s\n' '{"id":42,"login":"CanonicalLogin"}' ;;
+  "api user/emails")
+    printf 'requires user:email scope; token=selected-token' >&2
+    exit 1
+    ;;
+  *) exit 84 ;;
+esac
+"#,
+    );
+
+    let mut mail = isolated_ghis_command();
+    mail.args(["profile", "mail", "personal", "--json"])
+        .env("PATH", prepend_path(&bin));
+    for (key, value) in xdg_environment(&temp) {
+        mail.env(key, value);
+    }
+    let output = mail.output().expect("run profile mail");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let candidates: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(candidates.as_array().unwrap().len(), 1);
+    assert_eq!(
+        candidates[0]["email"],
+        "42+CanonicalLogin@users.noreply.github.com"
+    );
+    assert_eq!(candidates[0]["noreply"], true);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!combined.contains("selected-token"));
+}
+
+#[test]
+fn profile_noreply_rejects_enterprise_hosts_without_contacting_gh() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let bin = temp.path().join("bin");
+    let trace = temp.path().join("gh.trace");
+    fs::create_dir_all(&bin).expect("bin directory");
+    write_executable(
+        &bin.join("gh"),
+        "#!/bin/sh\nprintf 'unexpected\\n' > \"$FAKE_GH_TRACE\"\nexit 85\n",
+    );
+
+    let mut add = isolated_ghis_command();
+    add.args([
+        "profile",
+        "add",
+        "enterprise",
+        "--host",
+        "git.example.test",
+        "--login",
+        "alice",
+        "--name",
+        "Alice",
+        "-N",
+    ])
+    .env("PATH", prepend_path(&bin))
+    .env("FAKE_GH_TRACE", &trace);
+    for (key, value) in xdg_environment(&temp) {
+        add.env(key, value);
+    }
+    add.assert()
+        .failure()
+        .stderr(predicate::str::contains("只支持 github.com"));
+    assert!(!trace.exists());
+}
+
+#[test]
 fn discover_and_doctor_refresh_the_same_redacted_account_cache() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let fake_bin = temp.path().join("bin");

@@ -143,9 +143,18 @@ enum ProfileCommand {
     },
     Add(ProfileArgs),
     Edit(ProfileEditArgs),
+    /// 查看一个 profile 可用的提交邮箱候选
+    Mail(MailArgs),
     Remove {
         id: String,
     },
+}
+
+#[derive(Debug, Args)]
+struct MailArgs {
+    id: String,
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -157,8 +166,16 @@ struct ProfileArgs {
     login: String,
     #[arg(long = "name")]
     git_name: String,
-    #[arg(long = "email")]
-    git_email: String,
+    #[arg(long = "email", conflicts_with = "noreply")]
+    git_email: Option<String>,
+    /// 使用 GitHub.com 的 ID-based noreply 邮箱
+    #[arg(
+        short = 'N',
+        long = "noreply",
+        visible_alias = "github-noreply",
+        conflicts_with = "git_email"
+    )]
+    noreply: bool,
     #[arg(long, value_enum, default_value_t = SshModeArg::External)]
     ssh: SshModeArg,
     #[arg(long)]
@@ -184,8 +201,16 @@ struct ProfileEditArgs {
     login: Option<String>,
     #[arg(long = "name")]
     git_name: Option<String>,
-    #[arg(long = "email")]
+    #[arg(long = "email", conflicts_with = "noreply")]
     git_email: Option<String>,
+    /// 使用 GitHub.com 的 ID-based noreply 邮箱
+    #[arg(
+        short = 'N',
+        long = "noreply",
+        visible_alias = "github-noreply",
+        conflicts_with = "git_email"
+    )]
+    noreply: bool,
     #[arg(long, value_enum)]
     ssh: Option<SshModeArg>,
     #[arg(long)]
@@ -489,7 +514,13 @@ fn profile_command(path: Option<&Path>, command: ProfileCommand) -> app::Result<
         }
         ProfileCommand::Add(args) => {
             let id = args.id.clone();
-            let profile = profile_from_args(args);
+            let email = resolve_profile_email(
+                &args.host,
+                &args.login,
+                args.git_email.as_deref(),
+                args.noreply,
+            )?;
+            let profile = profile_from_args(args, email);
             let (config, ()) = update_config(&paths, |config| {
                 if config.profiles.contains_key(&id) {
                     return Err(app::AppError::Message(format!("profile `{id}` 已存在")));
@@ -502,6 +533,16 @@ fn profile_command(path: Option<&Path>, command: ProfileCommand) -> app::Result<
         }
         ProfileCommand::Edit(args) => {
             let id = args.id.clone();
+            let mut args = args;
+            if args.noreply {
+                let profile = config
+                    .profiles
+                    .get(&id)
+                    .ok_or_else(|| app::AppError::Message(format!("profile `{id}` 不存在")))?;
+                let host = args.host.as_deref().unwrap_or(&profile.host);
+                let login = args.login.as_deref().unwrap_or(&profile.login);
+                args.git_email = Some(resolve_profile_email(host, login, None, true)?);
+            }
             let (config, ()) = update_config(&paths, |config| {
                 let profile = config
                     .profiles
@@ -512,6 +553,36 @@ fn profile_command(path: Option<&Path>, command: ProfileCommand) -> app::Result<
             })?;
             app::sync_fragments(&paths, &config)?;
             println!("已更新 profile `{id}`。")
+        }
+        ProfileCommand::Mail(args) => {
+            let profile = config
+                .profiles
+                .get(&args.id)
+                .ok_or_else(|| app::AppError::Message(format!("profile `{}` 不存在", args.id)))?;
+            let candidates = github::profile_email_candidates(&profile.host, &profile.login)?;
+            if args.json {
+                print_json(&candidates)?;
+            } else {
+                for candidate in candidates {
+                    let mut labels = Vec::new();
+                    if candidate.noreply {
+                        labels.push("GitHub noreply");
+                    }
+                    if candidate.primary {
+                        labels.push("首选");
+                    }
+                    if candidate.verified {
+                        labels.push("已验证");
+                    }
+                    println!(
+                        "{}{}",
+                        candidate.email,
+                        (!labels.is_empty())
+                            .then(|| format!("（{}）", labels.join("，")))
+                            .unwrap_or_default()
+                    );
+                }
+            }
         }
         ProfileCommand::Remove { id } => {
             let (config, ()) = update_config(&paths, |config| remove_profile(config, &id))?;
@@ -536,7 +607,25 @@ fn remove_profile(config: &mut Config, id: &str) -> app::Result<()> {
     Ok(())
 }
 
-fn profile_from_args(args: ProfileArgs) -> Profile {
+fn resolve_profile_email(
+    host: &str,
+    login: &str,
+    explicit: Option<&str>,
+    noreply: bool,
+) -> app::Result<String> {
+    if noreply {
+        return github::github_noreply_email(host, login)?.ok_or_else(|| {
+            app::AppError::Message(
+                "--noreply 目前只支持 github.com；Enterprise 请使用 --email".into(),
+            )
+        });
+    }
+    explicit
+        .map(str::to_owned)
+        .ok_or_else(|| app::AppError::Message("请提供 --email，或使用 --noreply（-N）".into()))
+}
+
+fn profile_from_args(args: ProfileArgs, git_email: String) -> Profile {
     let ssh_mode = match args.ssh {
         SshModeArg::External => SshMode::External,
         SshModeArg::OnePassword => SshMode::OnePassword,
@@ -546,7 +635,7 @@ fn profile_from_args(args: ProfileArgs) -> Profile {
         host: github::normalize_host(&args.host),
         login: args.login,
         git_name: args.git_name,
-        git_email: args.git_email,
+        git_email,
         ssh: Some(SshProfile {
             mode: ssh_mode,
             public_key: args.public_key,
@@ -1476,7 +1565,7 @@ fn run_tui_worker(receiver: Receiver<TuiWorkerJob>, sender: Sender<TuiWorkerResu
             )),
             TuiWorkerJob::Discovery => TuiWorkerResult::Discovery(github::discover_accounts(None)),
             TuiWorkerJob::Emails { host, login } => {
-                let result = github::email_candidates(&host, &login);
+                let result = github::profile_email_candidates(&host, &login);
                 TuiWorkerResult::Emails {
                     host,
                     login,
@@ -2350,6 +2439,11 @@ fn receive_tui_worker_results(
                 );
                 state.status = if candidates.is_empty() {
                     "没有可预填的邮箱；请手动填写提交邮箱，回车后确认"
+                } else if candidates
+                    .first()
+                    .is_some_and(|candidate| candidate.noreply)
+                {
+                    "已预填 GitHub noreply 邮箱；可继续编辑，回车后确认"
                 } else {
                     "已预填首选邮箱；可继续编辑，回车后确认"
                 }
@@ -2409,6 +2503,9 @@ fn tui_email_candidate_details(
             let mut labels = Vec::new();
             if candidate.primary {
                 labels.push("首选");
+            }
+            if candidate.noreply {
+                labels.push("GitHub noreply");
             }
             if candidate.verified {
                 labels.push("已验证");

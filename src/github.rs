@@ -302,25 +302,7 @@ where
 /// is sorted primary-first and then alphabetically, making first-run profile
 /// confirmation deterministic.
 pub fn email_candidates(host: &str, login: &str) -> Result<Vec<EmailCandidate>> {
-    let selected = token(host, login)?;
-    let token_text = selected.as_str().ok_or_else(|| GhError::MissingToken {
-        host: host.to_owned(),
-        login: login.to_owned(),
-    })?;
-    let output = sanitized_command(
-        "gh",
-        ["api", "user/emails"],
-        Some((token_environment_variable(host), token_text)),
-        Some(host),
-    )?;
-    if !output.status.success() {
-        let error = command_error_with_secrets("api user/emails", &output, &[token_text]);
-        drop(selected);
-        return Err(error);
-    }
-    drop(selected);
-    let value: Value =
-        serde_json::from_slice(&output.stdout).map_err(|err| GhError::Json(err.to_string()))?;
+    let value = api_json(host, login, "user/emails")?;
     let array = value
         .as_array()
         .ok_or_else(|| GhError::Json("user/emails response is not an array".into()))?;
@@ -333,6 +315,7 @@ pub fn email_candidates(host: &str, login: &str) -> Result<Vec<EmailCandidate>> 
                 primary: bool_field(item, "primary").unwrap_or(false),
                 verified: bool_field(item, "verified").unwrap_or(false),
                 visibility: string_field(item, "visibility"),
+                noreply: false,
             })
         })
         .collect::<Vec<_>>();
@@ -346,12 +329,96 @@ pub fn email_candidates(host: &str, login: &str) -> Result<Vec<EmailCandidate>> 
     Ok(result)
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct EmailCandidate {
     pub email: String,
     pub primary: bool,
     pub verified: bool,
     pub visibility: Option<String>,
+    pub noreply: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GhUser {
+    pub id: u64,
+    pub login: String,
+}
+
+/// Read the canonical login and numeric id for the selected gh account.
+pub fn user_identity(host: &str, login: &str) -> Result<GhUser> {
+    let value = api_json(host, login, "user")?;
+    let id = value
+        .get("id")
+        .and_then(|value| value.as_u64().or_else(|| value.as_str()?.parse().ok()))
+        .ok_or_else(|| GhError::Json("user response has no numeric id".into()))?;
+    let login = string_field(&value, "login")
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| GhError::Json("user response has no login".into()))?;
+    Ok(GhUser { id, login })
+}
+
+/// Generate GitHub.com's ID-based noreply address. Enterprise hosts may use
+/// different address rules, so callers must choose an explicit email there.
+pub fn github_noreply_email(host: &str, login: &str) -> Result<Option<String>> {
+    if normalize_host(host) != "github.com" {
+        return Ok(None);
+    }
+    let user = user_identity(host, login)?;
+    Ok(
+        (user.id > 0)
+            .then(|| format!("{}+{}@users.noreply.github.com", user.id, user.login.trim())),
+    )
+}
+
+/// Build profile email candidates with noreply first. Reading `/user/emails`
+/// is optional because many existing gh tokens do not have `user:email`.
+pub fn profile_email_candidates(host: &str, login: &str) -> Result<Vec<EmailCandidate>> {
+    let user = user_identity(host, login)?;
+    let mut result = Vec::new();
+    if normalize_host(host) == "github.com" && user.id > 0 {
+        result.push(EmailCandidate {
+            email: format!("{}+{}@users.noreply.github.com", user.id, user.login.trim()),
+            primary: false,
+            verified: true,
+            visibility: Some("noreply".into()),
+            noreply: true,
+        });
+    }
+    if let Ok(mut emails) = email_candidates(host, login) {
+        result.append(&mut emails);
+    }
+    result.sort_by_key(|candidate| {
+        (
+            !candidate.noreply,
+            !candidate.primary,
+            !candidate.verified,
+            candidate.email.to_ascii_lowercase(),
+        )
+    });
+    result.dedup_by(|left, right| left.email.eq_ignore_ascii_case(&right.email));
+    Ok(result)
+}
+
+fn api_json(host: &str, login: &str, endpoint: &str) -> Result<Value> {
+    let selected = token(host, login)?;
+    let token_text = selected.as_str().ok_or_else(|| GhError::MissingToken {
+        host: host.to_owned(),
+        login: login.to_owned(),
+    })?;
+    let output = sanitized_command(
+        "gh",
+        ["api", endpoint],
+        Some((token_environment_variable(host), token_text)),
+        Some(host),
+    )?;
+    if !output.status.success() {
+        let error = command_error_with_secrets(format!("api {endpoint}"), &output, &[token_text]);
+        drop(selected);
+        return Err(error);
+    }
+    drop(selected);
+    serde_json::from_slice(&output.stdout).map_err(|err| GhError::Json(err.to_string()))
 }
 
 pub fn normalize_host(host: &str) -> String {
