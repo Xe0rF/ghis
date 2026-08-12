@@ -163,6 +163,78 @@ pub fn git_config(repository: &Repository, key: &str) -> Result<Option<String>> 
     repo::local_config(repository, key).map_err(Into::into)
 }
 
+/// One value returned by Git's merged configuration view.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConfigEntry {
+    pub scope: String,
+    pub origin: String,
+    pub key: String,
+    pub value: String,
+}
+
+/// Read the effective Git configuration, including included files. Git itself
+/// remains the parser so include/includeIf and scope semantics stay exact.
+pub fn config_entries(dir: &Path) -> Result<Vec<ConfigEntry>> {
+    let out = run_git(
+        dir,
+        [
+            "config",
+            "--null",
+            "--show-origin",
+            "--show-scope",
+            "--includes",
+            "--list",
+        ],
+    )?;
+    if !out.status.success() {
+        return Err(command_error(
+            "config --show-origin --show-scope --list",
+            &out,
+        ));
+    }
+    parse_config_entries(&out.stdout)
+}
+
+/// Parse the NUL-delimited triples emitted by [`config_entries`].
+pub fn parse_config_entries(bytes: &[u8]) -> Result<Vec<ConfigEntry>> {
+    let fields = bytes.split(|byte| *byte == 0).collect::<Vec<_>>();
+    let trailing_empty = fields.last().is_some_and(|field| field.is_empty());
+    let record_fields = if trailing_empty {
+        &fields[..fields.len().saturating_sub(1)]
+    } else {
+        fields.as_slice()
+    };
+    if !record_fields.len().is_multiple_of(3) {
+        return Err(GitError::InvalidOutput {
+            operation: "config --show-origin --show-scope --list".into(),
+            output: "Git returned an incomplete NUL-delimited config record".into(),
+        });
+    }
+
+    let mut entries = Vec::with_capacity(record_fields.len() / 3);
+    for chunk in record_fields.chunks_exact(3) {
+        if chunk.iter().all(|field| field.is_empty()) {
+            continue;
+        }
+        let scope = String::from_utf8_lossy(chunk[0]).trim().to_owned();
+        let origin = String::from_utf8_lossy(chunk[1]).into_owned();
+        let Some(separator) = chunk[2].iter().position(|byte| *byte == b'\n') else {
+            return Err(GitError::InvalidOutput {
+                operation: "config --show-origin --show-scope --list".into(),
+                output: "Git returned a config field without its key/value separator".into(),
+            });
+        };
+        let (key, value) = chunk[2].split_at(separator);
+        entries.push(ConfigEntry {
+            scope,
+            origin,
+            key: String::from_utf8_lossy(key).trim().to_ascii_lowercase(),
+            value: String::from_utf8_lossy(&value[1..]).into_owned(),
+        });
+    }
+    Ok(entries)
+}
+
 pub fn set_git_config(repository: &Repository, key: &str, value: &str) -> Result<()> {
     repo::set_local_config(repository, key, value).map_err(Into::into)
 }
@@ -465,6 +537,49 @@ fn command_error(operation: impl Into<String>, output: &Output) -> GitError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_git_config_entries_with_origin_scope_and_newlines() {
+        let bytes = b"global\0file:/tmp/global\0user.name\nAlice Example\0global\0file:/tmp/global\0credential.helper\nstore\0";
+        assert_eq!(
+            parse_config_entries(bytes).unwrap(),
+            vec![
+                ConfigEntry {
+                    scope: "global".into(),
+                    origin: "file:/tmp/global".into(),
+                    key: "user.name".into(),
+                    value: "Alice Example".into(),
+                },
+                ConfigEntry {
+                    scope: "global".into(),
+                    origin: "file:/tmp/global".into(),
+                    key: "credential.helper".into(),
+                    value: "store".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_or_unseparated_config_records() {
+        let incomplete = parse_config_entries(b"global\0file:/tmp/config\0user.name\nAlice\0extra");
+        assert!(matches!(incomplete, Err(GitError::InvalidOutput { .. })));
+        let missing_separator = parse_config_entries(b"global\0file:/tmp/config\0user.name\0");
+        assert!(matches!(
+            missing_separator,
+            Err(GitError::InvalidOutput { .. })
+        ));
+    }
+
+    #[test]
+    fn preserves_embedded_newlines_in_config_values() {
+        let entries = parse_config_entries(
+            b"global\0file:/tmp/config\0http.extraheader\nX-Test: one\nX-Test: two\0",
+        )
+        .unwrap();
+        assert_eq!(entries[0].key, "http.extraheader");
+        assert_eq!(entries[0].value, "X-Test: one\nX-Test: two");
+    }
     use std::process::Command;
 
     fn initialized_repository() -> (tempfile::TempDir, Repository) {

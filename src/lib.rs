@@ -7,6 +7,7 @@
 pub mod app;
 pub mod config;
 pub mod credential;
+pub mod diagnostics;
 pub mod git;
 pub mod github;
 pub mod process;
