@@ -64,7 +64,7 @@ enum Commands {
     /// 重建 profile Git 配置片段
     Sync,
     /// 检查依赖、账号、仓库和 1Password/SSH 状态
-    Doctor(JsonArgs),
+    Doctor(DoctorArgs),
     /// 安装 zsh 包装器
     Setup(SetupArgs),
     /// 从 .zshrc 移除 ghis 管理块
@@ -115,6 +115,15 @@ struct StatusArgs {
     shell: bool,
     #[arg(long, hide = true)]
     quiet: bool,
+}
+
+#[derive(Debug, Args, Default)]
+struct DoctorArgs {
+    #[arg(long)]
+    json: bool,
+    /// 显式访问 GitHub API，核对当前 Profile 的 SSH signing 公钥
+    #[arg(long, visible_alias = "check-github-signing-keys")]
+    check_github_signing_key: bool,
 }
 
 #[derive(Debug, Args)]
@@ -310,7 +319,12 @@ fn run(cli: Cli) -> app::Result<i32> {
         Commands::Rule { command } => rule_command(cli.config.as_deref(), command),
         Commands::Config { command } => config_command(cli.config.as_deref(), command),
         Commands::Sync => sync(cli.config.as_deref()),
-        Commands::Doctor(args) => doctor(cli.config.as_deref(), cli.profile.as_deref(), args.json),
+        Commands::Doctor(args) => doctor(
+            cli.config.as_deref(),
+            cli.profile.as_deref(),
+            args.json,
+            args.check_github_signing_key,
+        ),
         Commands::Setup(args) => setup(args),
         Commands::Uninstall => uninstall(),
         Commands::Init {
@@ -977,6 +991,7 @@ struct DoctorReport {
     credential_available: Option<bool>,
     ssh_agent: Option<DoctorAgent>,
     signing_program: Option<DoctorSigningProgram>,
+    github_signing_key: Option<DoctorGithubSigningKey>,
     git_config: diagnostics::GitConfigReport,
     warnings: Vec<String>,
 }
@@ -1029,7 +1044,37 @@ struct DoctorSigningProgram {
     available: bool,
 }
 
-fn doctor(path: Option<&Path>, explicit: Option<&str>, json: bool) -> app::Result<i32> {
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DoctorGithubSigningKeyStatus {
+    NotChecked,
+    Matched,
+    NotMatched,
+    LocalKeyUnavailable,
+    Unavailable,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct DoctorGithubSigningKey {
+    checked: bool,
+    status: DoctorGithubSigningKeyStatus,
+    local_fingerprint: Option<String>,
+    github_key_count: Option<usize>,
+    error: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct DoctorLocalSigningKey {
+    material: String,
+    fingerprint: Option<String>,
+}
+
+fn doctor(
+    path: Option<&Path>,
+    explicit: Option<&str>,
+    json: bool,
+    check_github_signing_key: bool,
+) -> app::Result<i32> {
     let ctx = context(path, explicit, std::env::current_dir()?)?;
     let mut warnings = ctx.warnings.clone();
     let shell_integration = doctor_shell_integration(&ctx);
@@ -1093,7 +1138,26 @@ fn doctor(path: Option<&Path>, explicit: Option<&str>, json: bool) -> app::Resul
                 .as_ref()
                 .is_some_and(|ssh| matches!(ssh.mode, SshMode::OnePassword | SshMode::Managed))
     });
-    let selector = doctor_key_selector(ctx.profile.as_ref(), &mut warnings);
+    let signing_required = ctx
+        .profile
+        .as_ref()
+        .is_some_and(|profile| profile.signing.enabled);
+    let (local_signing_key, local_signing_key_error) = if signing_required {
+        match doctor_local_signing_key(ctx.profile.as_ref().expect("signing profile exists")) {
+            Ok(key) => (Some(key), None),
+            Err(error) => {
+                warnings.push(error.clone());
+                (None, Some(error))
+            }
+        }
+    } else {
+        (None, None)
+    };
+    let selector = doctor_key_selector(
+        ctx.profile.as_ref(),
+        local_signing_key.as_ref().map(|key| key.material.as_str()),
+        &mut warnings,
+    );
     let ssh_agent = match socket {
         Some(socket) => match signing::inspect_agent(&socket) {
             Ok(agent) => {
@@ -1153,10 +1217,6 @@ fn doctor(path: Option<&Path>, explicit: Option<&str>, json: bool) -> app::Resul
             .as_ref()
             .and_then(|profile| profile.signing.program.as_deref()),
     );
-    let signing_required = ctx
-        .profile
-        .as_ref()
-        .is_some_and(|profile| profile.signing.enabled);
     let signing_program = program.map(|program| DoctorSigningProgram {
         available: signing::signing_program_available(&program),
         path: program.path.display().to_string(),
@@ -1169,6 +1229,14 @@ fn doctor(path: Option<&Path>, explicit: Option<&str>, json: bool) -> app::Resul
     {
         warnings.push("已启用 SSH commit signing，但签名程序不可执行".into());
     }
+
+    let github_signing_key = doctor_github_signing_key(
+        check_github_signing_key,
+        ctx.profile.as_ref(),
+        local_signing_key.as_ref(),
+        local_signing_key_error.as_deref(),
+        &mut warnings,
+    );
 
     let report = DoctorReport {
         schema_version: ghis::SCHEMA_VERSION,
@@ -1197,6 +1265,7 @@ fn doctor(path: Option<&Path>, explicit: Option<&str>, json: bool) -> app::Resul
         credential_available,
         ssh_agent,
         signing_program,
+        github_signing_key,
         git_config,
         warnings,
     };
@@ -1258,6 +1327,25 @@ fn doctor(path: Option<&Path>, explicit: Option<&str>, json: bool) -> app::Resul
             );
         } else {
             println!("SSH 签名程序: 未发现");
+        }
+        if let Some(check) = &report.github_signing_key {
+            let count = check
+                .github_key_count
+                .map(|count| format!("，GitHub 登记 {count} 把"))
+                .unwrap_or_default();
+            let fingerprint = check
+                .local_fingerprint
+                .as_deref()
+                .map(|fingerprint| format!("，本地 {fingerprint}"))
+                .unwrap_or_default();
+            println!(
+                "GitHub SSH 签名公钥: {}{}{}",
+                doctor_github_signing_key_text(check.status),
+                count,
+                fingerprint
+            );
+        } else {
+            println!("GitHub SSH 签名公钥: 未启用");
         }
         println!(
             "Git 配置冲突: {}",
@@ -1394,8 +1482,134 @@ fn doctor_shell_integration_advice(state: DoctorShellIntegrationState) -> &'stat
     }
 }
 
+fn doctor_local_signing_key(
+    profile: &Profile,
+) -> std::result::Result<DoctorLocalSigningKey, String> {
+    let public_key = profile_public_key_for_doctor(profile)?
+        .ok_or_else(|| "已启用签名，但未配置签名公钥".to_string())?;
+    let material = signing::public_key_material(&public_key)
+        .ok_or_else(|| "配置的签名公钥不包含有效 SSH 公钥".to_string())?;
+    let fingerprint = signing::fingerprint(&material)
+        .map_err(|error| format!("配置的签名公钥无法通过 ssh-keygen 校验：{error}"))?;
+    Ok(DoctorLocalSigningKey {
+        material,
+        fingerprint: Some(fingerprint),
+    })
+}
+
+fn doctor_github_signing_key(
+    requested: bool,
+    profile: Option<&Profile>,
+    local_key: Option<&DoctorLocalSigningKey>,
+    local_error: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> Option<DoctorGithubSigningKey> {
+    let profile = profile.filter(|profile| profile.signing.enabled)?;
+    let local_fingerprint = local_key.and_then(|key| key.fingerprint.clone());
+    let Some(local_key) = local_key else {
+        return Some(DoctorGithubSigningKey {
+            checked: false,
+            status: DoctorGithubSigningKeyStatus::LocalKeyUnavailable,
+            local_fingerprint,
+            github_key_count: None,
+            error: local_error.map(str::to_owned),
+        });
+    };
+    if !requested {
+        return Some(DoctorGithubSigningKey {
+            checked: false,
+            status: DoctorGithubSigningKeyStatus::NotChecked,
+            local_fingerprint,
+            github_key_count: None,
+            error: None,
+        });
+    }
+
+    match github::ssh_signing_keys(&profile.host, &profile.login) {
+        Ok(keys) => {
+            let materials = keys
+                .iter()
+                .map(|key| signing::public_key_material(&key.key))
+                .collect::<Option<Vec<_>>>();
+            let Some(materials) = materials else {
+                let error = "GitHub 返回了无法识别的 SSH signing 公钥".to_string();
+                warnings.push(format!("{error}；不会因此判定本地签名 key 失效"));
+                return Some(DoctorGithubSigningKey {
+                    checked: true,
+                    status: DoctorGithubSigningKeyStatus::Unavailable,
+                    local_fingerprint,
+                    github_key_count: None,
+                    error: Some(error),
+                });
+            };
+            let matched = materials
+                .iter()
+                .any(|material| material == &local_key.material);
+            if !matched {
+                if let Some(error) = materials
+                    .iter()
+                    .find_map(|material| signing::fingerprint(material).err())
+                {
+                    let error = format!(
+                        "GitHub 返回了无法通过 ssh-keygen 校验的 SSH signing 公钥：{error}"
+                    );
+                    warnings.push(format!("{error}；不会因此判定本地签名 key 失效"));
+                    return Some(DoctorGithubSigningKey {
+                        checked: true,
+                        status: DoctorGithubSigningKeyStatus::Unavailable,
+                        local_fingerprint,
+                        github_key_count: None,
+                        error: Some(error),
+                    });
+                }
+                warnings.push(
+                    "GitHub 未登记当前 Profile 的 SSH 签名公钥；本地 key 未被判为失效，但 GitHub 可能无法验证签名"
+                        .into(),
+                );
+            }
+            Some(DoctorGithubSigningKey {
+                checked: true,
+                status: if matched {
+                    DoctorGithubSigningKeyStatus::Matched
+                } else {
+                    DoctorGithubSigningKeyStatus::NotMatched
+                },
+                local_fingerprint,
+                github_key_count: Some(keys.len()),
+                error: None,
+            })
+        }
+        Err(error) => {
+            let error = error.to_string();
+            warnings.push(format!(
+                "无法检查 GitHub SSH 签名公钥：{error}；不会因此判定本地签名 key 失效"
+            ));
+            Some(DoctorGithubSigningKey {
+                checked: true,
+                status: DoctorGithubSigningKeyStatus::Unavailable,
+                local_fingerprint,
+                github_key_count: None,
+                error: Some(error),
+            })
+        }
+    }
+}
+
+fn doctor_github_signing_key_text(status: DoctorGithubSigningKeyStatus) -> &'static str {
+    match status {
+        DoctorGithubSigningKeyStatus::NotChecked => {
+            "未检查（使用 --check-github-signing-key 才会访问 GitHub API）"
+        }
+        DoctorGithubSigningKeyStatus::Matched => "已匹配",
+        DoctorGithubSigningKeyStatus::NotMatched => "未匹配（GitHub 未登记当前公钥）",
+        DoctorGithubSigningKeyStatus::LocalKeyUnavailable => "本地签名公钥不可用，未检查",
+        DoctorGithubSigningKeyStatus::Unavailable => "无法检查（保留本地状态）",
+    }
+}
+
 fn doctor_key_selector(
     profile: Option<&Profile>,
+    signing_public_key: Option<&str>,
     warnings: &mut Vec<String>,
 ) -> Option<signing::SigningProfile> {
     let profile = profile?;
@@ -1413,13 +1627,8 @@ fn doctor_key_selector(
     }
 
     let public_key = if profile.signing.enabled {
-        match profile_public_key_for_doctor(profile) {
-            Ok(key) => key,
-            Err(error) => {
-                warnings.push(error);
-                None
-            }
-        }
+        let key = signing_public_key?;
+        Some(key.to_owned())
     } else {
         ssh.and_then(|ssh| ssh.public_key.as_deref())
             .and_then(|path| {
@@ -1453,7 +1662,7 @@ fn profile_public_key_for_doctor(profile: &Profile) -> std::result::Result<Optio
     };
     let text = value.to_string_lossy();
     if signing::is_public_key_line(text.trim_start()) {
-        return Ok(Some(text.into_owned()));
+        return Ok(Some(text.trim_start().to_owned()));
     }
     if let Some(key) = text.trim_start().strip_prefix("key::") {
         return Ok(Some(key.to_owned()));

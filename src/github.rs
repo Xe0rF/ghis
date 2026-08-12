@@ -345,6 +345,14 @@ pub struct GhUser {
     pub login: String,
 }
 
+/// One public SSH signing key registered for the selected GitHub account.
+/// Only public material is returned by GitHub's endpoint; titles and other
+/// account metadata are intentionally not needed by callers.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GhSshSigningKey {
+    pub key: String,
+}
+
 /// Read the canonical login and numeric id for the selected gh account.
 pub fn user_identity(host: &str, login: &str) -> Result<GhUser> {
     let value = api_json(host, login, "user")?;
@@ -400,15 +408,85 @@ pub fn profile_email_candidates(host: &str, login: &str) -> Result<Vec<EmailCand
     Ok(result)
 }
 
+/// Read the selected account's public SSH signing keys. `/user` first binds
+/// the lookup to the selected gh account and supplies its canonical login;
+/// the public user endpoint then avoids requiring a signing-key read scope.
+/// Neither request uploads local key material or changes token scopes.
+pub fn ssh_signing_keys(host: &str, login: &str) -> Result<Vec<GhSshSigningKey>> {
+    let user = user_identity(host, login)?;
+    let endpoint = format!(
+        "users/{}/ssh_signing_keys",
+        encode_path_segment(&user.login)
+    );
+    let value = api_json_with_options(host, login, &endpoint, true)?;
+    parse_ssh_signing_keys(&value)
+}
+
+fn encode_path_segment(value: &str) -> String {
+    const HEX: &[u8; 16] = b"0123456789ABCDEF";
+    let mut encoded = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            encoded.push(char::from(byte));
+        } else {
+            encoded.push('%');
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+    }
+    encoded
+}
+
+fn parse_ssh_signing_keys(value: &Value) -> Result<Vec<GhSshSigningKey>> {
+    let top_level = value
+        .as_array()
+        .ok_or_else(|| GhError::Json("GitHub SSH signing keys response is not an array".into()))?;
+    let items = if top_level.first().is_some_and(Value::is_array) {
+        top_level
+            .iter()
+            .map(|page| {
+                page.as_array().ok_or_else(|| {
+                    GhError::Json("GitHub SSH signing keys pagination is malformed".into())
+                })
+            })
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+    } else {
+        top_level.iter().collect::<Vec<_>>()
+    };
+    let mut keys = Vec::with_capacity(items.len());
+    for (index, item) in items.into_iter().enumerate() {
+        let key = string_field(item, "key")
+            .filter(|key| !key.trim().is_empty())
+            .ok_or_else(|| {
+                GhError::Json(format!(
+                    "GitHub SSH signing keys[{index}] has no public key"
+                ))
+            })?;
+        keys.push(GhSshSigningKey { key });
+    }
+    Ok(keys)
+}
+
 fn api_json(host: &str, login: &str, endpoint: &str) -> Result<Value> {
+    api_json_with_options(host, login, endpoint, false)
+}
+
+fn api_json_with_options(host: &str, login: &str, endpoint: &str, paginate: bool) -> Result<Value> {
     let selected = token(host, login)?;
     let token_text = selected.as_str().ok_or_else(|| GhError::MissingToken {
         host: host.to_owned(),
         login: login.to_owned(),
     })?;
+    let mut args = vec!["api", endpoint];
+    if paginate {
+        args.extend(["--paginate", "--slurp"]);
+    }
     let output = sanitized_command(
         "gh",
-        ["api", endpoint],
+        args,
         Some((token_environment_variable(host), token_text)),
         Some(host),
     )?;
@@ -749,5 +827,28 @@ mod tests {
         assert_eq!(normalize_host("[2001:DB8::1]:443"), "[2001:db8::1]");
         assert_eq!(normalize_host("[2001:DB8::1]:8443"), "[2001:db8::1]:8443");
         assert_eq!(normalize_host("2001:DB8::1"), "2001:db8::1");
+    }
+
+    #[test]
+    fn signing_key_api_response_requires_public_key_material() {
+        let valid = serde_json::json!([
+            {"id": 1, "key": "ssh-ed25519 AAAATEST signing"},
+            {"id": 2, "key": "ssh-rsa AAAAOTHER another"}
+        ]);
+        let keys = parse_ssh_signing_keys(&valid).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert_eq!(keys[0].key, "ssh-ed25519 AAAATEST signing");
+
+        let paginated = serde_json::json!([
+            [{"id": 1, "key": "ssh-ed25519 AAAAONE first"}],
+            [{"id": 2, "key": "ssh-ed25519 AAAATWO second"}]
+        ]);
+        assert_eq!(parse_ssh_signing_keys(&paginated).unwrap().len(), 2);
+
+        assert!(parse_ssh_signing_keys(&serde_json::json!([{"id": 1}])).is_err());
+        assert_eq!(
+            encode_path_segment("Alice Example/管理员"),
+            "Alice%20Example%2F%E7%AE%A1%E7%90%86%E5%91%98"
+        );
     }
 }

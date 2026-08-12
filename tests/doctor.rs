@@ -617,3 +617,318 @@ esac
     assert!(!combined.contains("worktree-header-secret"));
     assert!(!combined.contains("test-token"));
 }
+#[test]
+fn github_signing_key_check_is_explicit_and_does_not_turn_api_failures_into_mismatches() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let fake_bin = temp.path().join("bin");
+    let config_home = temp.path().join("config");
+    let cache_home = temp.path().join("cache");
+    let state_home = temp.path().join("state");
+    let trace = temp.path().join("gh.trace");
+    let config_file = config_home.join("ghis/config.toml");
+    let public_key = temp.path().join("work.pub");
+    let agent_socket = temp.path().join("1password/agent.sock");
+    let signing_program = fake_bin.join("op-ssh-sign");
+    fs::create_dir_all(&fake_bin).expect("fake bin");
+    fs::create_dir_all(config_file.parent().expect("config parent")).expect("config directory");
+    fs::create_dir_all(agent_socket.parent().expect("agent parent")).expect("agent directory");
+    fs::write(&public_key, "ssh-ed25519 AAAATEST local comment\n").expect("public key");
+    fs::write(&agent_socket, "socket placeholder").expect("socket placeholder");
+    executable(&signing_program, "#!/bin/sh\nexit 0\n");
+    executable(
+        &fake_bin.join("gh"),
+        r#"#!/bin/sh
+printf '%s %s\n' "$1" "$2" >> "$FAKE_GH_TRACE"
+case "$1 $2" in
+  "auth status")
+    printf '%s\n' '{"hosts":{"github.com":[{"host":"github.com","login":"worker","state":"success","active":true}]}}'
+    ;;
+  "auth token")
+    if [ "$4" = "git.example.test" ]; then
+      printf '%s\n' 'enterprise-signing-token'
+    else
+      printf '%s\n' 'signing-secret-token'
+    fi
+    ;;
+  "api user")
+    if [ "$GH_HOST" = "git.example.test" ]; then
+      [ "$GH_ENTERPRISE_TOKEN" = "enterprise-signing-token" ] || exit 63
+      [ -z "${GH_TOKEN+x}" ] || exit 64
+    else
+      [ "$GH_TOKEN" = "signing-secret-token" ] || exit 65
+      [ -z "${GH_ENTERPRISE_TOKEN+x}" ] || exit 66
+    fi
+    printf '%s\n' '{"id":42,"login":"worker"}'
+    ;;
+  "api users/worker/ssh_signing_keys")
+    [ "$3" = "--paginate" ] || exit 67
+    [ "$4" = "--slurp" ] || exit 68
+    if [ "$FAKE_GH_MODE" = "rate-limit" ]; then
+      printf '%s\n' 'HTTP 429 rate limit exceeded' >&2
+      exit 173
+    fi
+    if [ "$FAKE_GH_MODE" = "mismatch" ]; then
+      printf '%s\n' '[{"id":2,"key":"ssh-ed25519 AAAAOTHER another key"}]'
+      exit 0
+    fi
+    if [ "$FAKE_GH_MODE" = "malformed" ]; then
+      printf '%s\n' '[{"id":3,"key":"ssh-ed25519 not-base64"}]'
+      exit 0
+    fi
+    if [ "$GH_HOST" = "git.example.test" ]; then
+      printf '%s\n' 'HTTP 404 endpoint unavailable on Enterprise' >&2
+      exit 44
+    fi
+    [ "$GH_TOKEN" = "signing-secret-token" ] || exit 69
+    [ -z "${GH_ENTERPRISE_TOKEN+x}" ] || exit 70
+    printf '%s\n' '[[{"id":1,"key":"ssh-ed25519 AAAATEST GitHub comment"}]]'
+    ;;
+  *)
+    exit 64
+    ;;
+esac
+"#,
+    );
+    executable(
+        &fake_bin.join("ssh-add"),
+        &format!(
+            "#!/bin/sh\n[ \"$SSH_AUTH_SOCK\" = '{}' ] || exit 65\nprintf '%s\\n' 'ssh-ed25519 AAAATEST agent comment'\n",
+            agent_socket.display()
+        ),
+    );
+    executable(
+        &fake_bin.join("ssh-keygen"),
+        "#!/bin/sh\nkey=$(cat)\ncase \"$key\" in *not-base64*) exit 71 ;; esac\nprintf '%s\\n' '256 SHA256:work work (ED25519)'\n",
+    );
+    fs::write(
+        &config_file,
+        format!(
+            r#"version = 1
+
+[profiles.work]
+host = "github.com"
+login = "worker"
+git_name = "Work Identity"
+git_email = "work@example.test"
+
+[profiles.work.ssh]
+mode = "one-password"
+public_key = {public_key:?}
+fingerprint = "SHA256:work"
+agent_socket = {agent_socket:?}
+
+[profiles.work.signing]
+enabled = true
+signing_key = {public_key:?}
+program = {signing_program:?}
+"#,
+            public_key = public_key,
+            agent_socket = agent_socket,
+            signing_program = signing_program,
+        ),
+    )
+    .expect("config");
+
+    let inherited_path = std::env::var_os("PATH").expect("PATH");
+    let path = std::env::join_paths(
+        std::iter::once(fake_bin.clone()).chain(std::env::split_paths(&inherited_path)),
+    )
+    .expect("joined PATH");
+    let run = |extra: &[&str], mode: Option<&str>| {
+        let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+        command
+            .args([
+                "--config",
+                config_file.to_str().expect("UTF-8 config path"),
+                "--profile",
+                "work",
+                "doctor",
+            ])
+            .args(extra)
+            .current_dir(temp.path())
+            .env("PATH", &path)
+            .env("FAKE_GH_TRACE", &trace)
+            .env("HOME", temp.path())
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_CACHE_HOME", &cache_home)
+            .env("XDG_STATE_HOME", &state_home)
+            .env("SSH_AUTH_SOCK", &agent_socket)
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env_remove("GIT_CONFIG_NOSYSTEM")
+            .env_remove("GHIS_CONFIG")
+            .env_remove("GHIS_PROFILE")
+            .env_remove("GHIS_BANNER_SHOWN")
+            .env_remove("GHIS_WRAPPER_ACTIVE")
+            .env_remove("GHIS_BYPASS")
+            .env_remove("GHIS_DISABLE_CHPWD")
+            .env("GH_TOKEN", "wrong-inherited-token");
+        if let Some(mode) = mode {
+            command.env("FAKE_GH_MODE", mode);
+        } else {
+            command.env_remove("FAKE_GH_MODE");
+        }
+        command.output().expect("run doctor")
+    };
+
+    fs::write(&trace, "").expect("clear trace");
+    let output = run(&["--json"], None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    assert_eq!(report["github_signing_key"]["checked"], false);
+    assert_eq!(report["github_signing_key"]["status"], "not_checked");
+    assert_eq!(
+        report["github_signing_key"]["github_key_count"],
+        serde_json::Value::Null
+    );
+    assert!(
+        !fs::read_to_string(&trace)
+            .expect("trace")
+            .contains("ssh_signing_keys")
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!combined.contains("signing-secret-token"));
+    assert!(!combined.contains("wrong-inherited-token"));
+
+    fs::write(&trace, "").expect("clear trace");
+    let output = run(&["--json", "--check-github-signing-key"], None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    assert_eq!(report["github_signing_key"]["checked"], true);
+    assert_eq!(report["github_signing_key"]["status"], "matched");
+    assert_eq!(report["github_signing_key"]["github_key_count"], 1);
+    assert_eq!(
+        report["github_signing_key"]["local_fingerprint"],
+        "SHA256:work"
+    );
+    assert!(
+        fs::read_to_string(&trace)
+            .expect("trace")
+            .contains("api users/worker/ssh_signing_keys")
+    );
+
+    let output = run(&["--check-github-signing-key"], None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("GitHub SSH 签名公钥: 已匹配"));
+
+    let output = run(&["--json", "--check-github-signing-key"], Some("mismatch"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    assert_eq!(report["github_signing_key"]["status"], "not_matched");
+    assert_eq!(report["github_signing_key"]["github_key_count"], 1);
+    assert!(
+        report["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| warning
+                .as_str()
+                .is_some_and(|warning| warning.contains("本地 key 未被判为失效")))
+    );
+
+    let output = run(
+        &["--json", "--check-github-signing-key"],
+        Some("rate-limit"),
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    assert_eq!(report["github_signing_key"]["status"], "unavailable");
+    assert!(
+        report["warnings"]
+            .as_array()
+            .expect("warnings")
+            .iter()
+            .any(|warning| {
+                warning
+                    .as_str()
+                    .is_some_and(|warning| warning.contains("不会因此判定本地签名 key 失效"))
+            })
+    );
+    assert!(
+        !report["github_signing_key"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("signing-secret-token")
+    );
+
+    let output = run(&["--json", "--check-github-signing-key"], Some("malformed"));
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    assert_eq!(report["github_signing_key"]["status"], "unavailable");
+    assert!(
+        report["github_signing_key"]["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("ssh-keygen")
+    );
+
+    let config = fs::read_to_string(&config_file).expect("read config");
+    fs::write(
+        &config_file,
+        config.replace("host = \"github.com\"", "host = \"git.example.test\""),
+    )
+    .expect("enterprise config");
+    let output = run(&["--json", "--check-github-signing-key"], None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    assert_eq!(report["github_signing_key"]["status"], "unavailable");
+    assert_ne!(report["github_signing_key"]["status"], "not_matched");
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!combined.contains("enterprise-signing-token"));
+
+    fs::write(&public_key, "ssh-ed25519 not-base64\n").expect("invalid public key");
+    fs::write(&trace, "").expect("clear trace");
+    let output = run(&["--json", "--check-github-signing-key"], None);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    assert_eq!(report["github_signing_key"]["checked"], false);
+    assert_eq!(
+        report["github_signing_key"]["status"],
+        "local_key_unavailable"
+    );
+    assert!(
+        !fs::read_to_string(&trace)
+            .expect("trace")
+            .contains("ssh_signing_keys")
+    );
+}
