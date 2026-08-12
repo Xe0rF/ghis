@@ -36,7 +36,7 @@ ghis discover
 ghis profile add personal \
   --login alice \
   --name "Alice" \
-  --email 12345678+alice@users.noreply.github.com
+  --noreply
 
 cd ~/src/project
 ghis use personal
