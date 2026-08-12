@@ -96,6 +96,10 @@ pub enum Action {
     Edit,
     Activate,
     Delete,
+    /// Repair the selected diagnostic.
+    Repair,
+    /// Apply all repairs classified as automatic.
+    RepairAll,
     Help,
 }
 
@@ -361,6 +365,8 @@ fn reduce_normal(state: &mut AppState, key: KeyEvent) -> Action {
         KeyCode::Char('a') => Action::Add,
         KeyCode::Char('e') => Action::Edit,
         KeyCode::Char('D') => Action::Delete,
+        KeyCode::Char('f') if state.view == View::Diagnostics => Action::Repair,
+        KeyCode::Char('F') if state.view == View::Diagnostics => Action::RepairAll,
         KeyCode::Enter | KeyCode::Char(' ') => Action::Activate,
         KeyCode::Char('n') => {
             find_next(state, false);
@@ -647,8 +653,13 @@ fn render_footer(frame: &mut Frame<'_>, area: Rect, state: &AppState) {
     };
     let content = match state.mode {
         Mode::Normal => format!(
-            "{}  |  h/l 视图  j/k 选择  / 搜索  b 绑定  U 解绑  r 刷新  ? 帮助  q 退出{}",
+            "{}  |  h/l 视图  j/k 选择  / 搜索  b 绑定  U 解绑{}  r 刷新  ? 帮助  q 退出{}",
             state.status,
+            if state.view == View::Diagnostics {
+                "  f 修复  F 安全全部修复"
+            } else {
+                ""
+            },
             if state.pending_g {
                 "  (再按 g 到顶部)"
             } else {
@@ -1007,6 +1018,34 @@ mod tests {
         );
         assert_eq!(action, Action::Quit);
         assert!(state.should_quit);
+    }
+
+    #[test]
+    fn diagnostics_repair_keys_emit_scoped_actions() {
+        let mut state = AppState {
+            view: View::Diagnostics,
+            ..AppState::default()
+        };
+        assert_eq!(reduce(&mut state, key(KeyCode::Char('f'))), Action::Repair);
+        assert_eq!(
+            reduce(&mut state, key(KeyCode::Char('F'))),
+            Action::RepairAll
+        );
+
+        state.view = View::Status;
+        assert_eq!(reduce(&mut state, key(KeyCode::Char('f'))), Action::None);
+    }
+
+    #[test]
+    fn snapshot_diagnostics_repair_footer() {
+        let mut state = bound_state();
+        state.view = View::Diagnostics;
+        state.set_items([
+            "自动\t同步 ghis 管理配置\tghis sync",
+            "手动\t检查全局 Git 配置\tgit config --show-origin --list",
+        ]);
+        state.status = "选择诊断后按 f 修复；F 仅运行安全自动修复".into();
+        insta::assert_snapshot!(snapshot_text(&state));
     }
 
     #[test]

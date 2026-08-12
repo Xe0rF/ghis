@@ -27,11 +27,84 @@ impl Severity {
     }
 }
 
+/// Stable machine-readable identifier for a diagnostic finding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DiagnosticCode {
+    GitIdentityConflict,
+    SigningConflict,
+    SshCommand,
+    CredentialHelper,
+    AuthorizationHeader,
+    UrlRewrite,
+    EffectiveIdentityMismatch,
+    InvalidBinding,
+    ShellIntegration,
+    GhAuth,
+    GlobalGitConfig,
+    SshKey,
+}
+
+/// Safety class for a proposed repair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RepairKind {
+    Automatic,
+    Confirmation,
+    Manual,
+}
+
+impl RepairKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Automatic => "自动",
+            Self::Confirmation => "需确认",
+            Self::Manual => "手动",
+        }
+    }
+}
+
+/// A safe, displayable repair description. Commands are suggestions only;
+/// execution is always performed by the owning application layer.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepairAction {
+    pub kind: RepairKind,
+    pub command: String,
+    pub confirmation: bool,
+}
+
+impl RepairAction {
+    pub fn automatic(command: impl Into<String>) -> Self {
+        Self {
+            kind: RepairKind::Automatic,
+            command: command.into(),
+            confirmation: false,
+        }
+    }
+
+    pub fn confirmation(command: impl Into<String>) -> Self {
+        Self {
+            kind: RepairKind::Confirmation,
+            command: command.into(),
+            confirmation: true,
+        }
+    }
+
+    pub fn manual(command: impl Into<String>) -> Self {
+        Self {
+            kind: RepairKind::Manual,
+            command: command.into(),
+            confirmation: false,
+        }
+    }
+}
+
 /// One actionable configuration finding. Values are sanitized before they
 /// enter this public structure so JSON, logs, and TUI rows cannot expose an
 /// Authorization header or credential helper body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GitConfigDiagnostic {
+    pub code: DiagnosticCode,
     pub severity: Severity,
     pub key: String,
     pub value: String,
@@ -39,6 +112,34 @@ pub struct GitConfigDiagnostic {
     pub origin: String,
     pub impact: String,
     pub suggestion: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair: Option<RepairAction>,
+}
+
+/// A doctor check separate from the detailed Git configuration scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DiagnosticCheck {
+    pub code: DiagnosticCode,
+    pub severity: Severity,
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub repair: Option<RepairAction>,
+}
+
+impl DiagnosticCheck {
+    pub fn new(
+        code: DiagnosticCode,
+        severity: Severity,
+        summary: impl Into<String>,
+        repair: Option<RepairAction>,
+    ) -> Self {
+        Self {
+            code,
+            severity,
+            summary: bounded(&summary.into()),
+            repair,
+        }
+    }
 }
 
 /// Structured report consumed by both front ends.
@@ -366,6 +467,7 @@ fn inspect_effective_identity(
             continue;
         }
         diagnostics.push(GitConfigDiagnostic {
+            code: DiagnosticCode::EffectiveIdentityMismatch,
             severity: Severity::Error,
             key: format!("effective.{role}"),
             value: bounded(&format!("{} <{}>", identity.name, identity.email)),
@@ -376,6 +478,9 @@ fn inspect_effective_identity(
                 profile.git_name, profile.git_email
             )),
             suggestion: "在 commit 前检查环境变量、-c 参数以及 local/worktree 配置".into(),
+            repair: Some(RepairAction::manual(
+                "git var GIT_AUTHOR_IDENT && git var GIT_COMMITTER_IDENT",
+            )),
         });
     }
 }
@@ -386,7 +491,9 @@ fn finding(
     impact: impl Into<String>,
     suggestion: impl Into<String>,
 ) -> GitConfigDiagnostic {
+    let (code, repair) = classify_git_config_repair(entry);
     GitConfigDiagnostic {
+        code,
         severity,
         key: redact_key(&entry.key),
         value: display_value(entry),
@@ -394,7 +501,39 @@ fn finding(
         origin: bounded(&entry.origin),
         impact: bounded(&impact.into()),
         suggestion: bounded(&suggestion.into()),
+        repair,
     }
+}
+
+fn classify_git_config_repair(entry: &ConfigEntry) -> (DiagnosticCode, Option<RepairAction>) {
+    let key = entry.key.as_str();
+    let code = if matches!(key, "user.name" | "user.email") {
+        DiagnosticCode::GitIdentityConflict
+    } else if matches!(
+        key,
+        "user.signingkey" | "commit.gpgsign" | "gpg.format" | "gpg.ssh.program"
+    ) {
+        DiagnosticCode::SigningConflict
+    } else if key == "core.sshcommand" {
+        DiagnosticCode::SshCommand
+    } else if is_credential_helper(key) {
+        DiagnosticCode::CredentialHelper
+    } else if is_extra_header(key) {
+        DiagnosticCode::AuthorizationHeader
+    } else {
+        DiagnosticCode::UrlRewrite
+    };
+    // Existing Git settings, especially system/global values and credentials,
+    // are never removed automatically. The command is deliberately read-only.
+    let repair = RepairAction::manual(format!(
+        "git config --show-origin --show-scope --get-all {}",
+        shell_quote_argument(&redact_key(key))
+    ));
+    (code, Some(repair))
+}
+
+fn shell_quote_argument(value: &str) -> String {
+    format!("'{value}'")
 }
 
 fn is_ghis_fragment(entry: &ConfigEntry) -> bool {
