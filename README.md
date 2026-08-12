@@ -10,7 +10,8 @@
 - 提供中文 Vim 风格 TUI、完整 CLI 和透明的 zsh wrapper。
 - 自动发现 `gh` 已保存的账号，并为 HTTPS 操作精确选择对应凭据。
 - 可选集成 1Password SSH Agent 和 `op-ssh-sign`，为不同 Profile 使用不同的 SSH commit signing key。
-- 提供身份预览、配置同步和 `doctor` 诊断；已选身份不可用时不会静默换成另一个账号。
+- 提供身份预览、结构化执行检查和带安全快速修复的 `doctor`；已选身份不可用时不会静默换成另一个账号。
+- 可在 Claude Code 会话 Hook 或 Codex developer instructions 中主动注入最小 ghis 上下文，无需 MCP、skill 或联网下载文档。
 
 ## 安装
 
@@ -66,9 +67,35 @@ gh pr list
 ghis status                         # 查看当前仓库将使用的身份
 ghis use work                       # 将当前仓库绑定到 work
 ghis --profile work git -- push     # 单次临时使用 work，不改变绑定
-ghis doctor                         # 检查依赖、账号和签名环境
+ghis doctor                         # 检查依赖、账号、集成并显示可用修复
+ghis check --operation gh --json -- --repo OWNER/REPO issue list
 ghis sync                           # 重建 Profile 配置片段并检查已登记仓库
 ```
+
+在非 Git 目录中也可以把仓库或 PR/Issue URL 作为显式目标；ghis 会先从目标 host/owner 解析 Profile，再在取得 token 前验证主机：
+
+```sh
+ghis gh -- --repo OWNER/REPO issue list
+ghis gh -- pr view https://github.com/OWNER/REPO/pull/123
+```
+
+## Agentic coding CLI
+
+推荐通过 launcher 启动，使模型在第一条消息前就获得当前、脱敏的身份上下文：
+
+```sh
+ghis agent run claude --
+ghis agent run codex --
+```
+
+Claude Code 还可以安装本地 `SessionStart`、`UserPromptSubmit` 和 `SubagentStart` Hook：
+
+```sh
+ghis agent setup claude --yes
+ghis agent status claude
+```
+
+Codex launcher 使用 CLI 的 `developer_instructions` 注入；两者都不依赖 MCP、skill 或联网文档。上下文不包含 token、私钥、SSH socket、raw remote URL 或 Doctor 诊断。agent 在具体 `git`/`gh` 操作遇到阻力时，再从 shell 运行 `ghis check` 或 `ghis doctor` 获取结构化修复信息。
 
 完整的配置、规则、1Password、SSH 签名、安全边界、Shell 说明和排障方法见 [Wiki](../../wiki)。
 
