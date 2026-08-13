@@ -191,7 +191,7 @@ ghis_chpwd() {{
   typeset -g GHIS_REPO_PROFILE_DISPLAY
   typeset -g GHIS_REPO_ROOT
   if [[ "$ghis_silent" != 1 && "$GHIS_CHPWD_ENABLED" == 1 && -n "$GHIS_REPO_PROFILE" ]]; then
-    print -r -- "GhIS  Profile  $GHIS_REPO_PROFILE_DISPLAY"
+    print -r -- "GHIS Profile: $GHIS_REPO_PROFILE_DISPLAY"
   fi
 }}
 _ghis_chpwd() {{

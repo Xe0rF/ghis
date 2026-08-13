@@ -1053,7 +1053,7 @@ fn zsh_chpwd_is_silent_on_source_and_displays_profile_after_directory_change() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
-        stdout.matches("GhIS  Profile  personal").count(),
+        stdout.matches("GHIS Profile: personal").count(),
         1,
         "{stdout}"
     );
