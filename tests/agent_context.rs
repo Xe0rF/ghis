@@ -143,3 +143,16 @@ fn require_resolved_checks_selection_state_not_repository_presence() {
     assert_eq!(unresolved.selection.state, SelectionState::Ambiguous);
     assert!(unresolved.require_resolved().is_err());
 }
+
+#[test]
+fn default_profile_context_explains_fallback_scope() {
+    let projected = AgentContext::from_app(&context(ResolutionSource::Default, Some("work")));
+    let rendered = projected.render_codex();
+
+    assert!(rendered.contains(
+        "context note: the selected profile comes from ghis default_profile, not a repository binding; after entering a repository, use the repository-specific ghis context."
+    ));
+
+    let bound = AgentContext::from_app(&context(ResolutionSource::RepositoryBinding, Some("work")));
+    assert!(!bound.render_codex().contains("context note:"));
+}

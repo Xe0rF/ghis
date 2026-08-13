@@ -237,6 +237,15 @@ impl AgentContext {
             display_candidates(&self.selection.candidates),
         )
         .expect("write to string");
+        if self.selection.state == SelectionState::Resolved
+            && self.selection.source.kind == SelectionSourceKind::Default
+        {
+            writeln!(
+                output,
+                "context note: the selected profile comes from ghis default_profile, not a repository binding; after entering a repository, use the repository-specific ghis context."
+            )
+            .expect("write to string");
+        }
         if let Some(identity) = &self.identity {
             writeln!(
                 output,
