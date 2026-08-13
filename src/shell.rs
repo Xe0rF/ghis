@@ -108,7 +108,48 @@ _ghis_dispatch() {{
   ghis_dispatch "$@"
 }}
 
+# Read-only Git probes are commonly issued by prompts (status, branch and
+# rev-parse). They do not need ghis identity or credential policy. Bypass the
+# expensive application path for those probes; writes and network operations
+# continue through ghis_dispatch below.
+ghis_git_read_only() {{
+  local ghis_arg
+  local ghis_option_arg=0
+  for ghis_arg in "$@"; do
+    if (( ghis_option_arg )); then
+      ghis_option_arg=0
+      continue
+    fi
+    case "$ghis_arg" in
+      -C|-c|--config|--exec-path|--git-dir|--namespace|--super-prefix|--work-tree)
+        ghis_option_arg=1
+        ;;
+      --git-dir=*|--work-tree=*|--namespace=*|--super-prefix=*)
+        ;;
+      --)
+        ;;
+      -*)
+        ;;
+      status|branch|rev-parse|rev-list|describe|diff|log|show|shortlog|remote|ls-files|ls-tree|cat-file|check-ignore|check-attr|for-each-ref|symbolic-ref|name-rev|count-objects|version|help)
+        return 0
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  done
+  return 1
+}}
+
 function git {{
+  if [[ "${{GHIS_BYPASS:-0}}" == 1 || "${{GHIS_WRAPPER_ACTIVE:-0}}" == 1 ]]; then
+    command git "$@"
+    return $?
+  fi
+  if ghis_git_read_only "$@"; then
+    command git "$@"
+    return $?
+  fi
   ghis_dispatch git "$@"
 }}
 
@@ -505,6 +546,9 @@ mod tests {
         assert!(script.contains("_ghis_dispatch()"));
         assert!(script.contains("_ghis_chpwd()"));
         assert!(script.contains("ghis_dispatch git \"$@\""));
+        assert!(script.contains("ghis_git_read_only()"));
+        assert!(script.contains("status|branch|rev-parse"));
+        assert!(!script.contains("|config|ls-files"));
         assert!(script.contains("function codex"));
         assert!(script.contains("agent run codex -- \"$@\""));
         assert!(script.contains("GHIS_AGENT_WRAPPER_ACTIVE"));
