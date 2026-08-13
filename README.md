@@ -1,4 +1,4 @@
-# ghis
+# GitHub Identity Switcher (`ghis`)
 
 `ghis` 是面向 Linux 和 zsh 的本地 GitHub 提交身份切换器。它按仓库或 worktree 选择 Profile，让普通的 `git commit`、`git push` 和 `gh` 命令使用对应的提交姓名、邮箱与 GitHub 账号，并在敏感操作前显示实际身份。
 

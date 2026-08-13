@@ -3,7 +3,7 @@
 pkgname=ghis
 pkgver=0.1.0
 pkgrel=1
-pkgdesc='Per-repository GitHub identity switcher for git, gh, and zsh'
+pkgdesc='Per-repository GitHub Identity Switcher for git, gh, and zsh'
 arch=('x86_64')
 license=('AGPL-3.0-or-later')
 options=('!debug')

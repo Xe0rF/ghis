@@ -2,7 +2,7 @@
 name = "ghis"
 version = "0.1.0"
 edition = "2024"
-description = "Per-repository GitHub identity switcher for git, gh, and zsh"
+description = "Per-repository GitHub Identity Switcher for git, gh, and zsh"
 license = "AGPL-3.0-or-later"
 rust-version = "1.97"
 exclude = ["/dist/"]
