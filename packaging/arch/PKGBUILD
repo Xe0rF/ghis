@@ -1,7 +1,7 @@
-# Maintainer: Xe0rF
+# Maintainer: Xe0rF <261605519+Xe0rF@users.noreply.github.com>
 
 pkgname=ghis
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc='Per-repository GitHub Identity Switcher for git, gh, and zsh'
 arch=('x86_64')
@@ -13,7 +13,7 @@ optdepends=(
   'openssh: SSH remotes and SSH commit signing diagnostics'
 )
 source=("file://${startdir}/../../dist/ghis-v${pkgver}-x86_64-unknown-linux-gnu.tar.gz")
-sha256sums=('6d47960868951b34914b1e96f7f2b888d8c5f20c21b1cdafbc939af1244d8b0e')
+sha256sums=('02890f51bff43c770ed1e681a4b58c87aa2bf5826e9fccebbc32f67330e1cc24')
 
 package() {
   local release_dir="${srcdir}/ghis-v${pkgver}-x86_64-unknown-linux-gnu"
