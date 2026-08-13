@@ -41,7 +41,8 @@ ghis discover
 ghis profile add personal \
   --login alice \
   --name "Alice" \
-  --noreply
+  --noreply \
+  --description "个人开源项目"
 
 cd ~/src/project
 ghis use personal
@@ -59,13 +60,19 @@ git push
 gh pr list
 ```
 
-不带参数运行 `ghis` 等同于 `ghis status`，直接显示当前仓库和有效身份。
+不带参数运行 `ghis` 等同于 `ghis status`，直接显示当前 Profile 及其可选描述。详细的提交身份、GitHub 账号和签名设置可通过 `ghis profile show <id>` 或 `ghis status --json` 查看。`profile list` 默认已经列出全部 Profile，因此不提供冗余的 `--all`；使用 `-d/--details` 展开人类可读详情，或使用 `-j/--json` 获取机器输出，两者互斥。
+
+高频参数提供了短形式，例如 Profile 的 `-H/--host`、`-l/--login`、`-n/--name`、`-e/--email`、`-d/--description`，仓库目标的 `-r/--repo`，非交互确认的 `-y/--yes`，以及工作目录的 `-C/--cwd`。低频的 SSH/signing 和清除类参数保留完整长名称。
 
 ## 常用命令
 
 ```sh
 ghis status                         # 查看当前仓库将使用的身份
-ghis use work                       # 将当前仓库绑定到 work
+ghis profile list                  # 简洁列出全部 Profile 及描述
+ghis profile list -d               # 批量显示人类可读详情
+ghis profile list -j               # 批量输出机器可读 JSON
+ghis profile show work             # 显示单个 Profile 详情
+ghis use work -r ~/src/project     # 将指定仓库绑定到 work
 ghis --profile work git -- push     # 单次临时使用 work，不改变绑定
 ghis doctor                         # 检查依赖、账号、集成并显示可用修复
 ghis check --operation gh --json -- --repo OWNER/REPO issue list

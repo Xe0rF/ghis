@@ -178,42 +178,14 @@ impl AppContext {
         self.resolution.profile.as_deref()
     }
 
-    pub fn identity_banner(&self) -> String {
-        let repo = self
-            .repository
-            .as_ref()
-            .map(|item| {
-                item.root
-                    .as_deref()
-                    .unwrap_or(&item.path)
-                    .display()
-                    .to_string()
-            })
-            .unwrap_or_else(|| "当前目录不是 Git 仓库".into());
-        let Some(profile) = self.profile.as_ref() else {
-            return format!(
-                "ghis: 仓库={repo} 身份=未解析；{}",
-                self.warnings.join("；")
-            );
-        };
-        let transport = self
-            .remote
-            .as_ref()
-            .map(|remote| remote.transport.as_str())
-            .unwrap_or("未知");
-        format!(
-            "ghis: 仓库={repo} profile={} 提交={} <{}> GitHub={}/{} 主远端传输={transport} 签名={}",
-            self.profile_id().unwrap_or("?"),
-            profile.git_name,
-            profile.git_email,
-            profile.host,
-            profile.login,
-            if profile.signing.enabled {
-                "SSH"
-            } else {
-                "关闭"
-            }
-        )
+    pub fn status_summary(&self) -> String {
+        match (self.profile_id(), self.profile.as_ref()) {
+            (Some(id), Some(profile)) => match profile.description.as_deref() {
+                Some(description) => format!("当前 Profile：{id}\n  {description}"),
+                None => format!("当前 Profile：{id}"),
+            },
+            _ => "当前 Profile：未解析".into(),
+        }
     }
 
     /// Keep automatic wrapper output compact. Detailed identity information is

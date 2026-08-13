@@ -119,6 +119,124 @@ fn long_version_reports_build_provenance() {
 }
 
 #[test]
+fn profile_list_details_are_human_readable_and_match_show() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let directory = temp.path().join("config/ghis");
+    fs::create_dir_all(&directory).expect("config directory");
+    fs::write(
+        directory.join("config.toml"),
+        r#"version = 1
+
+[profiles.personal]
+host = "github.com"
+login = "alice"
+git_name = "Alice"
+git_email = "alice@example.test"
+description = "个人项目"
+
+[profiles.work]
+host = "github.example.test"
+login = "alice-work"
+git_name = "Alice Work"
+git_email = "alice@work.example"
+"#,
+    )
+    .expect("config");
+
+    let configure = |command: &mut AssertCommand| {
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+    };
+    let mut details = isolated_ghis_command();
+    details.args(["profile", "list", "-d"]);
+    configure(&mut details);
+    let details = details.assert().success().get_output().stdout.clone();
+    let details = String::from_utf8(details).expect("utf-8 details");
+    assert_eq!(
+        details,
+        "Profile：personal\n描述：个人项目\n提交身份：Alice <alice@example.test>\nGitHub：alice@github.com\n签名：关闭\n\nProfile：work\n提交身份：Alice Work <alice@work.example>\nGitHub：alice-work@github.example.test\n签名：关闭\n"
+    );
+
+    let mut show = isolated_ghis_command();
+    show.args(["profile", "show", "personal"]);
+    configure(&mut show);
+    let show = show.assert().success().get_output().stdout.clone();
+    let show = String::from_utf8(show).expect("utf-8 show");
+    assert!(details.starts_with(&show));
+
+    let mut conflict = isolated_ghis_command();
+    conflict.args(["profile", "list", "-d", "-j"]);
+    configure(&mut conflict);
+    conflict.assert().failure();
+}
+
+#[test]
+fn profile_short_options_write_expected_fields() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let mut add = isolated_ghis_command();
+    add.args([
+        "profile",
+        "add",
+        "work",
+        "-H",
+        "github.example.test",
+        "-l",
+        "alice-work",
+        "-n",
+        "Alice Work",
+        "-e",
+        "alice@work.example",
+        "-d",
+        "公司项目",
+    ]);
+    for (key, value) in xdg_environment(&temp) {
+        add.env(key, value);
+    }
+    add.assert().success();
+
+    let mut show = isolated_ghis_command();
+    show.args(["profile", "show", "work", "-j"]);
+    for (key, value) in xdg_environment(&temp) {
+        show.env(key, value);
+    }
+    show.assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "\"host\": \"github.example.test\"",
+        ))
+        .stdout(predicate::str::contains("\"login\": \"alice-work\""))
+        .stdout(predicate::str::contains("\"git_name\": \"Alice Work\""))
+        .stdout(predicate::str::contains(
+            "\"git_email\": \"alice@work.example\"",
+        ))
+        .stdout(predicate::str::contains("\"description\": \"公司项目\""));
+}
+
+#[test]
+fn status_shows_only_profile_and_description() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+    let config = temp.path().join("config/ghis/config.toml");
+    let mut contents = fs::read_to_string(&config).expect("config");
+    contents.push_str("description = \"个人开源项目\"\n");
+    fs::write(&config, contents).expect("update config");
+
+    let mut command = isolated_ghis_command();
+    command.current_dir(temp.path()).arg("status");
+    for (key, value) in xdg_environment(&temp) {
+        command.env(key, value);
+    }
+    command
+        .assert()
+        .success()
+        .stdout("当前 Profile：personal\n  个人开源项目\n")
+        .stdout(predicate::str::contains(temp.path().display().to_string()).not())
+        .stdout(predicate::str::contains("Alice").not())
+        .stdout(predicate::str::contains("alice@example.test").not());
+}
+
+#[test]
 fn bare_command_defaults_to_status() {
     let temp = tempfile::tempdir().expect("temporary directory");
     write_default_profile(&temp);
@@ -1599,7 +1717,8 @@ git_email = "work@example.test"
     use_command
         .assert()
         .success()
-        .stdout(predicate::str::contains("Work Identity"))
+        .stdout(predicate::str::contains("已绑定 Profile `work`。"))
+        .stdout(predicate::str::contains("Work Identity").not())
         .stdout(predicate::str::contains("Alice").not());
 
     let fake_bin = temp.path().join("bin");
@@ -2058,6 +2177,55 @@ fn direct_hook_banner_reports_git_resolved_author_and_committer() {
         .stderr(predicate::str::contains(
             "实际提交者=Actual Committer <actual-committer@example.test>",
         ));
+}
+
+#[test]
+fn profile_description_can_be_added_and_cleared() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let configure = |command: &mut AssertCommand| {
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+    };
+
+    let mut add = isolated_ghis_command();
+    add.args([
+        "profile",
+        "add",
+        "work",
+        "--login",
+        "worker",
+        "--name",
+        "Work Identity",
+        "--email",
+        "work@example.test",
+        "--description",
+        "公司项目",
+    ]);
+    configure(&mut add);
+    add.assert().success();
+
+    let mut list = isolated_ghis_command();
+    list.args(["profile", "list"]);
+    configure(&mut list);
+    list.assert().success().stdout("work\n  公司项目\n");
+
+    let mut show = isolated_ghis_command();
+    show.args(["profile", "show", "work"]);
+    configure(&mut show);
+    show.assert()
+        .success()
+        .stdout(predicate::str::contains("描述：公司项目"));
+
+    let mut clear = isolated_ghis_command();
+    clear.args(["profile", "edit", "work", "--clear-description"]);
+    configure(&mut clear);
+    clear.assert().success();
+
+    let mut list_after_clear = isolated_ghis_command();
+    list_after_clear.args(["profile", "list"]);
+    configure(&mut list_after_clear);
+    list_after_clear.assert().success().stdout("work\n");
 }
 
 #[test]

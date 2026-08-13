@@ -294,6 +294,8 @@ pub struct Profile {
     pub login: String,
     pub git_name: String,
     pub git_email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub ssh: Option<SshProfile>,
     pub signing: SigningProfile,
 }
@@ -305,6 +307,7 @@ impl Default for Profile {
             login: String::new(),
             git_name: String::new(),
             git_email: String::new(),
+            description: None,
             ssh: None,
             signing: SigningProfile::default(),
         }
@@ -466,6 +469,23 @@ impl Config {
                 return Err(ConfigError::Validation(format!(
                     "profile `{id}` needs git_name and git_email"
                 )));
+            }
+            if let Some(description) = profile.description.as_deref() {
+                if description.trim().is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "profile `{id}` description cannot be empty"
+                    )));
+                }
+                if description.chars().any(char::is_control) {
+                    return Err(ConfigError::Validation(format!(
+                        "profile `{id}` description cannot contain control characters"
+                    )));
+                }
+                if description.chars().count() > 200 {
+                    return Err(ConfigError::Validation(format!(
+                        "profile `{id}` description cannot exceed 200 characters"
+                    )));
+                }
             }
             if profile.ssh.as_ref().is_some_and(|ssh| {
                 matches!(ssh.mode, SshMode::OnePassword | SshMode::Managed)
@@ -731,7 +751,15 @@ fn merge_profile(destination: &mut Item, source: &Item) {
     merge_known_table(
         destination,
         source,
-        &["host", "login", "git_name", "git_email", "ssh", "signing"],
+        &[
+            "host",
+            "login",
+            "git_name",
+            "git_email",
+            "description",
+            "ssh",
+            "signing",
+        ],
     );
     let Item::Table(destination) = destination else {
         return;
@@ -1070,6 +1098,23 @@ mod tests {
     }
 
     #[test]
+    fn profile_description_must_be_safe_single_line_text() {
+        for description in ["", "   ", "line one\nline two", "alert\u{1b}"] {
+            let mut config = Config::default();
+            let mut invalid = profile();
+            invalid.description = Some(description.into());
+            config.profiles.insert("work".into(), invalid);
+            assert!(config.validate().is_err(), "accepted {description:?}");
+        }
+
+        let mut config = Config::default();
+        let mut invalid = profile();
+        invalid.description = Some("字".repeat(201));
+        config.profiles.insert("work".into(), invalid);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
     fn managed_ssh_requires_a_public_key_path() {
         let mut config = Config::default();
         let mut managed = profile();
@@ -1332,6 +1377,7 @@ host = "github.com"
 login = "alice"
 git_name = "Alice"
 git_email = "alice@example.com"
+description = "Personal projects"
 future_profile = "keep"
 
 [profiles.personal.ssh]
@@ -1353,6 +1399,7 @@ future_signing = "keep"
         let mut config = Config::load(&path).unwrap();
         config.behavior.default_profile = None;
         let personal = config.profiles.get_mut("personal").unwrap();
+        personal.description = None;
         let ssh = personal.ssh.as_mut().unwrap();
         ssh.mode = SshMode::External;
         ssh.public_key = None;
@@ -1364,6 +1411,7 @@ future_signing = "keep"
 
         let saved = fs::read_to_string(&path).unwrap();
         assert!(!saved.contains("default_profile"));
+        assert!(!saved.contains("description"));
         assert!(!saved.contains("public_key"));
         assert!(!saved.contains("fingerprint"));
         assert!(!saved.contains("agent_socket"));

@@ -13,6 +13,7 @@ fn context(source: ResolutionSource, profile_id: Option<&str>) -> AppContext {
         login: "alice".into(),
         git_name: "Alice Example".into(),
         git_email: "alice@example.test".into(),
+        description: Some("CANARY_PROFILE_DESCRIPTION".into()),
         ssh: Some(SshProfile {
             public_key: Some(PathBuf::from("CANARY_PUBLIC_KEY_PATH")),
             fingerprint: Some("CANARY_FINGERPRINT".into()),
@@ -89,6 +90,7 @@ fn allowlist_projection_does_not_leak_sensitive_or_diagnostic_fields() {
             "CANARY_RESOLUTION_WARNING",
             "CANARY_APP_WARNING",
             "CANARY_REPAIR_GUIDANCE",
+            "CANARY_PROFILE_DESCRIPTION",
             "https://",
         ] {
             assert!(!output.contains(canary), "leaked {canary}: {output}");

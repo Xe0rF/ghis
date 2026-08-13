@@ -47,12 +47,12 @@ enum Commands {
     /// 将 profile 绑定到仓库
     Use {
         profile: String,
-        #[arg(long)]
+        #[arg(short = 'r', long)]
         repo: Option<PathBuf>,
     },
     /// 解除当前仓库绑定
     Unbind {
-        #[arg(long)]
+        #[arg(short = 'r', long)]
         repo: Option<PathBuf>,
     },
     /// 管理自动匹配规则
@@ -124,7 +124,7 @@ struct ContextArgs {
     #[arg(long, value_enum, default_value_t = ContextFormatArg::Json)]
     format: ContextFormatArg,
     /// 在指定目录解析仓库上下文
-    #[arg(long)]
+    #[arg(short = 'C', long)]
     cwd: Option<PathBuf>,
     /// 未解析、歧义或失效选择时返回错误
     #[arg(long)]
@@ -133,13 +133,13 @@ struct ContextArgs {
 
 #[derive(Debug, Args, Default)]
 struct JsonArgs {
-    #[arg(long)]
+    #[arg(short = 'j', long)]
     json: bool,
 }
 
 #[derive(Debug, Args, Default)]
 struct StatusArgs {
-    #[arg(long)]
+    #[arg(short = 'j', long)]
     json: bool,
     /// 供 chpwd hook 使用：不访问网络，也不输出正文
     #[arg(long, hide = true)]
@@ -150,7 +150,7 @@ struct StatusArgs {
 
 #[derive(Debug, Args, Default)]
 struct DoctorArgs {
-    #[arg(long)]
+    #[arg(short = 'j', long)]
     json: bool,
     /// 显式访问 GitHub API，核对当前 Profile 的 SSH signing 公钥
     #[arg(long, visible_alias = "check-github-signing-keys")]
@@ -161,7 +161,7 @@ struct DoctorArgs {
 struct CheckArgs {
     #[arg(long, value_enum)]
     operation: CheckOperation,
-    #[arg(long)]
+    #[arg(short = 'j', long)]
     json: bool,
     #[arg(last = true, allow_hyphen_values = true)]
     args: Vec<String>,
@@ -206,7 +206,7 @@ enum AgentCommand {
         scope: AgentScope,
         #[arg(long)]
         project: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(short = 'y', long)]
         yes: bool,
     },
     /// 移除 ghis 管理的 Claude Hook
@@ -226,7 +226,7 @@ enum AgentCommand {
         scope: AgentScope,
         #[arg(long)]
         project: Option<PathBuf>,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     /// Claude Code Hook 内部入口
@@ -243,7 +243,7 @@ struct SetupArgs {
     #[arg(long)]
     print: bool,
     /// 跳过修改 zsh 启动文件前的确认，供脚本安装使用
-    #[arg(long)]
+    #[arg(short = 'y', long)]
     yes: bool,
 }
 
@@ -253,12 +253,21 @@ struct Passthrough {
     args: Vec<String>,
 }
 
+#[derive(Debug, Args, Default)]
+struct ProfileListArgs {
+    #[arg(short = 'j', long, conflicts_with = "details")]
+    json: bool,
+    /// 显示所有 Profile 的人类可读详情
+    #[arg(short = 'd', long)]
+    details: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum ProfileCommand {
-    List(JsonArgs),
+    List(ProfileListArgs),
     Show {
         id: String,
-        #[arg(long)]
+        #[arg(short = 'j', long)]
         json: bool,
     },
     Add(ProfileArgs),
@@ -273,20 +282,23 @@ enum ProfileCommand {
 #[derive(Debug, Args)]
 struct MailArgs {
     id: String,
-    #[arg(long)]
+    #[arg(short = 'j', long)]
     json: bool,
 }
 
 #[derive(Debug, Args)]
 struct ProfileArgs {
     id: String,
-    #[arg(long, default_value = "github.com")]
+    #[arg(short = 'H', long, default_value = "github.com")]
     host: String,
-    #[arg(long)]
+    #[arg(short = 'l', long)]
     login: String,
-    #[arg(long = "name")]
+    #[arg(short = 'n', long = "name")]
     git_name: String,
-    #[arg(long = "email", conflicts_with = "noreply")]
+    /// 用于状态和列表展示的人类可读说明
+    #[arg(short = 'd', long)]
+    description: Option<String>,
+    #[arg(short = 'e', long = "email", conflicts_with = "noreply")]
     git_email: Option<String>,
     /// 使用 GitHub.com 的 ID-based noreply 邮箱
     #[arg(
@@ -315,13 +327,19 @@ struct ProfileArgs {
 #[derive(Debug, Args)]
 struct ProfileEditArgs {
     id: String,
-    #[arg(long)]
+    #[arg(short = 'H', long)]
     host: Option<String>,
-    #[arg(long)]
+    #[arg(short = 'l', long)]
     login: Option<String>,
-    #[arg(long = "name")]
+    #[arg(short = 'n', long = "name")]
     git_name: Option<String>,
-    #[arg(long = "email", conflicts_with = "noreply")]
+    /// 设置用于状态和列表展示的人类可读说明
+    #[arg(short = 'd', long, conflicts_with = "clear_description")]
+    description: Option<String>,
+    /// 清除 Profile 的人类可读说明
+    #[arg(long, conflicts_with = "description")]
+    clear_description: bool,
+    #[arg(short = 'e', long = "email", conflicts_with = "noreply")]
     git_email: Option<String>,
     /// 使用 GitHub.com 的 ID-based noreply 邮箱
     #[arg(
@@ -695,7 +713,7 @@ fn status(path: Option<&Path>, explicit: Option<&str>, args: StatusArgs) -> app:
     if args.json {
         print_json(&report)?;
     } else {
-        println!("{}", ctx.identity_banner());
+        println!("{}", ctx.status_summary());
         for warning in &ctx.warnings {
             eprintln!("警告：{warning}");
         }
@@ -845,12 +863,19 @@ fn profile_command(path: Option<&Path>, command: ProfileCommand) -> app::Result<
                 print_json(&config.profiles)?;
             } else if config.profiles.is_empty() {
                 println!("尚未配置 profile。可先运行 `ghis discover`。")
+            } else if args.details {
+                for (index, (id, profile)) in config.profiles.iter().enumerate() {
+                    if index > 0 {
+                        println!();
+                    }
+                    println!("{}", profile_details(id, profile));
+                }
             } else {
                 for (id, profile) in &config.profiles {
-                    println!(
-                        "{id}: {} <{}>，{}/{}",
-                        profile.git_name, profile.git_email, profile.host, profile.login
-                    );
+                    match profile.description.as_deref() {
+                        Some(description) => println!("{id}\n  {description}"),
+                        None => println!("{id}"),
+                    }
                 }
             }
         }
@@ -862,18 +887,7 @@ fn profile_command(path: Option<&Path>, command: ProfileCommand) -> app::Result<
             if json {
                 print_json(profile)?;
             } else {
-                println!(
-                    "profile: {id}\n提交身份: {} <{}>\nGitHub: {}/{}\n签名: {}",
-                    profile.git_name,
-                    profile.git_email,
-                    profile.host,
-                    profile.login,
-                    if profile.signing.enabled {
-                        "开启"
-                    } else {
-                        "关闭"
-                    }
-                );
+                println!("{}", profile_details(&id, profile));
             }
         }
         ProfileCommand::Add(args) => {
@@ -960,6 +974,27 @@ fn profile_command(path: Option<&Path>, command: ProfileCommand) -> app::Result<
     Ok(0)
 }
 
+fn profile_details(id: &str, profile: &Profile) -> String {
+    let mut lines = vec![format!("Profile：{id}")];
+    if let Some(description) = profile.description.as_deref() {
+        lines.push(format!("描述：{description}"));
+    }
+    lines.push(format!(
+        "提交身份：{} <{}>",
+        profile.git_name, profile.git_email
+    ));
+    lines.push(format!("GitHub：{}@{}", profile.login, profile.host));
+    lines.push(format!(
+        "签名：{}",
+        if profile.signing.enabled {
+            "开启"
+        } else {
+            "关闭"
+        }
+    ));
+    lines.join("\n")
+}
+
 fn remove_profile(config: &mut Config, id: &str) -> app::Result<()> {
     config
         .profiles
@@ -1002,6 +1037,7 @@ fn profile_from_args(args: ProfileArgs, git_email: String) -> Profile {
         login: args.login,
         git_name: args.git_name,
         git_email,
+        description: args.description,
         ssh: Some(SshProfile {
             mode: ssh_mode,
             public_key: args.public_key,
@@ -1030,6 +1066,11 @@ fn update_profile_from_args(profile: &mut Profile, args: ProfileEditArgs) {
     }
     if let Some(git_email) = args.git_email {
         profile.git_email = git_email;
+    }
+    if args.clear_description {
+        profile.description = None;
+    } else if let Some(description) = args.description {
+        profile.description = Some(description);
     }
 
     if args.ssh.is_some()
@@ -1073,7 +1114,14 @@ fn use_profile(path: Option<&Path>, id: &str, repo: Option<&Path>) -> app::Resul
         .unwrap_or(std::env::current_dir()?);
     let ctx = context(path, Some(id), cwd)?;
     app::bind_repository(&ctx, id)?;
-    println!("已将仓库绑定到 `{id}`。\n{}", ctx.identity_banner());
+    println!("已绑定 Profile `{id}`。");
+    if let Some(description) = ctx
+        .profile
+        .as_ref()
+        .and_then(|profile| profile.description.as_deref())
+    {
+        println!("  {description}");
+    }
     Ok(0)
 }
 
@@ -1096,11 +1144,34 @@ fn rule_command(path: Option<&Path>, command: RuleCommand) -> app::Result<i32> {
             } else if config.rules.is_empty() {
                 println!("尚未配置规则。")
             } else {
-                for rule in &config.rules {
-                    println!(
-                        "{}: profile={} priority={}",
-                        rule.id, rule.profile, rule.priority
-                    );
+                for (index, rule) in config.rules.iter().enumerate() {
+                    if index > 0 {
+                        println!();
+                    }
+                    println!("{} → {}", rule.id, rule.profile);
+                    if let Some(description) = config
+                        .profiles
+                        .get(&rule.profile)
+                        .and_then(|profile| profile.description.as_deref())
+                    {
+                        println!("  Profile：{description}");
+                    }
+                    println!("  优先级：{}", rule.priority);
+                    let matches = [
+                        ("主机", rule.host.as_deref()),
+                        ("所有者", rule.owner.as_deref()),
+                        ("仓库", rule.repo.as_deref()),
+                        ("远端", rule.remote.as_deref()),
+                        ("Git 目录", rule.gitdir.as_deref()),
+                    ];
+                    if matches.iter().any(|(_, value)| value.is_some()) {
+                        println!("  匹配条件：");
+                        for (label, value) in matches {
+                            if let Some(value) = value {
+                                println!("    {label}：{value}");
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -2548,6 +2619,41 @@ fn write_stdout(bytes: &[u8]) -> app::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_short_options_are_conflict_free() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn profile_list_details_conflicts_with_json() {
+        let error = Cli::try_parse_from(["ghis", "profile", "list", "-d", "-j"])
+            .expect_err("details and json must conflict");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn profile_short_options_parse_in_their_subcommands() {
+        Cli::try_parse_from([
+            "ghis",
+            "profile",
+            "add",
+            "work",
+            "-H",
+            "github.example.test",
+            "-l",
+            "alice",
+            "-n",
+            "Alice",
+            "-e",
+            "alice@example.test",
+            "-d",
+            "Work",
+        ])
+        .expect("profile add short options");
+        Cli::try_parse_from(["ghis", "profile", "list", "-d"])
+            .expect("profile list details short option");
+    }
 
     #[test]
     fn explicit_profile_email_rejects_blank_input() {
