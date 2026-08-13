@@ -90,7 +90,36 @@ gh pr list
 
 不带参数运行 `ghis` 等同于 `ghis status`，直接显示当前仓库和有效身份。
 
-## 常用命令
+## 本地隔离沙盒
+
+不想手动准备 fake `gh`、临时 `HOME` 和测试仓库时，可以直接运行：
+
+```sh
+scripts/onboard-sandbox.sh
+```
+
+脚本会创建临时的 XDG 配置、缓存和状态目录，准备一个 Git 仓库，并让 fake `gh` 模拟 `github.com / alice`。退出后临时目录自动删除。需要手动运行多个命令时：
+
+```sh
+scripts/onboard-sandbox.sh --shell
+```
+
+隔离 shell 中可运行：
+
+```sh
+cargo run --quiet -- onboard --repo "$GHIS_SANDBOX_REPO"
+git -C "$GHIS_SANDBOX_REPO" config --local --list
+gh              # 只会调用脚本内的 fake gh
+```
+
+若需要保留现场排查：
+
+```sh
+scripts/onboard-sandbox.sh --keep --shell
+```
+
+脚本退出时会打印临时目录路径。这个沙盒不会访问真实 GitHub、不会使用真实 token，也不会修改宿主机的 gh、Git 或 XDG 配置。
+
 
 ```sh
 ghis status                         # 查看当前仓库将使用的身份
