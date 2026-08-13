@@ -556,6 +556,16 @@ fn agent_command(
                     "非交互环境请明确使用 `ghis agent setup claude --yes`".into(),
                 ));
             }
+            if !yes {
+                eprint!("将更新 Claude Code 设置 {}，继续吗？[y/N] ", path.display());
+                io::stderr().flush()?;
+                let mut answer = String::new();
+                io::stdin().read_line(&mut answer)?;
+                if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+                    println!("已取消，未修改 Claude Code 设置。");
+                    return Ok(0);
+                }
+            }
             let changed =
                 ghis::agent::claude::setup_settings(&path, Path::new(&agent_binary()), None)
                     .map_err(|error| app::AppError::Message(error.to_string()))?;
