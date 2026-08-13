@@ -13,6 +13,7 @@ fn context(source: ResolutionSource, profile_id: Option<&str>) -> AppContext {
         login: "alice".into(),
         git_name: "Alice Example".into(),
         git_email: "alice@example.test".into(),
+        description: None,
         ssh: Some(SshProfile {
             public_key: Some(PathBuf::from("CANARY_PUBLIC_KEY_PATH")),
             fingerprint: Some("CANARY_FINGERPRINT".into()),

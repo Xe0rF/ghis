@@ -39,6 +39,8 @@ enum Commands {
     Context(ContextArgs),
     /// 从 gh CLI 发现已有账号
     Discover(JsonArgs),
+    /// 通过普通行式提示创建 Profile 并可选初始化当前仓库
+    Onboard(OnboardArgs),
     /// 管理 profile
     Profile {
         #[command(subcommand)]
@@ -247,6 +249,13 @@ struct SetupArgs {
     yes: bool,
 }
 
+#[derive(Debug, Args, Default)]
+struct OnboardArgs {
+    /// 评估并可选绑定的仓库路径，默认使用当前目录
+    #[arg(long)]
+    repo: Option<PathBuf>,
+}
+
 #[derive(Debug, Args)]
 struct Passthrough {
     #[arg(allow_hyphen_values = true)]
@@ -286,6 +295,9 @@ struct ProfileArgs {
     login: String,
     #[arg(long = "name")]
     git_name: String,
+    /// 用于状态和列表展示的人类可读说明
+    #[arg(long)]
+    description: Option<String>,
     #[arg(long = "email", conflicts_with = "noreply")]
     git_email: Option<String>,
     /// 使用 GitHub.com 的 ID-based noreply 邮箱
@@ -321,6 +333,12 @@ struct ProfileEditArgs {
     login: Option<String>,
     #[arg(long = "name")]
     git_name: Option<String>,
+    /// 设置用于状态和列表展示的人类可读说明
+    #[arg(long, conflicts_with = "clear_description")]
+    description: Option<String>,
+    /// 清除 Profile 的人类可读说明
+    #[arg(long, conflicts_with = "description")]
+    clear_description: bool,
     #[arg(long = "email", conflicts_with = "noreply")]
     git_email: Option<String>,
     /// 使用 GitHub.com 的 ID-based noreply 邮箱
@@ -422,6 +440,7 @@ fn run(cli: Cli) -> app::Result<i32> {
             agent_context(cli.config.as_deref(), cli.profile.as_deref(), args)
         }
         Commands::Discover(args) => discover(cli.config.as_deref(), args.json),
+        Commands::Onboard(args) => onboard(cli.config.as_deref(), args),
         Commands::Profile { command } => profile_command(cli.config.as_deref(), command),
         Commands::Use { profile, repo } => {
             use_profile(cli.config.as_deref(), &profile, repo.as_deref())
@@ -695,7 +714,7 @@ fn status(path: Option<&Path>, explicit: Option<&str>, args: StatusArgs) -> app:
     if args.json {
         print_json(&report)?;
     } else {
-        println!("{}", ctx.identity_banner());
+        println!("{}", ctx.status_summary());
         for warning in &ctx.warnings {
             eprintln!("警告：{warning}");
         }
@@ -837,6 +856,120 @@ fn cache_discovery(paths: &ConfigPaths, discovery: &github::GhDiscovery) -> Opti
         .map(|error| format!("无法更新 gh 账号缓存：{error}"))
 }
 
+fn onboard(path: Option<&Path>, args: OnboardArgs) -> app::Result<i32> {
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Err(app::AppError::Message(
+            "`ghis onboard` 需要交互终端；脚本环境请使用 `ghis profile add ...`、`ghis use ...` 和 `ghis setup --yes`。".into(),
+        ));
+    }
+    let (paths, config) = load_config(path)?;
+    let target = args.repo.unwrap_or(std::env::current_dir()?);
+    let repository = ghis::repo::discover(&target).ok();
+    let discovery = match github::discover_accounts(None) {
+        Ok(value) => value,
+        Err(_) => github::load_discovery_cache(&discovery_cache_path(&paths))?.unwrap_or_default(),
+    };
+    let mut prompt = ghis::onboarding::Prompt::new(
+        BufReader::new(io::stdin()),
+        io::stderr(),
+        std::env::var_os("NO_COLOR").is_none()
+            && std::env::var("TERM")
+                .map(|value| value != "dumb")
+                .unwrap_or(true),
+    );
+    let result = ghis::onboarding::collect(
+        &mut prompt,
+        &config,
+        &discovery.accounts,
+        |host, login| github::profile_email_candidates(host, login).unwrap_or_default(),
+        repository.as_ref().map(|value| value.command_dir()),
+    )?;
+    let draft = match result {
+        ghis::onboarding::FlowResult::Cancelled | ghis::onboarding::FlowResult::Back => {
+            eprintln!("已取消，未写入任何文件。");
+            return Ok(0);
+        }
+        ghis::onboarding::FlowResult::Complete(draft) => draft,
+    };
+    eprintln!("\n── ghis 初始设置 ───────────────────────────────────────────── 5 / 5 ──");
+    eprintln!(
+        "[完成] 目标  ──>  [完成] 账号  ──>  [完成] 身份  ──>  [完成] 选项  ──>  [当前] 确认"
+    );
+    eprintln!("\n将执行：");
+    eprintln!(
+        "  ✓ 写入 Profile `{}` 到 {}",
+        draft.id,
+        paths.config_file.display()
+    );
+    if draft.make_default {
+        eprintln!("  ✓ 设置默认 Profile 为 `{}`", draft.id);
+    }
+    if draft.bind_repository {
+        eprintln!("  ✓ 绑定当前 Git worktree：{}", target.display());
+    }
+    if draft.setup_zsh {
+        eprintln!("  ✓ 安装 zsh wrapper");
+    }
+    eprintln!("\n继续吗？[y/N]：");
+    if !matches!(
+        prompt.confirm_final()?,
+        ghis::onboarding::FlowResult::Complete(true)
+    ) {
+        eprintln!("已取消，未写入任何文件。");
+        return Ok(0);
+    }
+    let profile = Profile {
+        host: github::normalize_host(&draft.host),
+        login: draft.login,
+        git_name: draft.git_name,
+        git_email: draft.git_email,
+        description: draft.description,
+        ssh: Some(SshProfile::default()),
+        signing: SigningProfile::default(),
+    };
+    let (saved, ()) = update_config(&paths, |config| {
+        if config.profiles.contains_key(&draft.id) {
+            return Err(app::AppError::Message(format!(
+                "profile `{}` 已存在",
+                draft.id
+            )));
+        }
+        config.profiles.insert(draft.id.clone(), profile);
+        if draft.make_default {
+            config.behavior.default_profile = Some(draft.id.clone());
+        }
+        Ok(())
+    })?;
+    app::sync_fragments(&paths, &saved)?;
+    if draft.bind_repository {
+        let ctx = context(path, Some(&draft.id), &target)?;
+        app::bind_repository(&ctx, &draft.id)?;
+    }
+    if draft.setup_zsh {
+        let home =
+            std::env::var_os("HOME").ok_or_else(|| app::AppError::Message("HOME 未设置".into()))?;
+        let zshrc = shell::zshrc_path(Path::new(&home), std::env::var_os("ZDOTDIR").as_deref());
+        let init = paths.config_dir.join("init.zsh");
+        shell::setup(zshrc, &init, "ghis")?;
+    }
+    println!("已创建 Profile `{}`。", draft.id);
+    if draft.bind_repository {
+        println!(
+            "已绑定到当前 Git worktree。\nHint: 运行 ghis status 查看当前身份。\nHint: 也可稍后运行 ghis doctor 检查 SSH 和 signing。"
+        );
+    } else {
+        println!(
+            "Hint: 可稍后运行 ghis use {} --repo {} 完成绑定。",
+            draft.id,
+            target.display()
+        );
+    }
+    if !draft.setup_zsh {
+        println!("Hint: 可稍后运行 ghis setup；脚本中使用 ghis setup --yes。");
+    }
+    Ok(0)
+}
+
 fn profile_command(path: Option<&Path>, command: ProfileCommand) -> app::Result<i32> {
     let (paths, config) = load_config(path)?;
     match command {
@@ -847,10 +980,10 @@ fn profile_command(path: Option<&Path>, command: ProfileCommand) -> app::Result<
                 println!("尚未配置 profile。可先运行 `ghis discover`。")
             } else {
                 for (id, profile) in &config.profiles {
-                    println!(
-                        "{id}: {} <{}>，{}/{}",
-                        profile.git_name, profile.git_email, profile.host, profile.login
-                    );
+                    match profile.description.as_deref() {
+                        Some(description) => println!("{id}\n  {description}"),
+                        None => println!("{id}"),
+                    }
                 }
             }
         }
@@ -862,12 +995,16 @@ fn profile_command(path: Option<&Path>, command: ProfileCommand) -> app::Result<
             if json {
                 print_json(profile)?;
             } else {
+                println!("Profile：{id}");
+                if let Some(description) = profile.description.as_deref() {
+                    println!("描述：{description}");
+                }
                 println!(
-                    "profile: {id}\n提交身份: {} <{}>\nGitHub: {}/{}\n签名: {}",
+                    "提交身份：{} <{}>\nGitHub：{}@{}\n签名：{}",
                     profile.git_name,
                     profile.git_email,
-                    profile.host,
                     profile.login,
+                    profile.host,
                     if profile.signing.enabled {
                         "开启"
                     } else {
@@ -1002,6 +1139,7 @@ fn profile_from_args(args: ProfileArgs, git_email: String) -> Profile {
         login: args.login,
         git_name: args.git_name,
         git_email,
+        description: args.description,
         ssh: Some(SshProfile {
             mode: ssh_mode,
             public_key: args.public_key,
@@ -1030,6 +1168,11 @@ fn update_profile_from_args(profile: &mut Profile, args: ProfileEditArgs) {
     }
     if let Some(git_email) = args.git_email {
         profile.git_email = git_email;
+    }
+    if args.clear_description {
+        profile.description = None;
+    } else if let Some(description) = args.description {
+        profile.description = Some(description);
     }
 
     if args.ssh.is_some()
@@ -1073,7 +1216,7 @@ fn use_profile(path: Option<&Path>, id: &str, repo: Option<&Path>) -> app::Resul
         .unwrap_or(std::env::current_dir()?);
     let ctx = context(path, Some(id), cwd)?;
     app::bind_repository(&ctx, id)?;
-    println!("已将仓库绑定到 `{id}`。\n{}", ctx.identity_banner());
+    println!("已绑定 Profile `{id}`。\n{}", ctx.identity_banner());
     Ok(0)
 }
 

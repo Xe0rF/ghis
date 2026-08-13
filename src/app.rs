@@ -178,6 +178,16 @@ impl AppContext {
         self.resolution.profile.as_deref()
     }
 
+    pub fn status_summary(&self) -> String {
+        match (self.profile_id(), self.profile.as_ref()) {
+            (Some(id), Some(profile)) => match profile.description.as_deref() {
+                Some(description) => format!("当前 Profile：{id}\n  {description}"),
+                None => format!("当前 Profile：{id}"),
+            },
+            _ => "当前 Profile：未解析".into(),
+        }
+    }
+
     pub fn identity_banner(&self) -> String {
         let repo = self
             .repository

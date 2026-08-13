@@ -294,6 +294,8 @@ pub struct Profile {
     pub login: String,
     pub git_name: String,
     pub git_email: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub ssh: Option<SshProfile>,
     pub signing: SigningProfile,
 }
@@ -305,6 +307,7 @@ impl Default for Profile {
             login: String::new(),
             git_name: String::new(),
             git_email: String::new(),
+            description: None,
             ssh: None,
             signing: SigningProfile::default(),
         }
@@ -466,6 +469,23 @@ impl Config {
                 return Err(ConfigError::Validation(format!(
                     "profile `{id}` needs git_name and git_email"
                 )));
+            }
+            if let Some(description) = profile.description.as_deref() {
+                if description.trim().is_empty() {
+                    return Err(ConfigError::Validation(format!(
+                        "profile `{id}` description cannot be empty"
+                    )));
+                }
+                if description.chars().any(char::is_control) {
+                    return Err(ConfigError::Validation(format!(
+                        "profile `{id}` description cannot contain control characters"
+                    )));
+                }
+                if description.chars().count() > 200 {
+                    return Err(ConfigError::Validation(format!(
+                        "profile `{id}` description cannot exceed 200 characters"
+                    )));
+                }
             }
             if profile.ssh.as_ref().is_some_and(|ssh| {
                 matches!(ssh.mode, SshMode::OnePassword | SshMode::Managed)
@@ -731,7 +751,15 @@ fn merge_profile(destination: &mut Item, source: &Item) {
     merge_known_table(
         destination,
         source,
-        &["host", "login", "git_name", "git_email", "ssh", "signing"],
+        &[
+            "host",
+            "login",
+            "git_name",
+            "git_email",
+            "description",
+            "ssh",
+            "signing",
+        ],
     );
     let Item::Table(destination) = destination else {
         return;

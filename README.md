@@ -34,7 +34,36 @@ scripts/package-release.sh
 
 ## 快速开始
 
-先确认需要使用的账号都已经由 `gh` 登录，然后创建 Profile、绑定当前仓库并安装 zsh wrapper。下面的账号、姓名、邮箱、路径均为示例，需要替换成自己的值：
+首次使用可以运行普通行式向导，按步骤选择 `gh` 账号、提交身份，并可选设置默认 Profile、绑定当前 Git worktree 和安装 zsh wrapper：
+
+```sh
+ghis onboard
+```
+
+向导不会启动全屏 TUI，不会清屏或接管终端；它使用带颜色的步骤抬头、状态轨道和 Hint 输出普通终端文本。菜单支持编号输入，也支持输入 `j` 或 `k` 后按 Enter 移动默认候选；文本字段中的 `j` 和 `k` 仍是普通字符。输入 `back` 返回上一步，输入 `cancel` 取消。最终确认前不会写入配置、Git 仓库或 shell 文件。
+
+目标目录为 Git 仓库时，向导会明确询问是否绑定当前 worktree，并提示：
+
+```text
+Hint: 也可稍后运行 ghis use <profile> --repo <path> 绑定。
+```
+
+取消绑定、zsh 或 agent 集成时，向导会给出对应的后续命令。向导仅支持交互终端；CI 和脚本请继续使用完整的非交互命令链：
+
+```sh
+ghis discover
+ghis profile add personal \
+  --login alice \
+  --name "Alice" \
+  --noreply
+
+ghis use personal --repo ~/src/project
+ghis setup --yes
+```
+
+向导不会执行 `gh auth login`，不会保存 GitHub token，不读取 SSH 私钥，不修改 remote 或全局 Git identity。GitHub.com 的 noreply 邮箱和 GitHub Enterprise 的邮箱候选遵循现有 host 规则；linked worktree 的绑定只影响当前 worktree。
+
+原有快速创建方式仍然可用。下面的账号、姓名、邮箱、路径均为示例，需要替换成自己的值：
 
 ```sh
 ghis discover

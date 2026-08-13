@@ -1237,6 +1237,23 @@ exec "$GHIS_REAL_GIT" "$@"
 }
 
 #[test]
+fn onboard_rejects_noninteractive_input_without_writing_config() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let mut command = isolated_ghis_command();
+    command.arg("onboard").write_stdin("alice\n");
+    for (key, value) in xdg_environment(&temp) {
+        command.env(key, value);
+    }
+    command
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ghis onboard"));
+    assert!(!temp.path().join("config").exists());
+    assert!(!temp.path().join("cache").exists());
+    assert!(!temp.path().join("state").exists());
+}
+
+#[test]
 fn setup_respects_zdotdir_and_requires_explicit_noninteractive_consent() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let home = temp.path().join("home");
