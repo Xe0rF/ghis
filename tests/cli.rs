@@ -11,13 +11,17 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
-const GHIS_CONTROL_ENV: [&str; 6] = [
+const GHIS_CONTROL_ENV: [&str; 10] = [
     "GHIS_CONFIG",
     "GHIS_PROFILE",
     "GHIS_BANNER_SHOWN",
     "GHIS_WRAPPER_ACTIVE",
     "GHIS_BYPASS",
     "GHIS_DISABLE_CHPWD",
+    "GHIS_CHPWD_ENABLED",
+    "GHIS_REPO_PROFILE",
+    "GHIS_REPO_PROFILE_DISPLAY",
+    "GHIS_REPO_ROOT",
 ];
 
 fn write_executable(path: &Path, body: &str) {
@@ -112,6 +116,27 @@ fn long_version_reports_build_provenance() {
         .stdout(predicate::str::contains("SOURCE_DATE_EPOCH: "))
         .stdout(predicate::str::contains("target: "))
         .stdout(predicate::str::contains("profile: "));
+}
+
+#[test]
+fn bare_command_defaults_to_status() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+
+    let run = |args: &[&str]| {
+        let mut command = isolated_ghis_command();
+        command.current_dir(temp.path()).args(args);
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.output().expect("run ghis")
+    };
+
+    let bare = run(&[]);
+    let status = run(&["status"]);
+    assert_eq!(bare.status, status.status);
+    assert_eq!(bare.stdout, status.stdout);
+    assert_eq!(bare.stderr, status.stderr);
 }
 
 #[test]
@@ -882,14 +907,19 @@ fn caller_identity_config_still_overrides_the_profile_fragment() {
 
 #[test]
 fn git_version_options_keep_injected_config_before_the_option_terminator() {
+    let temp = tempfile::tempdir().expect("temporary directory");
     let mut direct = isolated_ghis_command();
-    direct.args(["git", "--", "--version"]);
+    direct
+        .current_dir(temp.path())
+        .args(["git", "--", "--version"]);
+    for (key, value) in xdg_environment(&temp) {
+        direct.env(key, value);
+    }
     direct
         .assert()
         .success()
         .stdout(predicate::str::starts_with("git version "));
 
-    let temp = tempfile::tempdir().expect("temporary directory");
     let init = temp.path().join("init.zsh");
     fs::write(&init, ghis::shell::zsh_init_script("ghis")).expect("init script");
     let binary = assert_cmd::cargo::cargo_bin!("ghis");
@@ -918,6 +948,119 @@ fn git_version_options_keep_injected_config_before_the_option_terminator() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(String::from_utf8_lossy(&output.stdout).starts_with("git version "));
+}
+
+#[test]
+fn chpwd_status_is_disabled_without_repository_probe_by_default() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let mut command = isolated_ghis_command();
+    command.args(["status", "--shell"]);
+    command.current_dir(temp.path());
+    for (key, value) in xdg_environment(&temp) {
+        command.env(key, value);
+    }
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("GHIS_CHPWD_ENABLED=0"))
+        .stdout(predicate::str::contains("GHIS_REPO_PROFILE=''"));
+}
+
+#[test]
+fn chpwd_status_reports_non_authoritative_profile_when_enabled() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo directory");
+    let init = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&repo)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .status()
+        .expect("git init");
+    assert!(init.success());
+    let config_dir = temp.path().join("config/ghis");
+    fs::create_dir_all(&config_dir).expect("config directory");
+    fs::write(
+        config_dir.join("config.toml"),
+        "version = 1\n[behavior]\ndefault_profile = \"personal\"\ndisplay_profile_on_chpwd = true\n[profiles.personal]\nhost = \"github.com\"\nlogin = \"alice\"\ngit_name = \"Alice\"\ngit_email = \"alice@example.test\"\n",
+    )
+    .expect("config");
+
+    let mut command = isolated_ghis_command();
+    command.args(["status", "--shell"]);
+    command.current_dir(&repo);
+    for (key, value) in xdg_environment(&temp) {
+        command.env(key, value);
+    }
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("GHIS_CHPWD_ENABLED=1"))
+        .stdout(predicate::str::contains("GHIS_REPO_PROFILE='personal'"))
+        .stdout(predicate::str::contains("GHIS_REPO_ROOT="))
+        .stdout(predicate::str::contains("GHIS_PROFILE=").not());
+}
+
+#[test]
+fn zsh_chpwd_is_silent_on_source_and_displays_profile_after_directory_change() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo directory");
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .expect("git init")
+            .success()
+    );
+    let config_dir = temp.path().join("config/ghis");
+    fs::create_dir_all(&config_dir).expect("config directory");
+    fs::write(
+        config_dir.join("config.toml"),
+        "version = 1\n[behavior]\ndefault_profile = \"personal\"\ndisplay_profile_on_chpwd = true\n[profiles.personal]\nhost = \"github.com\"\nlogin = \"alice\"\ngit_name = \"Alice\"\ngit_email = \"alice@example.test\"\n",
+    )
+    .expect("config");
+    let init = temp.path().join("init.zsh");
+    let ghis_bin = assert_cmd::cargo::cargo_bin!("ghis");
+    fs::write(
+        &init,
+        ghis::shell::zsh_init_script(&ghis_bin.to_string_lossy()),
+    )
+    .expect("init script");
+
+    let mut command = Command::new("zsh");
+    command
+        .args([
+            "-f",
+            "-c",
+            "source \"$1\"; cd \"$2\"; print -r -- \"repo=$GHIS_REPO_PROFILE authoritative=${GHIS_PROFILE-unset}\"",
+            "zsh",
+        ])
+        .arg(&init)
+        .arg(&repo)
+        .current_dir(temp.path());
+    for (key, value) in xdg_environment(&temp) {
+        command.env(key, value);
+    }
+    clear_ghis_environment(&mut command);
+    let output = command.output().expect("run zsh chpwd hook");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.matches("GhIS  Profile  personal").count(),
+        1,
+        "{stdout}"
+    );
+    assert!(
+        stdout.contains("repo=personal authoritative=unset"),
+        "{stdout}"
+    );
 }
 
 #[test]
@@ -2155,7 +2298,7 @@ fn config_commands_list_and_update_behavior_with_short_keys() {
     let output = list.output().expect("list behavior settings");
     assert!(output.status.success());
     let settings: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(settings.as_array().unwrap().len(), 6);
+    assert_eq!(settings.as_array().unwrap().len(), 7);
 
     let mut set = isolated_ghis_command();
     set.args(["config", "set", "display-identity", "never"]);

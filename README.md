@@ -7,7 +7,7 @@
 ## 核心能力
 
 - 按仓库绑定身份，也可用规则、remote owner 或默认值自动选择。
-- 提供中文 Vim 风格 TUI、完整 CLI 和透明的 zsh wrapper。
+- 提供完整 CLI 和透明的 zsh wrapper。
 - 自动发现 `gh` 已保存的账号，并为 HTTPS 操作精确选择对应凭据。
 - 可选集成 1Password SSH Agent 和 `op-ssh-sign`，为不同 Profile 使用不同的 SSH commit signing key。
 - 提供身份预览、结构化执行检查和带安全快速修复的 `doctor`；已选身份不可用时不会静默换成另一个账号。
@@ -59,7 +59,7 @@ git push
 gh pr list
 ```
 
-不带参数运行 `ghis` 会打开 TUI。常用按键包括 `h/j/k/l`、`gg/G`、`Ctrl-u/Ctrl-d`、`/`、`n/N`、`Enter` 和 `Esc`。
+不带参数运行 `ghis` 等同于 `ghis status`，直接显示当前仓库和有效身份。
 
 ## 常用命令
 

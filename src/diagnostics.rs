@@ -8,7 +8,7 @@ use crate::signing;
 use serde::Serialize;
 use std::path::Path;
 
-/// Diagnostic severity shared by CLI JSON/text output and the TUI.
+/// Diagnostic severity shared by CLI JSON and text output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Severity {
@@ -100,7 +100,7 @@ impl RepairAction {
 }
 
 /// One actionable configuration finding. Values are sanitized before they
-/// enter this public structure so JSON, logs, and TUI rows cannot expose an
+/// enter this public structure so JSON and text output cannot expose an
 /// Authorization header or credential helper body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct GitConfigDiagnostic {
@@ -142,7 +142,7 @@ impl DiagnosticCheck {
     }
 }
 
-/// Structured report consumed by both front ends.
+/// Structured report consumed by the JSON and text front ends.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct GitConfigReport {
     pub info: usize,
@@ -186,7 +186,7 @@ pub fn summary_line(report: &GitConfigReport) -> String {
     )
 }
 
-/// Render one finding for a text terminal or a filterable TUI list row.
+/// Render one finding for text terminal output.
 pub fn render_row(item: &GitConfigDiagnostic) -> String {
     format!(
         "{}\t{}={}\t范围={} 来源={}\t影响={}\t建议={}",
@@ -695,12 +695,9 @@ fn bounded(value: &str) -> String {
     }
 }
 
-/// Do not let a hostile Git config value create a new terminal line, inject an
-/// ANSI control sequence, or resize a TUI row. JSON would escape controls, but
-/// the text doctor output and TUI consume these fields directly.
-/// Escape terminal control characters before a value is rendered in text or
-/// TUI output. This is also used by the TUI for data returned by external
-/// agents and GitHub commands.
+/// Escape terminal control characters before a value is rendered in text.
+/// JSON would escape controls, but the text doctor output consumes these
+/// fields directly.
 pub fn sanitize_display_text(value: &str) -> String {
     let mut sanitized = String::with_capacity(value.len());
     for character in value.chars() {

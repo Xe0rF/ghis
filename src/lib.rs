@@ -17,7 +17,6 @@ pub mod repo;
 pub mod shell;
 pub mod signing;
 pub mod state;
-pub mod tui;
 
 pub const SCHEMA_VERSION: u32 = 1;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

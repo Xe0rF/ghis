@@ -228,6 +228,7 @@ pub struct Behavior {
     pub credential_failure: CredentialFailurePolicy,
     pub ssh_unmanaged: SshUnmanagedPolicy,
     pub display_identity: DisplayIdentity,
+    pub display_profile_on_chpwd: bool,
 }
 
 impl Default for Behavior {
@@ -239,6 +240,7 @@ impl Default for Behavior {
             credential_failure: CredentialFailurePolicy::default(),
             ssh_unmanaged: SshUnmanagedPolicy::default(),
             display_identity: DisplayIdentity::default(),
+            display_profile_on_chpwd: false,
         }
     }
 }
@@ -654,6 +656,7 @@ fn merge_document(dst: &mut DocumentMut, src: &DocumentMut) {
                         "credential_failure",
                         "ssh_unmanaged",
                         "display_identity",
+                        "display_profile_on_chpwd",
                     ],
                 ),
                 _ => merge_item(destination_item, source_item),

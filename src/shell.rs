@@ -135,10 +135,23 @@ function codex {{
 autoload -Uz add-zsh-hook 2>/dev/null || true
 ghis_chpwd() {{
   [[ "${{GHIS_DISABLE_CHPWD:-0}}" == 1 ]] && return 0
-  # Keep only a local hint; this must never perform network I/O or print.
-  local ghis_root
-  ghis_root="$(GHIS_BYPASS=1 command git rev-parse --show-toplevel 2>/dev/null)"
-  typeset -g GHIS_REPO_ROOT="$ghis_root"
+  local ghis_silent="${{1:-0}}"
+  local ghis_state
+  ghis_state="$(GHIS_BYPASS=1 command {binary} status --shell 2>/dev/null)" || {{
+    typeset -g GHIS_CHPWD_ENABLED=0
+    typeset -g GHIS_REPO_PROFILE=''
+    typeset -g GHIS_REPO_PROFILE_DISPLAY=''
+    typeset -g GHIS_REPO_ROOT=''
+    return 0
+  }}
+  eval "$ghis_state"
+  typeset -g GHIS_CHPWD_ENABLED
+  typeset -g GHIS_REPO_PROFILE
+  typeset -g GHIS_REPO_PROFILE_DISPLAY
+  typeset -g GHIS_REPO_ROOT
+  if [[ "$ghis_silent" != 1 && "$GHIS_CHPWD_ENABLED" == 1 && -n "$GHIS_REPO_PROFILE" ]]; then
+    print -r -- "GhIS  Profile  $GHIS_REPO_PROFILE_DISPLAY"
+  fi
 }}
 _ghis_chpwd() {{
   ghis_chpwd "$@"
@@ -147,7 +160,7 @@ if (( $+functions[add-zsh-hook] )); then
   add-zsh-hook -d chpwd _ghis_chpwd 2>/dev/null || true
   add-zsh-hook -d chpwd ghis_chpwd 2>/dev/null || true
   add-zsh-hook chpwd ghis_chpwd
-  ghis_chpwd
+  ghis_chpwd 1
 fi
 
 # Set this last: children can distinguish a legacy/partial environment marker
@@ -485,6 +498,10 @@ mod tests {
         let script = zsh_init_script("ghis");
         assert!(script.contains("ghis_dispatch()"));
         assert!(script.contains("ghis_chpwd()"));
+        assert!(script.contains("status --shell"));
+        assert!(script.contains("ghis_chpwd 1"));
+        assert!(script.contains("GHIS_REPO_PROFILE_DISPLAY"));
+        assert!(!script.contains("typeset -g GHIS_PROFILE"));
         assert!(script.contains("_ghis_dispatch()"));
         assert!(script.contains("_ghis_chpwd()"));
         assert!(script.contains("ghis_dispatch git \"$@\""));

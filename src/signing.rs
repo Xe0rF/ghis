@@ -165,8 +165,7 @@ pub fn onepassword_socket_candidates() -> Vec<PathBuf> {
 }
 
 /// Discover public key material from the conventional `~/.ssh` directory.
-/// This is intentionally a read-only lookup used by the TUI to offer choices
-/// instead of asking users to paste key material or point at a private key.
+/// This read-only lookup never inspects private key material.
 pub fn discover_public_key_files() -> Vec<PublicKeyFile> {
     let Some(home) = env::var_os("HOME").map(PathBuf::from) else {
         return Vec::new();
