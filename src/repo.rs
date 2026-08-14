@@ -10,6 +10,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use tempfile::tempdir;
+
 #[derive(Debug)]
 pub enum RepoError {
     Io(std::io::Error),
@@ -217,6 +219,464 @@ impl Transport {
             Self::Other(value) => value.as_str(),
         }
     }
+}
+
+/// A remote URL selected for an operation. Fetch and push URLs deliberately
+/// remain distinct: `remote.<name>.pushurl` only applies to pushes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OperationRemote {
+    /// One known remote will be contacted.
+    Resolved(Remote),
+    /// The operation will contact every listed remote (for example, `remote
+    /// update` without a name). Callers must apply policy to every target.
+    Multiple(Vec<Remote>),
+    /// Git will choose a target that ghis cannot establish safely from the
+    /// command line and local configuration.
+    Uncertain,
+}
+
+impl OperationRemote {
+    pub fn remotes(&self) -> &[Remote] {
+        match self {
+            Self::Resolved(remote) => std::slice::from_ref(remote),
+            Self::Multiple(remotes) => remotes,
+            Self::Uncertain => &[],
+        }
+    }
+
+    pub fn is_uncertain(&self) -> bool {
+        matches!(self, Self::Uncertain)
+    }
+}
+
+/// Resolve the remote Git will contact for a network operation without
+/// changing the existing [`primary_remote`] or [`gh_remote_context`] behavior.
+///
+/// `pushurl` is used only for pushes. Fetch, pull and `remote update` use the
+/// ordinary fetch URL. When Git's target cannot be determined unambiguously,
+/// callers receive [`OperationRemote::Uncertain`] rather than an arbitrary
+/// primary remote.
+pub fn operation_remote(
+    repository: &Repository,
+    operation: &str,
+    arguments: &[String],
+) -> Result<OperationRemote> {
+    let direction = match operation {
+        "push" => RemoteDirection::Push,
+        "fetch" | "pull" | "ls-remote" | "remote" => RemoteDirection::Fetch,
+        _ => return Ok(OperationRemote::Uncertain),
+    };
+    let configured = operation_remotes(repository, direction)?;
+    if operation == "remote" {
+        return operation_remote_update(arguments, &configured);
+    }
+    if operation == "fetch" && operation_has_flag(arguments, operation, "--all") {
+        return Ok(if configured.is_empty() {
+            OperationRemote::Uncertain
+        } else {
+            OperationRemote::Multiple(configured)
+        });
+    }
+
+    let positionals = operation_positionals(arguments, operation);
+    let Some(positionals) = positionals else {
+        return Ok(OperationRemote::Uncertain);
+    };
+    if operation == "fetch" && operation_has_flag(arguments, operation, "--multiple") {
+        return Ok(select_operation_remote_targets(&positionals, &configured));
+    }
+    if let Some(target) = positionals.first() {
+        return select_explicit_operation_remote(repository, direction, target, &configured);
+    }
+    Ok(default_operation_remote(repository, operation, &configured))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteDirection {
+    Fetch,
+    Push,
+}
+
+/// Obtain Git's effective operation URLs. Asking Git through `remote get-url`
+/// applies `insteadOf`/`pushInsteadOf` rewrites and preserves every configured
+/// value, including multiple push URLs.
+fn operation_remotes(repository: &Repository, direction: RemoteDirection) -> Result<Vec<Remote>> {
+    let names = run_git(repository.command_dir(), ["remote"])?;
+    if !names.status.success() {
+        return Err(command_error("remote", &names));
+    }
+    let mut remotes = Vec::new();
+    for name in String::from_utf8_lossy(&names.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        let mut args = vec!["remote".to_owned(), "get-url".to_owned()];
+        if matches!(direction, RemoteDirection::Push) {
+            args.push("--push".to_owned());
+        }
+        args.extend(["--all".to_owned(), name.to_owned()]);
+        let output = run_git(repository.command_dir(), args)?;
+        if !output.status.success() {
+            return Err(command_error("remote get-url", &output));
+        }
+        for url in String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+        {
+            remotes.push(parse_remote(name.to_owned(), url.to_owned()));
+        }
+    }
+    Ok(remotes)
+}
+
+fn select_named_operation_remotes(name: &str, remotes: &[Remote]) -> OperationRemote {
+    let selected = remotes
+        .iter()
+        .filter(|remote| remote.name == name)
+        .cloned()
+        .collect::<Vec<_>>();
+    match selected.as_slice() {
+        [] => OperationRemote::Uncertain,
+        [remote] => OperationRemote::Resolved(remote.clone()),
+        _ => OperationRemote::Multiple(selected),
+    }
+}
+
+fn operation_remote_update(arguments: &[String], remotes: &[Remote]) -> Result<OperationRemote> {
+    let Some(positionals) = operation_positionals(arguments, "remote") else {
+        return Ok(OperationRemote::Uncertain);
+    };
+    let Some(action) = positionals.first().map(String::as_str) else {
+        return Ok(OperationRemote::Uncertain);
+    };
+    if !matches!(action, "update" | "prune") {
+        return Ok(OperationRemote::Uncertain);
+    }
+    let names = &positionals[1..];
+    if names.is_empty() {
+        return Ok(if remotes.is_empty() {
+            OperationRemote::Uncertain
+        } else {
+            OperationRemote::Multiple(remotes.to_vec())
+        });
+    }
+    let selected = names
+        .iter()
+        .map(|name| match select_named_operation_remotes(name, remotes) {
+            OperationRemote::Resolved(remote) => vec![remote],
+            OperationRemote::Multiple(remotes) => remotes,
+            OperationRemote::Uncertain => Vec::new(),
+        })
+        .collect::<Vec<_>>();
+    if selected.iter().any(Vec::is_empty) {
+        return Ok(OperationRemote::Uncertain);
+    }
+    let selected = selected.into_iter().flatten().collect::<Vec<_>>();
+    Ok(match selected.as_slice() {
+        [] => OperationRemote::Uncertain,
+        [remote] => OperationRemote::Resolved(remote.clone()),
+        _ => OperationRemote::Multiple(selected),
+    })
+}
+
+fn select_explicit_operation_remote(
+    repository: &Repository,
+    direction: RemoteDirection,
+    target: &str,
+    remotes: &[Remote],
+) -> Result<OperationRemote> {
+    let selected = select_named_operation_remotes(target, remotes);
+    if !selected.is_uncertain() {
+        return Ok(selected);
+    }
+    // Git also accepts a URL in place of a remote name. Resolve rewrite rules
+    // in an isolated repository so the result matches Git's actual target.
+    let effective = effective_explicit_url(repository, direction, target)?;
+    let remote = parse_remote("<explicit>", effective);
+    if remote.host.is_some() && !matches!(remote.transport, Transport::File | Transport::Other(_)) {
+        Ok(OperationRemote::Resolved(remote))
+    } else {
+        Ok(OperationRemote::Uncertain)
+    }
+}
+
+fn effective_explicit_url(
+    repository: &Repository,
+    direction: RemoteDirection,
+    target: &str,
+) -> Result<String> {
+    let rules = run_git(
+        repository.command_dir(),
+        [
+            "config",
+            "--includes",
+            "--null",
+            "--get-regexp",
+            r"^url\..*\.(insteadof|pushinsteadof)$",
+        ],
+    )?;
+    if !rules.status.success() && rules.status.code() != Some(1) {
+        return Err(command_error("config URL rewrites", &rules));
+    }
+    let scratch = tempdir()?;
+    let init = Command::new("git")
+        .args(["init", "--bare", "-q"])
+        .current_dir(scratch.path())
+        .output()?;
+    if !init.status.success() {
+        return Err(command_error("init rewrite scratch repository", &init));
+    }
+    let empty_global = scratch.path().join("empty-global");
+    std::fs::File::create(&empty_global)?;
+    for record in String::from_utf8_lossy(&rules.stdout).split('\0') {
+        let Some((key, value)) = record.split_once('\n') else {
+            continue;
+        };
+        let output = Command::new("git")
+            .args(["config", "--local", "--add", key, value])
+            .current_dir(scratch.path())
+            .output()?;
+        if !output.status.success() {
+            return Err(command_error("configure URL rewrite", &output));
+        }
+    }
+    let add = Command::new("git")
+        .args(["remote", "add", "synthetic", target])
+        .current_dir(scratch.path())
+        .output()?;
+    if !add.status.success() {
+        return Err(command_error("configure explicit remote", &add));
+    }
+    let mut get_args = vec!["remote", "get-url"];
+    if matches!(direction, RemoteDirection::Push) {
+        get_args.push("--push");
+    }
+    get_args.push("synthetic");
+    let output = Command::new("git")
+        .args(get_args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", &empty_global)
+        .current_dir(scratch.path())
+        .output()?;
+    if !output.status.success() {
+        return Err(command_error("resolve explicit remote URL", &output));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn default_operation_remote(
+    repository: &Repository,
+    operation: &str,
+    remotes: &[Remote],
+) -> OperationRemote {
+    let branch = current_branch(repository);
+    let branch_push_default = (operation == "push")
+        .then(|| {
+            branch.as_deref().and_then(|branch| {
+                git_config_value(repository, &format!("branch.{branch}.pushRemote"))
+            })
+        })
+        .flatten();
+    let configured_default = if operation == "push" {
+        git_config_value(repository, "remote.pushDefault")
+    } else {
+        None
+    };
+    let branch_default = branch
+        .as_deref()
+        .and_then(|branch| git_config_value(repository, &format!("branch.{branch}.remote")));
+    let origin = String::from("origin");
+    for name in branch_push_default
+        .iter()
+        .chain(configured_default.iter())
+        .chain(branch_default.iter())
+        .chain(std::iter::once(&origin))
+    {
+        let selected = select_named_operation_remotes(name, remotes);
+        if !selected.is_uncertain() {
+            return selected;
+        }
+    }
+    match remotes {
+        [remote] => OperationRemote::Resolved(remote.clone()),
+        _ => OperationRemote::Uncertain,
+    }
+}
+
+fn git_config_value(repository: &Repository, key: &str) -> Option<String> {
+    let output = run_git(repository.command_dir(), ["config", "--get", key]).ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn current_branch(repository: &Repository) -> Option<String> {
+    let output = run_git(
+        repository.command_dir(),
+        ["symbolic-ref", "--quiet", "--short", "HEAD"],
+    )
+    .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+fn select_operation_remote_targets(targets: &[String], remotes: &[Remote]) -> OperationRemote {
+    let selected = targets
+        .iter()
+        .map(
+            |target| match select_named_operation_remotes(target, remotes) {
+                OperationRemote::Resolved(remote) => vec![remote],
+                OperationRemote::Multiple(remotes) => remotes,
+                OperationRemote::Uncertain => Vec::new(),
+            },
+        )
+        .collect::<Vec<_>>();
+    if selected.iter().any(Vec::is_empty) {
+        return OperationRemote::Uncertain;
+    }
+    let selected = selected.into_iter().flatten().collect::<Vec<_>>();
+    match selected.as_slice() {
+        [] => OperationRemote::Uncertain,
+        [remote] => OperationRemote::Resolved(remote.clone()),
+        _ => OperationRemote::Multiple(selected),
+    }
+}
+
+fn operation_has_flag(arguments: &[String], operation: &str, flag: &str) -> bool {
+    let Some(start) = arguments.iter().position(|argument| argument == operation) else {
+        return false;
+    };
+    arguments[start + 1..]
+        .iter()
+        .take_while(|argument| argument.as_str() != "--")
+        .any(|argument| argument == flag)
+}
+
+/// Extract positionals after a network subcommand. The parser is intentionally
+/// conservative: known options that consume values are skipped, while an
+/// unfamiliar option makes the remaining target uncertain instead of guessing.
+fn operation_positionals(arguments: &[String], operation: &str) -> Option<Vec<String>> {
+    let start = arguments
+        .iter()
+        .position(|argument| argument == operation)?;
+    let mut result = Vec::new();
+    let mut index = start + 1;
+    let mut positional_only = false;
+    while let Some(argument) = arguments.get(index) {
+        if positional_only {
+            result.push(argument.clone());
+            index += 1;
+            continue;
+        }
+        if argument == "--" {
+            positional_only = true;
+            index += 1;
+            continue;
+        }
+        if argument.starts_with('-') && argument != "-" {
+            if !operation_option_is_known(operation, argument) {
+                return None;
+            }
+            if operation_option_takes_value(operation, argument) && !argument.contains('=') {
+                index += 2;
+            } else {
+                index += 1;
+            }
+            continue;
+        }
+        result.push(argument.clone());
+        index += 1;
+    }
+    Some(result)
+}
+
+fn operation_option_is_known(operation: &str, option: &str) -> bool {
+    let option = option.split('=').next().unwrap_or(option);
+    matches!(
+        option,
+        "-q" | "--quiet"
+            | "-v"
+            | "--verbose"
+            | "--all"
+            | "--prune"
+            | "--prune-tags"
+            | "--tags"
+            | "--no-tags"
+            | "--dry-run"
+            | "--force"
+            | "-f"
+            | "--set-upstream"
+            | "-u"
+            | "--mirror"
+            | "--porcelain"
+            | "--atomic"
+            | "--follow-tags"
+            | "--no-verify"
+            | "--ipv4"
+            | "--ipv6"
+            | "--recurse-submodules"
+            | "--no-recurse-submodules"
+            | "--multiple"
+            | "--append"
+            | "--no-write-fetch-head"
+            | "--write-commit-graph"
+            | "--update-head-ok"
+            | "--negotiate-only"
+            | "--prefetch"
+            | "--show-forced-updates"
+            | "--no-show-forced-updates"
+            | "--keep"
+            | "--progress"
+            | "--no-progress"
+    ) || matches!(
+        option,
+        "--receive-pack"
+            | "--exec"
+            | "--push-option"
+            | "-o"
+            | "--upload-pack"
+            | "--depth"
+            | "--deepen"
+            | "--shallow-since"
+            | "--shallow-exclude"
+            | "--server-option"
+            | "--jobs"
+            | "-j"
+            | "--negotiation-tip"
+            | "--refmap"
+            | "--filter"
+    ) || (operation == "pull"
+        && matches!(
+            option,
+            "--rebase" | "--strategy" | "-s" | "--strategy-option" | "-X"
+        ))
+}
+
+fn operation_option_takes_value(operation: &str, option: &str) -> bool {
+    let option = option.split('=').next().unwrap_or(option);
+    matches!(
+        option,
+        "--receive-pack"
+            | "--exec"
+            | "--push-option"
+            | "-o"
+            | "--upload-pack"
+            | "--depth"
+            | "--deepen"
+            | "--shallow-since"
+            | "--shallow-exclude"
+            | "--server-option"
+            | "--jobs"
+            | "-j"
+            | "--negotiation-tip"
+            | "--refmap"
+            | "--filter"
+    ) || (operation == "pull" && matches!(option, "--strategy" | "-s" | "--strategy-option" | "-X"))
 }
 
 /// Read all configured remotes.  A remote's push URL wins over its fetch URL
@@ -991,5 +1451,204 @@ mod tests {
             panic!("expected the preferred mismatched remote");
         };
         assert_eq!(mismatch.name, "upstream");
+    }
+
+    #[test]
+    fn operation_remote_separates_pushurl_fetch_and_defaults() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("repository");
+        fs::create_dir_all(&path).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let configure = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        };
+        configure(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/project.git",
+        ]);
+        configure(&[
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            "git@github.com:acme/project.git",
+        ]);
+        configure(&[
+            "remote",
+            "add",
+            "backup",
+            "ssh://git@example.test/acme/backup.git",
+        ]);
+        configure(&["config", "remote.pushDefault", "backup"]);
+        let repository = discover(&path).unwrap();
+
+        let OperationRemote::Resolved(push) =
+            operation_remote(&repository, "push", &["push".into()]).unwrap()
+        else {
+            panic!("expected a default push remote");
+        };
+        assert_eq!(push.name, "backup");
+        assert!(push.transport.is_ssh());
+
+        let OperationRemote::Resolved(fetch) =
+            operation_remote(&repository, "fetch", &["fetch".into(), "origin".into()]).unwrap()
+        else {
+            panic!("expected origin fetch remote");
+        };
+        assert_eq!(fetch.transport, Transport::Https);
+        assert_eq!(fetch.url, "https://github.com/acme/project.git");
+
+        let OperationRemote::Resolved(push_origin) =
+            operation_remote(&repository, "push", &["push".into(), "origin".into()]).unwrap()
+        else {
+            panic!("expected origin push remote");
+        };
+        assert!(push_origin.transport.is_ssh());
+        assert_eq!(push_origin.url, "git@github.com:acme/project.git");
+    }
+
+    #[test]
+    fn operation_remote_handles_remote_update_and_unknown_targets_conservatively() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("repository");
+        fs::create_dir_all(&path).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        for (name, url) in [
+            ("origin", "https://github.com/acme/project.git"),
+            ("backup", "git@github.com:acme/backup.git"),
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(["remote", "add", name, url])
+                    .current_dir(&path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+        let repository = discover(&path).unwrap();
+        let OperationRemote::Multiple(remotes) =
+            operation_remote(&repository, "remote", &["remote".into(), "update".into()]).unwrap()
+        else {
+            panic!("expected every remote for remote update");
+        };
+        assert_eq!(remotes.len(), 2);
+        assert!(remotes.iter().any(|remote| remote.transport.is_ssh()));
+        assert!(
+            operation_remote(
+                &repository,
+                "fetch",
+                &["fetch".into(), "not-a-configured-remote".into()],
+            )
+            .unwrap()
+            .is_uncertain()
+        );
+        let OperationRemote::Multiple(remotes) =
+            operation_remote(&repository, "fetch", &["fetch".into(), "--all".into()]).unwrap()
+        else {
+            panic!("expected every remote for fetch --all");
+        };
+        assert_eq!(remotes.len(), 2);
+        assert!(remotes.iter().any(|remote| remote.transport.is_ssh()));
+        assert!(
+            operation_remote(
+                &repository,
+                "fetch",
+                &["fetch".into(), "--unrecognized-option".into()],
+            )
+            .unwrap()
+            .is_uncertain()
+        );
+    }
+
+    #[test]
+    fn operation_remote_uses_effective_rewrites_and_all_push_urls() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("repository");
+        fs::create_dir_all(&path).unwrap();
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .current_dir(&path)
+                .status()
+                .unwrap()
+                .success()
+        );
+        let configure = |args: &[&str]| {
+            assert!(
+                Command::new("git")
+                    .args(args)
+                    .current_dir(&path)
+                    .status()
+                    .unwrap()
+                    .success(),
+                "git {args:?} failed"
+            );
+        };
+        configure(&[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/project.git",
+        ]);
+        configure(&[
+            "config",
+            "url.git@github.com:.insteadOf",
+            "https://github.com/",
+        ]);
+        let repository = discover(&path).unwrap();
+        let OperationRemote::Resolved(fetch) =
+            operation_remote(&repository, "fetch", &["fetch".into(), "origin".into()]).unwrap()
+        else {
+            panic!("expected rewritten fetch remote");
+        };
+        assert!(fetch.transport.is_ssh());
+        assert_eq!(fetch.url, "git@github.com:acme/project.git");
+
+        configure(&[
+            "remote",
+            "set-url",
+            "--push",
+            "origin",
+            "https://github.com/acme/project.git",
+        ]);
+        configure(&[
+            "remote",
+            "set-url",
+            "--add",
+            "--push",
+            "origin",
+            "git@github.com:acme/project.git",
+        ]);
+        let OperationRemote::Multiple(pushes) =
+            operation_remote(&repository, "push", &["push".into(), "origin".into()]).unwrap()
+        else {
+            panic!("expected every push URL");
+        };
+        assert_eq!(pushes.len(), 2);
+        assert!(pushes.iter().any(|remote| remote.transport.is_ssh()));
     }
 }
