@@ -220,8 +220,9 @@ pub fn scan_entries(
     identities: Option<&EffectiveIdentities>,
 ) -> GitConfigReport {
     let mut diagnostics = Vec::new();
+    let effective_helpers = effective_credential_helpers(entries);
 
-    for entry in entries {
+    for (index, entry) in entries.iter().enumerate() {
         if is_ghis_fragment(entry) {
             continue;
         }
@@ -236,7 +237,19 @@ pub fn scan_entries(
         } else if key == "core.sshcommand" {
             inspect_ssh_command(entry, profile, remote, &mut diagnostics);
         } else if is_credential_helper(key) {
-            inspect_credential_helper(entry, profile, remote, &mut diagnostics);
+            if !effective_helpers[index] {
+                continue;
+            }
+            let ghis_reset = entry.value.trim().is_empty()
+                && entries[index + 1..]
+                    .iter()
+                    .enumerate()
+                    .any(|(offset, next)| {
+                        effective_helpers[index + 1 + offset]
+                            && next.key.eq_ignore_ascii_case(key)
+                            && is_ghis_helper(&next.value)
+                    });
+            inspect_credential_helper(entry, profile, remote, ghis_reset, &mut diagnostics);
         } else if is_extra_header(key) {
             inspect_extra_header(entry, profile, remote, &mut diagnostics);
         } else if is_url_rewrite(key) {
@@ -388,12 +401,13 @@ fn inspect_credential_helper(
     entry: &ConfigEntry,
     profile: Option<&Profile>,
     remote: Option<&Remote>,
+    ghis_reset: bool,
     diagnostics: &mut Vec<GitConfigDiagnostic>,
 ) {
     let managed = is_ghis_helper(&entry.value);
     let applies = entry_applies_to_host(entry, profile, remote);
     diagnostics.push(finding(
-        if managed {
+        if managed || ghis_reset {
             Severity::Info
         } else if applies {
             Severity::Warning
@@ -403,10 +417,12 @@ fn inspect_credential_helper(
         entry,
         if managed {
             "这是 ghis 安装的专用 credential helper；它会按当前 Profile 选择凭据"
+        } else if ghis_reset {
+            "这是 ghis helper 前的空值重置；它会清除继承的 helper，避免账号串用"
         } else {
             "credential helper 参与凭据查找；错误的链顺序可能让 Git 尝试另一个账号"
         },
-        if managed {
+        if managed || ghis_reset {
             "确认它前面的空值重置和 helper 链顺序没有被其他配置覆盖"
         } else {
             "检查 helper 的作用域和顺序；绑定仓库会为 Profile 主机安装专用 helper"
@@ -546,6 +562,53 @@ fn shell_quote_argument(value: &str) -> String {
 fn is_ghis_fragment(entry: &ConfigEntry) -> bool {
     let origin = entry.origin.replace('\\', "/").to_ascii_lowercase();
     origin.contains("/ghis/fragments/") || origin.contains("/ghis/fragments/config-")
+}
+
+/// Return only helper entries that can participate in the final helper chain.
+/// Git treats an empty helper value as a reset, so values before the last reset
+/// for the same key are shadowed. ghis's shell wrapper may also append the
+/// same reset/helper pair on the command line; those ephemeral duplicates are
+/// omitted when an equivalent non-command pair is already present.
+fn effective_credential_helpers(entries: &[ConfigEntry]) -> Vec<bool> {
+    let mut visible = vec![true; entries.len()];
+
+    for (index, entry) in entries.iter().enumerate() {
+        if !is_credential_helper(&entry.key) || entry.scope != "command" {
+            continue;
+        }
+        let duplicate = is_ghis_helper(&entry.value)
+            || (entry.value.trim().is_empty()
+                && entries[index + 1..].iter().any(|next| {
+                    next.scope == "command"
+                        && next.key.eq_ignore_ascii_case(&entry.key)
+                        && is_ghis_helper(&next.value)
+                }));
+        if duplicate
+            && entries[..index].iter().any(|previous| {
+                previous.scope != "command"
+                    && previous.key.eq_ignore_ascii_case(&entry.key)
+                    && (is_ghis_helper(&previous.value) || previous.value.trim().is_empty())
+            })
+        {
+            visible[index] = false;
+        }
+    }
+
+    let mut last_reset = std::collections::BTreeMap::<String, usize>::new();
+    for (index, entry) in entries.iter().enumerate() {
+        if visible[index] && is_credential_helper(&entry.key) && entry.value.trim().is_empty() {
+            last_reset.insert(entry.key.to_ascii_lowercase(), index);
+        }
+    }
+    for (index, entry) in entries.iter().enumerate() {
+        if !visible[index] || !is_credential_helper(&entry.key) {
+            continue;
+        }
+        if let Some(reset) = last_reset.get(&entry.key.to_ascii_lowercase()) {
+            visible[index] = index >= *reset;
+        }
+    }
+    visible
 }
 
 /// Recognize only the command shape ghis writes for its managed helper. A
@@ -870,13 +933,8 @@ mod tests {
             None,
             None,
         );
-        assert_eq!(report.warnings, 3);
-        assert!(
-            report
-                .diagnostics
-                .iter()
-                .any(|item| item.scope == "system" && item.origin == "file:/etc/gitconfig")
-        );
+        assert_eq!(report.warnings, 2);
+        assert!(report.diagnostics.iter().all(|item| item.scope != "system"));
         assert!(
             report
                 .diagnostics
@@ -889,8 +947,67 @@ mod tests {
                 .iter()
                 .map(|item| item.value.as_str())
                 .collect::<Vec<_>>(),
-            vec!["cache", "<空值：重置 helper 链>", "store"]
+            vec!["<空值：重置 helper 链>", "store"]
         );
+    }
+
+    #[test]
+    fn hides_shadowed_and_wrapper_duplicate_credential_helpers() {
+        let report = scan_entries(
+            &[
+                entry(
+                    "global",
+                    "file:/home/test/.gitconfig",
+                    "credential.https://github.com.helper",
+                    "",
+                ),
+                entry(
+                    "global",
+                    "file:/home/test/.gitconfig",
+                    "credential.https://github.com.helper",
+                    "!/usr/bin/gh auth git-credential",
+                ),
+                entry(
+                    "worktree",
+                    "file:.git/config.worktree",
+                    "credential.https://github.com.helper",
+                    "",
+                ),
+                entry(
+                    "worktree",
+                    "file:.git/config.worktree",
+                    "credential.https://github.com.helper",
+                    "!'/usr/bin/ghis' --config '/tmp/ghis.toml' credential-helper",
+                ),
+                entry(
+                    "command",
+                    "command line:",
+                    "credential.https://github.com.helper",
+                    "",
+                ),
+                entry(
+                    "command",
+                    "command line:",
+                    "credential.https://github.com.helper",
+                    "!'/usr/bin/ghis' --config '/tmp/ghis.toml' credential-helper",
+                ),
+            ],
+            Some(&profile()),
+            None,
+            None,
+        );
+        assert_eq!(report.warnings, 0);
+        assert_eq!(report.info, 2);
+        assert_eq!(
+            report
+                .diagnostics
+                .iter()
+                .map(|item| item.scope.as_str())
+                .collect::<Vec<_>>(),
+            vec!["worktree", "worktree"]
+        );
+        assert!(report.diagnostics[0].value.contains("重置 helper 链"));
+        assert_eq!(report.diagnostics[1].value, "<shell helper，内容已隐藏>");
     }
 
     #[test]
