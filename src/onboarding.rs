@@ -190,7 +190,6 @@ struct Wizard<'a> {
     setup_zsh: bool,
     review_selected: usize,
     error: Option<String>,
-    show_help: bool,
 }
 
 impl<'a> Wizard<'a> {
@@ -230,7 +229,6 @@ impl<'a> Wizard<'a> {
             setup_zsh: false,
             review_selected: 0,
             error: None,
-            show_help: false,
         }
     }
 
@@ -248,10 +246,6 @@ impl<'a> Wizard<'a> {
         if let Some(error) = self.error.as_deref() {
             lines.push(String::new());
             lines.push(format!("! {error}"));
-        }
-        if self.show_help {
-            lines.push(String::new());
-            lines.extend(self.help_lines());
         }
         lines
     }
@@ -303,7 +297,7 @@ impl<'a> Wizard<'a> {
                     lines.push(format!("! {notice}"));
                 }
                 lines.push(String::new());
-                lines.push("↑/k 上移  ↓/j 下移  h 返回  l/Enter 确认  ? 帮助  q 取消".into());
+                lines.push("↑/k 上移  ↓/j 下移  h 返回  l/Enter 确认  q 取消".into());
             }
             AccountMode::Host => {
                 lines.push("手动输入 GitHub host".into());
@@ -325,6 +319,13 @@ impl<'a> Wizard<'a> {
     fn render_identity(&self, lines: &mut Vec<String>) {
         lines.push("当前选择".into());
         lines.push(format!("  账号    {}@{}", self.login, self.host));
+        if matches!(
+            self.identity_field,
+            IdentityField::EmailMenu | IdentityField::ManualEmail
+        ) && !self.git_name.is_empty()
+        {
+            lines.push(format!("  姓名    {}", self.git_name));
+        }
         lines.push(String::new());
         match self.identity_field {
             IdentityField::ProfileId => {
@@ -342,12 +343,14 @@ impl<'a> Wizard<'a> {
                 lines.push("Enter 继续  Esc 返回  Ctrl+C 取消".into());
             }
             IdentityField::EmailMenu => {
-                if !self.git_name.is_empty() {
-                    lines.push(format!("  姓名    {}", self.git_name));
-                    lines.push(String::new());
-                }
                 lines.push("选择提交邮箱".into());
                 lines.push(String::new());
+                let email_width = self
+                    .email_candidates
+                    .iter()
+                    .map(|candidate| UnicodeWidthStr::width(candidate.email.as_str()))
+                    .max()
+                    .unwrap_or(0);
                 for (index, candidate) in self.email_candidates.iter().enumerate() {
                     let marker = if index == self.email_selected {
                         ">"
@@ -355,13 +358,18 @@ impl<'a> Wizard<'a> {
                         " "
                     };
                     let label = if candidate.noreply {
-                        "    GitHub noreply"
+                        "[GitHub noreply]"
                     } else if candidate.primary {
-                        "    首选"
+                        "[GitHub 主邮箱]"
+                    } else if candidate.verified {
+                        "[GitHub 已验证邮箱]"
                     } else {
-                        ""
+                        "[GitHub 账号邮箱]"
                     };
-                    lines.push(format!("  {marker} {}{label}", candidate.email));
+                    lines.push(format!(
+                        "  {marker} {}  {label}",
+                        pad_columns(&candidate.email, email_width)
+                    ));
                 }
                 let manual = self.email_candidates.len();
                 let marker = if self.email_selected == manual {
@@ -415,14 +423,13 @@ impl<'a> Wizard<'a> {
             } else {
                 " "
             };
-            let value = if index == 1 && self.repository.is_none() {
-                "不可用"
-            } else if enabled {
-                "已选择"
+            let checkbox = if enabled { "[x]" } else { "[ ]" };
+            let suffix = if index == 1 && self.repository.is_none() {
+                "（当前不可用）"
             } else {
-                "未选择"
+                ""
             };
-            lines.push(format!("  {marker} [{value}] {label}"));
+            lines.push(format!("  {marker} {checkbox} {label}{suffix}"));
         }
         lines.push(String::new());
         lines.push("j/k 移动  Space 切换  h 返回  l/Enter 继续  q 取消".into());
@@ -451,20 +458,6 @@ impl<'a> Wizard<'a> {
         lines.push("↑/k 上移  ↓/j 下移  h 返回  l/Enter 确认".into());
     }
 
-    fn help_lines(&self) -> Vec<String> {
-        if self.is_text_editing() {
-            vec![
-                "帮助：当前正在编辑文本，h/j/k/l 会作为普通字符输入。".into(),
-                "使用 Enter 继续、Esc 返回、Backspace 删除、Ctrl+C 取消。".into(),
-            ]
-        } else {
-            vec![
-                "帮助：方向键与 h/j/k/l 均可导航。".into(),
-                "j/k 或 ↓/↑ 移动，h 或 ← 返回，l、→ 或 Enter 确认。".into(),
-            ]
-        }
-    }
-
     fn is_text_editing(&self) -> bool {
         matches!(
             (self.step, self.account_mode, self.identity_field),
@@ -489,14 +482,9 @@ impl<'a> Wizard<'a> {
             return Some(FlowResult::Cancelled);
         }
         self.error = None;
-        if !self.is_text_editing() && key == InputKey::Character('?') {
-            self.show_help = !self.show_help;
-            return None;
-        }
         if !self.is_text_editing() && key == InputKey::Character('q') {
             return Some(FlowResult::Cancelled);
         }
-        self.show_help = false;
         match self.step {
             Step::Account => self.handle_account(key, candidate_loader),
             Step::Identity => self.handle_identity(key, candidate_loader),
@@ -1077,6 +1065,15 @@ fn next(current: usize, count: usize) -> usize {
     if count == 0 { 0 } else { (current + 1) % count }
 }
 
+fn pad_columns(value: &str, width: usize) -> String {
+    let current = UnicodeWidthStr::width(value);
+    if current >= width {
+        value.to_owned()
+    } else {
+        format!("{value}{}", " ".repeat(width - current))
+    }
+}
+
 fn yes_no(value: bool) -> &'static str {
     if value { "是" } else { "否" }
 }
@@ -1227,6 +1224,64 @@ mod tests {
                 .iter()
                 .all(|line| UnicodeWidthStr::width(line.as_str()) <= 11)
         );
+    }
+
+    #[test]
+    fn email_view_keeps_summary_compact_and_explains_sources() {
+        let config = Config::default();
+        let accounts = [account()];
+        let mut wizard = Wizard::new(&config, &accounts, None, None);
+        wizard.step = Step::Identity;
+        wizard.identity_field = IdentityField::EmailMenu;
+        wizard.host = "github.com".into();
+        wizard.login = "alice".into();
+        wizard.git_name = "Alice".into();
+        wizard.email_candidates = vec![
+            EmailCandidate {
+                email: "12345+alice@users.noreply.github.com".into(),
+                noreply: true,
+                verified: true,
+                ..EmailCandidate::default()
+            },
+            EmailCandidate {
+                email: "alice@example.test".into(),
+                primary: true,
+                verified: true,
+                ..EmailCandidate::default()
+            },
+        ];
+        let lines = wizard.frame(80);
+        let account_line = lines
+            .iter()
+            .position(|line| line.starts_with("  账号"))
+            .unwrap();
+        assert_eq!(lines[account_line + 1], "  姓名    Alice");
+        let noreply = lines
+            .iter()
+            .find(|line| line.contains("[GitHub noreply]"))
+            .unwrap();
+        let primary = lines
+            .iter()
+            .find(|line| line.contains("[GitHub 主邮箱]"))
+            .unwrap();
+        assert_eq!(
+            noreply.find('[').unwrap(),
+            primary.find('[').unwrap(),
+            "邮箱来源标签应当对齐"
+        );
+    }
+
+    #[test]
+    fn options_use_plain_checkboxes_without_help_prompt() {
+        let config = Config::default();
+        let accounts = [account()];
+        let mut wizard = Wizard::new(&config, &accounts, None, None);
+        wizard.step = Step::Options;
+        let lines = wizard.frame(80).join("\n");
+        assert!(lines.contains("[x] 设为默认 Profile"));
+        assert!(lines.contains("[ ] 安装 zsh wrapper"));
+        assert!(!lines.contains("已选择"));
+        assert!(!lines.contains("? 帮助"));
     }
 
     #[test]
