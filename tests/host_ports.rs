@@ -17,6 +17,7 @@ fn enterprise_remote_port_participates_in_host_rule_resolution() {
         repo: remote.repo,
         remote: Some(remote.url),
         gitdir: None,
+        cwd: None,
     };
 
     assert_eq!(

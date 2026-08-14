@@ -339,6 +339,7 @@ pub struct Rule {
     pub repo: Option<String>,
     pub remote: Option<String>,
     pub gitdir: Option<String>,
+    pub cwd: Option<String>,
 }
 
 /// Top-level ghis configuration.
@@ -580,6 +581,16 @@ impl Config {
                     rule.id
                 )));
             }
+            if rule
+                .cwd
+                .as_deref()
+                .is_some_and(|pattern| build_rule_glob(&expand_home(pattern)).is_err())
+            {
+                return Err(ConfigError::Validation(format!(
+                    "规则 `{}` 的 `cwd` glob 模式无效",
+                    rule.id
+                )));
+            }
         }
         Ok(())
     }
@@ -756,7 +767,7 @@ fn merge_rules(destination: &mut Item, source: &Item) {
                 &mut destination_item,
                 &source_item,
                 &[
-                    "id", "profile", "priority", "host", "owner", "repo", "remote", "gitdir",
+                    "id", "profile", "priority", "host", "owner", "repo", "remote", "gitdir", "cwd",
                 ],
             );
             table = destination_item
@@ -878,7 +889,7 @@ fn merge_item(destination: &mut Item, source: &Item) {
     }
 }
 
-/// Values available to a rule matcher for one repository.
+/// Values available to a rule matcher for one operation.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuleContext {
     pub host: Option<String>,
@@ -886,6 +897,7 @@ pub struct RuleContext {
     pub repo: Option<String>,
     pub remote: Option<String>,
     pub gitdir: Option<PathBuf>,
+    pub cwd: Option<PathBuf>,
 }
 
 impl RuleContext {
@@ -903,6 +915,7 @@ impl RuleContext {
             repo: repo.map(Into::into),
             remote: remote.map(Into::into),
             gitdir: gitdir.map(Into::into),
+            cwd: None,
         }
     }
 }
@@ -980,6 +993,11 @@ pub fn rule_matches(rule: &Rule, context: &RuleContext) -> bool {
             .is_some_and(|actual| glob_matches(pattern, actual))
     }) && rule.gitdir.as_deref().is_none_or(|pattern| {
         context.gitdir.as_deref().is_some_and(|actual| {
+            let expanded = expand_home(pattern);
+            glob_matches(&expanded, &actual.to_string_lossy())
+        })
+    }) && rule.cwd.as_deref().is_none_or(|pattern| {
+        context.cwd.as_deref().is_some_and(|actual| {
             let expanded = expand_home(pattern);
             glob_matches(&expanded, &actual.to_string_lossy())
         })
@@ -1204,13 +1222,15 @@ mod tests {
 
     #[test]
     fn invalid_rule_globs_are_rejected_without_exposing_the_pattern() {
-        for (field, remote, gitdir) in [
+        for (field, remote, gitdir, cwd) in [
             (
                 "remote",
                 Some("https://credential-marker@example.test/["),
                 None,
+                None,
             ),
-            ("gitdir", None, Some("/private/credential-marker/[")),
+            ("gitdir", None, Some("/private/credential-marker/["), None),
+            ("cwd", None, None, Some("/private/credential-marker/[")),
         ] {
             let mut config = Config::default();
             config.profiles.insert("work".into(), profile());
@@ -1219,6 +1239,7 @@ mod tests {
                 profile: "work".into(),
                 remote: remote.map(str::to_owned),
                 gitdir: gitdir.map(str::to_owned),
+                cwd: cwd.map(str::to_owned),
                 ..Rule::default()
             });
 
@@ -1237,6 +1258,7 @@ mod tests {
         for (field, pattern) in [
             ("remote", "https://credential-marker@example.test/["),
             ("gitdir", "/private/credential-marker/["),
+            ("cwd", "/private/credential-marker/["),
         ] {
             let path = dir.path().join(format!("invalid-{field}.toml"));
             fs::write(
@@ -1278,12 +1300,44 @@ profile = "work"
             repo: Some("literal[repo".into()),
             remote: Some("https://github.com/**".into()),
             gitdir: Some(r"C:\work\".into()),
+            cwd: Some("~/discussions/**".into()),
             ..Rule::default()
         });
 
         config
             .validate()
             .expect("repo remains exact and backslashes remain literal in globs");
+    }
+
+    #[test]
+    fn cwd_rules_match_the_working_directory_and_combine_with_targets() {
+        let rule = Rule {
+            id: "discussion-project".into(),
+            profile: "work".into(),
+            host: Some("github.com".into()),
+            repo: Some("project".into()),
+            cwd: Some("/workspace/discussions/**".into()),
+            ..Rule::default()
+        };
+        let matching = RuleContext {
+            host: Some("github.com".into()),
+            repo: Some("project".into()),
+            cwd: Some("/workspace/discussions/topic".into()),
+            ..RuleContext::default()
+        };
+        assert!(rule_matches(&rule, &matching));
+
+        let outside = RuleContext {
+            cwd: Some("/workspace/projects/topic".into()),
+            ..matching.clone()
+        };
+        assert!(!rule_matches(&rule, &outside));
+
+        let wrong_target = RuleContext {
+            repo: Some("other".into()),
+            ..matching
+        };
+        assert!(!rule_matches(&rule, &wrong_target));
     }
 
     #[test]
@@ -1532,6 +1586,7 @@ priority = 1
         let mut config = Config::load(&path).unwrap();
         config.rules[0].priority = 50;
         config.rules[0].remote = None;
+        config.rules[0].cwd = Some("~/discussions/**".into());
         config.rules.remove(1);
         config.save(&path).unwrap();
 
@@ -1539,6 +1594,7 @@ priority = 1
         assert!(saved.contains("# keep this rule comment"));
         assert!(saved.contains("future_rule = \"keep\""));
         assert!(saved.contains("priority = 50"));
+        assert!(saved.contains("cwd = \"~/discussions/**\""));
         assert!(!saved.contains("remote ="));
         assert!(!saved.contains("obsolete-rule"));
         assert_eq!(Config::load(path).unwrap().rules.len(), 1);

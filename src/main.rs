@@ -441,6 +441,9 @@ struct RuleArgs {
     remote: Option<String>,
     #[arg(long)]
     gitdir: Option<String>,
+    /// 匹配执行 ghis 时的工作目录，支持 glob 和 ~
+    #[arg(long)]
+    cwd: Option<String>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -1519,6 +1522,7 @@ fn rule_command(path: Option<&Path>, command: RuleCommand) -> app::Result<i32> {
                         ("仓库", rule.repo.as_deref()),
                         ("远端", rule.remote.as_deref()),
                         ("Git 目录", rule.gitdir.as_deref()),
+                        ("工作目录", rule.cwd.as_deref()),
                     ];
                     if matches.iter().any(|(_, value)| value.is_some()) {
                         println!("  匹配条件：");
@@ -1582,6 +1586,7 @@ fn rule_from_args(args: RuleArgs) -> Rule {
         repo: args.repo,
         remote: args.remote,
         gitdir: args.gitdir,
+        cwd: args.cwd,
     }
 }
 

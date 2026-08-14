@@ -932,6 +932,150 @@ case "$GH_HOST" in github.com|git.example.test) exit 0 ;; *) exit 91 ;; esac
 }
 
 #[test]
+fn cwd_rules_select_profiles_from_non_git_directories() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let matching = temp.path().join("home/discussions/topic");
+    let outside = temp.path().join("home/other/topic");
+    fs::create_dir_all(&matching).expect("matching directory");
+    fs::create_dir_all(&outside).expect("outside directory");
+    let config_directory = temp.path().join("config/ghis");
+    fs::create_dir_all(&config_directory).expect("config directory");
+    fs::write(
+        config_directory.join("config.toml"),
+        r#"version = 1
+
+[behavior]
+default_profile = "personal"
+
+[profiles.personal]
+host = "github.com"
+login = "personal"
+git_name = "Personal"
+git_email = "personal@example.test"
+
+[profiles.work]
+host = "github.com"
+login = "work"
+git_name = "Work"
+git_email = "work@example.test"
+
+[[rules]]
+id = "discussion-directory"
+profile = "work"
+priority = 100
+cwd = "~/discussions/**"
+"#,
+    )
+    .expect("config");
+    let bin = temp.path().join("bin");
+    let trace = temp.path().join("gh.trace");
+    fs::create_dir_all(&bin).expect("bin directory");
+    write_executable(
+        &bin.join("gh"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_GH_TRACE"
+case "$*" in
+  "auth token --hostname github.com --user work") printf 'work-token\n'; exit 0 ;;
+  "auth token --hostname github.com --user personal") printf 'personal-token\n'; exit 0 ;;
+  "issue list --repo acme/project")
+    [ "$GH_HOST" = github.com ] || exit 71
+    [ "$GH_TOKEN" = work-token ] || [ "$GH_TOKEN" = personal-token ] || exit 72
+    exit 0
+    ;;
+  *) exit 73 ;;
+esac
+"#,
+    );
+
+    let mut matching_command = isolated_ghis_command();
+    matching_command
+        .current_dir(&matching)
+        .args(["gh", "--", "issue", "list", "--repo", "acme/project"])
+        .env("PATH", prepend_path(&bin))
+        .env("FAKE_GH_TRACE", &trace);
+    for (key, value) in xdg_environment(&temp) {
+        matching_command.env(key, value);
+    }
+    matching_command.assert().success();
+    assert!(
+        fs::read_to_string(&trace)
+            .expect("matching gh trace")
+            .contains("auth token --hostname github.com --user work")
+    );
+
+    fs::remove_file(&trace).expect("clear matching trace");
+    let mut outside_command = isolated_ghis_command();
+    outside_command
+        .current_dir(&outside)
+        .args(["gh", "--", "issue", "list", "--repo", "acme/project"])
+        .env("PATH", prepend_path(&bin))
+        .env("FAKE_GH_TRACE", &trace);
+    for (key, value) in xdg_environment(&temp) {
+        outside_command.env(key, value);
+    }
+    outside_command.assert().success();
+    assert!(
+        fs::read_to_string(&trace)
+            .expect("outside gh trace")
+            .contains("auth token --hostname github.com --user personal")
+    );
+}
+
+#[test]
+fn rule_cli_adds_and_lists_cwd_conditions() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let config_directory = temp.path().join("config/ghis");
+    fs::create_dir_all(&config_directory).expect("config directory");
+    fs::write(
+        config_directory.join("config.toml"),
+        r#"version = 1
+
+[profiles.work]
+host = "github.com"
+login = "work"
+git_name = "Work"
+git_email = "work@example.test"
+"#,
+    )
+    .expect("config");
+
+    let mut add = isolated_ghis_command();
+    add.args([
+        "rule",
+        "add",
+        "discussion-directory",
+        "--profile",
+        "work",
+        "--priority",
+        "50",
+        "--cwd",
+        "~/discussions/**",
+    ]);
+    for (key, value) in xdg_environment(&temp) {
+        add.env(key, value);
+    }
+    add.assert().success();
+
+    let mut list = isolated_ghis_command();
+    list.args(["rule", "list"]);
+    for (key, value) in xdg_environment(&temp) {
+        list.env(key, value);
+    }
+    list.assert()
+        .success()
+        .stdout(predicate::str::contains("工作目录：~/discussions/**"));
+
+    let mut json = isolated_ghis_command();
+    json.args(["rule", "list", "--json"]);
+    for (key, value) in xdg_environment(&temp) {
+        json.env(key, value);
+    }
+    json.assert()
+        .success()
+        .stdout(predicate::str::contains("\"cwd\": \"~/discussions/**\""));
+}
+
+#[test]
 fn explicit_profile_still_precedes_gh_target_and_number_only_does_not_guess() {
     let temp = tempfile::tempdir().expect("temporary directory");
     write_default_profile(&temp);

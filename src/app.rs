@@ -90,8 +90,9 @@ impl AppContext {
         explicit: Option<&str>,
         target: Option<&GhProfileTarget>,
     ) -> Result<Self> {
+        let cwd = std::path::absolute(cwd.as_ref())?;
         let mut warnings = Vec::new();
-        let (repository, remote, binding, identities) = match repo::discover(cwd.as_ref()) {
+        let (repository, remote, binding, identities) = match repo::discover(&cwd) {
             Ok(repository) => {
                 let remote = repo::primary_remote(&repository)?;
                 let binding = repo::local_config(&repository, PROFILE_CONFIG_KEY)?;
@@ -109,6 +110,7 @@ impl AppContext {
                     repo: remote.repo.clone(),
                     remote: Some(remote.url.clone()),
                     gitdir: repository.as_ref().map(|item| item.git_dir.clone()),
+                    cwd: Some(cwd.clone()),
                 },
                 unique_profile_for_target(&config, remote.host.as_deref(), remote.owner.as_deref()),
             )
@@ -116,14 +118,16 @@ impl AppContext {
             (
                 RuleContext {
                     gitdir: repository.as_ref().map(|item| item.git_dir.clone()),
+                    cwd: Some(cwd.clone()),
                     ..RuleContext::default()
                 },
                 None,
             )
         };
-        let context = target
+        let mut context = target
             .map(|target| target.context.clone())
             .unwrap_or(repository_context);
+        context.cwd = Some(cwd);
         let github_match = if target.is_some() {
             unique_profile_for_target(&config, context.host.as_deref(), context.owner.as_deref())
         } else {

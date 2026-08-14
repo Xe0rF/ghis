@@ -6,7 +6,7 @@
 
 ## 核心能力
 
-- 按仓库绑定身份，也可用规则、remote owner 或默认值自动选择。
+- 按仓库绑定身份，也可用规则、工作目录、remote owner 或默认值自动选择。
 - 提供完整 CLI 和透明的 zsh wrapper。
 - 自动发现 `gh` 已保存的账号，并为 HTTPS 操作精确选择对应凭据。
 - 可选集成 1Password SSH Agent 和 `op-ssh-sign`，为不同 Profile 使用不同的 SSH commit signing key。
@@ -126,9 +126,23 @@ ghis sync                           # 重建 Profile 配置片段并检查已登
 在非 Git 目录中也可以把仓库或 PR/Issue URL 作为显式目标；ghis 会先从目标 host/owner 解析 Profile，再在取得 token 前验证主机：
 
 ```sh
-ghis gh -- --repo OWNER/REPO issue list
+ghis gh -- issue list --repo OWNER/REPO
 ghis gh -- pr view https://github.com/OWNER/REPO/pull/123
 ```
+
+也可以用规则让某个普通工作目录自动选择 Profile。`--cwd` 匹配执行 ghis 时的绝对工作目录，支持 glob 和 `~` 展开；它与只匹配 Git 元数据目录的 `--gitdir` 不同，因此在非 Git 目录中也有效：
+
+```sh
+ghis rule add discussions-xe0rf \
+  --profile xe0rf \
+  --priority 50 \
+  --cwd '~/discussions/**'
+
+cd ~/discussions/project-a
+ghis gh -- issue list --repo OWNER/REPO
+```
+
+`--cwd` 可以与 `--host`、`--owner`、`--repo` 组合，使规则同时限制工作目录和 GitHub 目标。规则仍遵循显式 `--profile`、仓库绑定、规则优先级和歧义检测；规则只在运行时选择身份，不会把非 Git 目录绑定成仓库。
 
 ### 远程开发与 SSH Agent forwarding
 
