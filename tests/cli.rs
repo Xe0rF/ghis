@@ -1519,15 +1519,11 @@ exec "$GHIS_REAL_GIT" "$@"
     fs::write(
         &probe,
         format!(
-            "#!/usr/bin/zsh -f\nsource {}\ngit tty-probe\n",
+            "source {}\ngit tty-probe\n",
             ghis::shell::shell_quote(&init.to_string_lossy())
         ),
     )
     .expect("probe");
-    let mut probe_permissions = fs::metadata(&probe).unwrap().permissions();
-    probe_permissions.set_mode(0o755);
-    fs::set_permissions(&probe, probe_permissions).unwrap();
-
     let ghis_bin = assert_cmd::cargo::cargo_bin!("ghis");
     let binary_dir = ghis_bin.parent().unwrap();
     let inherited = std::env::var_os("PATH").unwrap_or_default();
@@ -1545,7 +1541,8 @@ exec "$GHIS_REAL_GIT" "$@"
             .expect("real git in PATH")
             .into_os_string()
     });
-    let mut command = Command::new(&probe);
+    let mut command = Command::new("zsh");
+    command.arg("-f").arg(&probe);
     command
         .current_dir(temp.path())
         .env("PATH", path)
