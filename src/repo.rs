@@ -1308,6 +1308,7 @@ mod tests {
             .unwrap();
         assert!(init.status.success());
         let repository = discover(repository_path.join("nested")).unwrap();
+        let repository_path = fs::canonicalize(repository_path).unwrap();
         assert_eq!(repository.root.as_deref(), Some(repository_path.as_path()));
         assert_eq!(repository.git_dir, repository_path.join(".git"));
     }

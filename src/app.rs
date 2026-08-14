@@ -423,13 +423,13 @@ pub fn bind_repository(ctx: &AppContext, id: &str) -> Result<()> {
     let fragment = write_profile_fragment(&ctx.paths, id, profile)?;
     remove_managed_credential_helpers(repository)?;
     git::set_git_config(repository, PROFILE_CONFIG_KEY, id)?;
-    let include_keys = profile_include_keys(repository);
-    for old_key in &include_keys {
-        unset_profile_include(repository, old_key)?;
+    let include_key = profile_include_key(repository);
+    for old_key in profile_include_cleanup_keys(repository) {
+        unset_profile_include(repository, &old_key)?;
     }
     repo::add_local_config(
         repository,
-        &include_keys[0],
+        &include_key,
         fragment.to_string_lossy().as_ref(),
     )?;
     let helper = credential_helper_command(&ctx.paths);
@@ -448,7 +448,7 @@ pub fn unbind_repository(ctx: &AppContext) -> Result<()> {
         .as_ref()
         .ok_or_else(|| AppError::Message("当前目录不是 Git 仓库".into()))?;
     git::unset_git_config(repository, PROFILE_CONFIG_KEY)?;
-    for include_key in profile_include_keys(repository) {
+    for include_key in profile_include_cleanup_keys(repository) {
         unset_profile_include(repository, &include_key)?;
     }
     remove_managed_credential_helpers(repository)?;
@@ -521,14 +521,26 @@ fn unset_profile_include(repository: &Repository, key: &str) -> Result<()> {
     Ok(())
 }
 
-fn profile_include_keys(repository: &Repository) -> [String; 2] {
+fn profile_include_key(repository: &Repository) -> String {
+    let gitdir = fs::canonicalize(&repository.git_dir)
+        .unwrap_or_else(|_| repository.git_dir.clone())
+        .to_string_lossy()
+        .replace('\\', "/");
+    format!("includeIf.gitdir:{gitdir}.path")
+}
+
+fn profile_include_cleanup_keys(repository: &Repository) -> Vec<String> {
     let gitdir = repository.git_dir.to_string_lossy().replace('\\', "/");
-    // Git's dotted key syntax is `includeIf.<condition>.path`; keep the legacy
-    // key as the second entry so upgrades and unbind both remove it.
-    [
+    let mut keys = vec![profile_include_key(repository)];
+    for key in [
         format!("includeIf.gitdir:{gitdir}.path"),
         format!("includeIf.gitdir:{gitdir}/.path"),
-    ]
+    ] {
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
 }
 
 pub fn sync_fragments(paths: &ConfigPaths, config: &Config) -> Result<Vec<PathBuf>> {
@@ -2328,7 +2340,7 @@ fn repository_binding_needs_repair(ctx: &AppContext) -> Result<bool> {
     if fs::read_to_string(&fragment).ok().as_deref() != Some(expected_fragment.as_str()) {
         return Ok(true);
     }
-    let include_key = profile_include_keys(repository)[0].clone();
+    let include_key = profile_include_key(repository);
     let configured = repo::local_config(repository, &include_key)?;
     if configured.as_deref() != Some(fragment.to_string_lossy().as_ref()) {
         return Ok(true);
