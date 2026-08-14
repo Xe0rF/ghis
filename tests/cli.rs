@@ -115,7 +115,11 @@ fn run_in_pseudo_terminal(command: &mut Command) -> io::Result<ExitStatus> {
             if libc::setsid() == -1 {
                 return Err(io::Error::last_os_error());
             }
-            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) == -1 {
+            #[cfg(target_os = "macos")]
+            let tiocsctty = u64::from(libc::TIOCSCTTY);
+            #[cfg(not(target_os = "macos"))]
+            let tiocsctty = libc::TIOCSCTTY;
+            if libc::ioctl(libc::STDIN_FILENO, tiocsctty, 0) == -1 {
                 return Err(io::Error::last_os_error());
             }
             Ok(())
