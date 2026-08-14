@@ -86,6 +86,28 @@ ghis gh -- --repo OWNER/REPO issue list
 ghis gh -- pr view https://github.com/OWNER/REPO/pull/123
 ```
 
+### 远程开发与 SSH Agent forwarding
+
+在远程开发机上使用本地 1Password SSH Agent 时，先由用户自行配置 SSH forwarding，例如 `ssh -A user@host` 或本地 `~/.ssh/config` 的 `ForwardAgent yes`；远端 SSH 服务端也必须允许 `AllowAgentForwarding yes`。登录后 OpenSSH 会为当前会话设置临时 `SSH_AUTH_SOCK`。
+
+Profile 可以明确使用转发 Agent 进行 SSH commit signing：
+
+```toml
+[profiles.work.signing]
+enabled = true
+transport = "forwarded-agent"
+signing_key = "/home/user/.ssh/work-signing.pub"
+fingerprint = "SHA256:example"
+```
+
+`forwarded-agent` 只使用当前会话的 `SSH_AUTH_SOCK`，要求显式 public key 或 fingerprint 精确匹配；它不会查找本地 1Password socket、写入 `IdentityAgent`、覆盖 socket、自动开启 `ForwardAgent` 或把本机 `op-ssh-sign` 路径写到远端。ghis 不传输、导出或同步私钥，也不绕过 1Password 的本地批准。未显式配置 `program` 时使用远端 Git/OpenSSH 默认 SSH signer；只有显式配置的签名程序不可执行时，签名操作才会停止。
+
+`local-agent` 是旧配置的默认 transport，继续使用本机 Agent/1Password 的现有发现行为。远程 forwarding、VS Code Remote、多跳 SSH 和容器的安全边界与排障步骤见 [Wiki](../../wiki) 的 [Remote Development and Agent Forwarding](../../wiki/Remote-Development-and-Agent-Forwarding)。
+
+### 多 remote 与 push URL
+
+Git 的 fetch 与 push 可能使用不同 URL。`git push backup` 按目标 remote 的 push URL、`remote.pushDefault` 或 branch push remote 选择；多个 `pushurl` 和 `insteadOf`/`pushInsteadOf` rewrite 还可能使一次操作访问多个或不同 transport。ghis 按具体操作检查实际目标，无法确认时保持保守策略；不会只依据 `origin` 猜测 SSH 安全状态。
+
 ## Agentic coding CLI
 
 推荐通过 launcher 启动，使模型在第一条消息前就获得当前、脱敏的身份上下文：
