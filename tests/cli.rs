@@ -72,12 +72,39 @@ fn isolated_git_command() -> AssertCommand {
 }
 
 fn xdg_environment(temp: &TempDir) -> [(String, PathBuf); 4] {
+    let root = fs::canonicalize(temp.path()).unwrap_or_else(|_| temp.path().to_owned());
     [
-        ("HOME".into(), temp.path().join("home")),
-        ("XDG_CONFIG_HOME".into(), temp.path().join("config")),
-        ("XDG_CACHE_HOME".into(), temp.path().join("cache")),
-        ("XDG_STATE_HOME".into(), temp.path().join("state")),
+        ("HOME".into(), root.join("home")),
+        ("XDG_CONFIG_HOME".into(), root.join("config")),
+        ("XDG_CACHE_HOME".into(), root.join("cache")),
+        ("XDG_STATE_HOME".into(), root.join("state")),
     ]
+}
+
+fn pseudo_terminal_command(command: &Path) -> Command {
+    let mut pseudo_terminal = Command::new("script");
+    #[cfg(target_os = "macos")]
+    pseudo_terminal.args(["-q", "-e", "/dev/null"]).arg(command);
+    #[cfg(not(target_os = "macos"))]
+    pseudo_terminal
+        .args(["-q", "-e", "-c"])
+        .arg(command)
+        .arg("/dev/null");
+    pseudo_terminal
+}
+
+fn pseudo_terminal_shell(command: &str) -> Command {
+    let mut pseudo_terminal = Command::new("script");
+    #[cfg(target_os = "macos")]
+    pseudo_terminal
+        .args(["-q", "-e", "/dev/null", "/bin/sh", "-c"])
+        .arg(command);
+    #[cfg(not(target_os = "macos"))]
+    pseudo_terminal
+        .args(["-q", "-e", "-c"])
+        .arg(command)
+        .arg("/dev/null");
+    pseudo_terminal
 }
 
 fn write_default_profile(temp: &TempDir) {
@@ -1478,11 +1505,8 @@ exec "$GHIS_REAL_GIT" "$@"
             .expect("real git in PATH")
             .into_os_string()
     });
-    let mut command = Command::new("script");
+    let mut command = pseudo_terminal_command(&probe);
     command
-        .args(["-q", "-e", "-c"])
-        .arg(&probe)
-        .arg("/dev/null")
         .current_dir(temp.path())
         .env("PATH", path)
         .env("GHIS_REAL_GIT", real_git)
@@ -1509,11 +1533,8 @@ fn agent_setup_claude_requires_confirmation_before_writing_settings() {
         ghis::shell::shell_quote(&ghis_bin.to_string_lossy()),
         ghis::shell::shell_quote(&project.to_string_lossy())
     );
-    let mut command = Command::new("script");
+    let mut command = pseudo_terminal_shell(&invocation);
     command
-        .args(["-q", "-e", "-c"])
-        .arg(invocation)
-        .arg("/dev/null")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1605,11 +1626,8 @@ esac
         ghis::shell::shell_quote(&binary.to_string_lossy()),
         ghis::shell::shell_quote(&repository.to_string_lossy())
     );
-    let mut command = Command::new("script");
+    let mut command = pseudo_terminal_shell(&child_command);
     command
-        .args(["-q", "-e", "-c"])
-        .arg(child_command)
-        .arg("/dev/null")
         .env("PATH", prepend_path(&fake_bin))
         .env("NO_COLOR", "1")
         .env("COLUMNS", "80")
