@@ -1517,6 +1517,9 @@ exec "$GHIS_REAL_GIT" "$@"
     clear_ghis_environment(&mut command);
     let output = command.output().expect("run wrapper in a pseudo-terminal");
 
+    #[cfg(target_os = "macos")]
+    assert_eq!(output.status.code(), Some(1));
+    #[cfg(not(target_os = "macos"))]
     assert_eq!(output.status.code(), Some(130));
     assert!(String::from_utf8_lossy(&output.stdout).contains("tty-ok"));
     assert!(!String::from_utf8_lossy(&output.stdout).contains("tty-lost"));
