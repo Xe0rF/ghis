@@ -4,11 +4,13 @@ use assert_cmd::Command as AssertCommand;
 use ghis::config::{Config, SshMode};
 use predicates::prelude::*;
 use std::fs;
-use std::os::fd::OwnedFd;
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
 use tempfile::TempDir;
 
 const GHIS_CONTROL_ENV: [&str; 10] = [
@@ -81,16 +83,49 @@ fn xdg_environment(temp: &TempDir) -> [(String, PathBuf); 4] {
     ]
 }
 
-fn pseudo_terminal_command(command: &Path) -> Command {
-    let mut pseudo_terminal = Command::new("script");
-    #[cfg(target_os = "macos")]
-    pseudo_terminal.args(["-q", "-e", "/dev/null"]).arg(command);
-    #[cfg(not(target_os = "macos"))]
-    pseudo_terminal
-        .args(["-q", "-e", "-c"])
-        .arg(command)
-        .arg("/dev/null");
-    pseudo_terminal
+fn run_in_pseudo_terminal(command: &mut Command) -> io::Result<ExitStatus> {
+    let mut master = -1;
+    let mut slave = -1;
+    if unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let master = unsafe { OwnedFd::from_raw_fd(master) };
+    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+    for descriptor in [&master, &slave] {
+        if unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+
+    command
+        .stdin(Stdio::from(slave.try_clone()?))
+        .stdout(Stdio::from(slave.try_clone()?))
+        .stderr(Stdio::from(slave.try_clone()?));
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::ioctl(libc::STDIN_FILENO, libc::TIOCSCTTY, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn()?;
+    drop(slave);
+    let status = child.wait();
+    drop(master);
+    status
 }
 
 fn pseudo_terminal_shell(command: &str) -> Command {
@@ -1506,7 +1541,7 @@ exec "$GHIS_REAL_GIT" "$@"
             .expect("real git in PATH")
             .into_os_string()
     });
-    let mut command = pseudo_terminal_command(&probe);
+    let mut command = Command::new(&probe);
     command
         .current_dir(temp.path())
         .env("PATH", path)
@@ -1517,12 +1552,9 @@ exec "$GHIS_REAL_GIT" "$@"
         .env("XDG_CACHE_HOME", temp.path().join("cache"))
         .env("XDG_STATE_HOME", temp.path().join("state"));
     clear_ghis_environment(&mut command);
-    let output = command.output().expect("run wrapper in a pseudo-terminal");
+    let status = run_in_pseudo_terminal(&mut command).expect("run wrapper in a pseudo-terminal");
 
-    #[cfg(target_os = "macos")]
-    assert_eq!(output.status.code(), Some(1));
-    #[cfg(not(target_os = "macos"))]
-    assert_eq!(output.status.code(), Some(130));
+    assert_eq!(status.code(), Some(130));
     assert_eq!(
         fs::read_to_string(tty_trace).expect("TTY trace"),
         "tty-ok\n"
