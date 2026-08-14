@@ -227,7 +227,7 @@ pub fn scan_entries(
         }
         let key = entry.key.as_str();
         if matches!(key, "user.name" | "user.email") {
-            inspect_identity_entry(entry, profile, &mut diagnostics);
+            inspect_identity_entry(entry, profile, identities, &mut diagnostics);
         } else if matches!(
             key,
             "user.signingkey" | "commit.gpgsign" | "gpg.format" | "gpg.ssh.program"
@@ -251,11 +251,18 @@ pub fn scan_entries(
 fn inspect_identity_entry(
     entry: &ConfigEntry,
     profile: Option<&Profile>,
+    identities: Option<&EffectiveIdentities>,
     diagnostics: &mut Vec<GitConfigDiagnostic>,
 ) {
     let Some(profile) = profile else {
         return;
     };
+    // Once Git's effective author/committer identities are available, the
+    // final-value check below is authoritative. Lower-priority values are
+    // valid fallbacks and must not be reported as current-repository conflicts.
+    if identities.is_some() {
+        return;
+    }
     let expected = if entry.key == "user.name" {
         &profile.git_name
     } else {
@@ -757,6 +764,38 @@ mod tests {
         let report = scan_entries(&[], Some(&profile()), None, Some(&identities));
         assert_eq!(report.errors, 1);
         assert_eq!(report.diagnostics[0].key, "effective.author");
+    }
+
+    #[test]
+    fn ignores_overridden_identity_entries_when_effective_identity_matches() {
+        let configured = profile();
+        let identities = EffectiveIdentities {
+            author: GitIdentity {
+                name: configured.git_name.clone(),
+                email: configured.git_email.clone(),
+                raw: String::new(),
+            },
+            committer: GitIdentity {
+                name: configured.git_name.clone(),
+                email: configured.git_email.clone(),
+                raw: String::new(),
+            },
+        };
+        let report = scan_entries(
+            &[
+                entry("global", "file:/home/test/.gitconfig", "user.name", "Other"),
+                entry(
+                    "global",
+                    "file:/home/test/.gitconfig",
+                    "user.email",
+                    "other@example.test",
+                ),
+            ],
+            Some(&configured),
+            None,
+            Some(&identities),
+        );
+        assert_eq!(report, GitConfigReport::default());
     }
 
     #[test]
