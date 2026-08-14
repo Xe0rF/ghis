@@ -358,11 +358,15 @@ fn profile_fragment_content(profile: &Profile) -> String {
         .enabled
         .then(|| {
             signing.signing_key.clone().or_else(|| {
-                profile
-                    .ssh
-                    .as_ref()
-                    .and_then(|ssh| ssh.public_key.as_ref())
-                    .map(|path| path.to_string_lossy().into_owned())
+                if signing.fingerprint.is_some() {
+                    None
+                } else {
+                    profile
+                        .ssh
+                        .as_ref()
+                        .and_then(|ssh| ssh.public_key.as_ref())
+                        .map(|path| path.to_string_lossy().into_owned())
+                }
             })
         })
         .flatten();
@@ -374,8 +378,12 @@ fn profile_fragment_content(profile: &Profile) -> String {
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned())
                 .or_else(|| {
-                    signing::discover_signing_program(None)
-                        .map(|program| program.path.to_string_lossy().into_owned())
+                    matches!(signing.transport, config::SigningTransport::LocalAgent)
+                        .then(|| {
+                            signing::discover_signing_program(None)
+                                .map(|program| program.path.to_string_lossy().into_owned())
+                        })
+                        .flatten()
                 })
         })
         .flatten();
@@ -706,6 +714,7 @@ pub struct GithubReport {
 #[derive(Debug, Clone, Serialize)]
 pub struct SigningReport {
     pub enabled: bool,
+    pub transport: String,
     pub key: Option<String>,
 }
 
@@ -740,6 +749,11 @@ impl StatusReport {
         });
         let signing = ctx.profile.as_ref().map(|profile| SigningReport {
             enabled: profile.signing.enabled,
+            transport: match profile.signing.transport {
+                config::SigningTransport::LocalAgent => "local-agent",
+                config::SigningTransport::ForwardedAgent => "forwarded-agent",
+            }
+            .into(),
             key: profile.signing.signing_key.clone(),
         });
         Self {
@@ -850,6 +864,11 @@ pub fn run_git(
     // option terminator/subcommand. Appending `-c` after `--` makes Git treat it
     // as a command (notably for `git --version` and `ghis git -- --version`).
     command = command.args(args[..policy_index].iter().cloned());
+    if let Some(signing_key) = execution_policy.signing_key.as_deref() {
+        command = command
+            .arg("-c")
+            .arg(format!("user.signingKey={signing_key}"));
+    }
     if let Some(profile) = ctx.profile.as_ref() {
         // Restrict the fail-closed helper to this Profile's GitHub host. Other
         // HTTPS services and cross-host submodules keep their own helper chain.
@@ -880,6 +899,7 @@ pub fn run_git(
 #[derive(Debug, Default)]
 struct GitExecutionPolicy {
     ssh_command: Option<String>,
+    signing_key: Option<String>,
 }
 
 #[derive(Debug)]
@@ -970,6 +990,14 @@ fn validate_profile_operation(
                 status.warnings.join("；")
             )));
         }
+        if profile.signing.signing_key.is_none() && profile.signing.fingerprint.is_some() {
+            let selected = status
+                .selected_key
+                .ok_or_else(|| AppError::Message("签名检查未返回严格匹配的 Agent 公钥".into()))?;
+            let material = signing::public_key_material(&selected.public_key)
+                .ok_or_else(|| AppError::Message("Agent 返回的签名公钥格式无效".into()))?;
+            policy.signing_key = Some(signing::git_signing_key_value(&material));
+        }
     }
 
     let may_use_remote = operation.may_contact_remote();
@@ -980,11 +1008,24 @@ fn validate_profile_operation(
                 .then(ssh_guard_command)
         });
 
-    let primary_remote_is_ssh = ctx
-        .remote
-        .as_ref()
-        .is_some_and(|remote| remote.transport == Transport::Ssh);
-    if may_use_remote && primary_remote_is_ssh {
+    let remote_target = if operation.requires_remote_resolution() {
+        ctx.repository
+            .as_ref()
+            .map(|repository| {
+                repo::operation_remote(repository, &operation.name, &operation.arguments)
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let target_may_use_ssh = remote_target.as_ref().is_some_and(|target| {
+        target.is_uncertain()
+            || target
+                .remotes()
+                .iter()
+                .any(|remote| remote.transport == Transport::Ssh)
+    });
+    if may_use_remote && target_may_use_ssh {
         match profile.ssh.as_ref() {
             None
             | Some(config::SshProfile {
@@ -992,11 +1033,19 @@ fn validate_profile_operation(
                 ..
             }) => match ctx.config.behavior.ssh_unmanaged {
                 config::SshUnmanagedPolicy::WarnAndContinue => {
-                    eprintln!("ghis: SSH remote 由系统 SSH 配置管理，未限制 Agent key");
+                    if remote_target
+                        .as_ref()
+                        .is_some_and(repo::OperationRemote::is_uncertain)
+                    {
+                        eprintln!("ghis: 无法确定 Git 实际 SSH remote，保留系统 SSH 配置");
+                    } else {
+                        eprintln!("ghis: SSH remote 由系统 SSH 配置管理，未限制 Agent key");
+                    }
                 }
                 config::SshUnmanagedPolicy::Fail => {
                     return Err(AppError::Message(
-                        "当前 Profile 未纳管 SSH key，已按策略停止操作".into(),
+                        "当前 Profile 未纳管 SSH key，或无法确定实际 SSH remote；已阻止 SSH 操作"
+                            .into(),
                     ));
                 }
             },
@@ -1037,24 +1086,30 @@ fn validate_profile_operation(
     Ok(policy)
 }
 
-fn profile_public_key(profile: &Profile) -> Result<String> {
+fn profile_public_key(profile: &Profile) -> Result<Option<String>> {
     if let Some(value) = profile.signing.signing_key.as_deref() {
         let inline = value.trim_start().strip_prefix("key::").unwrap_or(value);
         if signing::is_public_key_line(inline) {
-            return Ok(inline.to_owned());
+            return Ok(Some(inline.to_owned()));
         }
         let path = signing::expand_user(Path::new(value));
-        return fs::read_to_string(&path).map_err(|error| {
+        return fs::read_to_string(&path).map(Some).map_err(|error| {
             AppError::Message(format!("无法读取签名公钥 {}：{error}", path.display()))
         });
     }
-    let path = profile
+    if profile.signing.fingerprint.is_some() {
+        return Ok(None);
+    }
+    let Some(path) = profile
         .ssh
         .as_ref()
         .and_then(|ssh| ssh.public_key.as_deref())
-        .ok_or_else(|| AppError::Message("已启用签名，但未配置签名公钥".into()))?;
+    else {
+        return Ok(None);
+    };
     let path = signing::expand_user(path);
     fs::read_to_string(&path)
+        .map(Some)
         .map_err(|error| AppError::Message(format!("无法读取签名公钥 {}：{error}", path.display())))
 }
 
@@ -1062,26 +1117,35 @@ pub fn inspect_profile_signing(profile: &Profile) -> Result<signing::SigningStat
     let public_key = profile_public_key(profile)?;
     Ok(signing::inspect(&signing::SigningProfile {
         enabled: true,
-        agent_socket: profile
-            .ssh
-            .as_ref()
-            .and_then(|ssh| ssh.agent_socket.clone()),
-        public_key: Some(public_key),
-        fingerprint: profile_signing_fingerprint(profile),
+        transport: profile.signing.transport,
+        agent_socket: matches!(
+            profile.signing.transport,
+            config::SigningTransport::LocalAgent
+        )
+        .then(|| {
+            profile
+                .ssh
+                .as_ref()
+                .and_then(|ssh| ssh.agent_socket.clone())
+        })
+        .flatten(),
+        public_key,
+        fingerprint: profile.signing.fingerprint.clone(),
         signing_program: profile.signing.program.clone(),
     }))
 }
 
-/// Reuse the SSH authentication fingerprint only when signing also reuses
-/// that public key. An explicit `signing_key` may intentionally select a
-/// different key from the same Agent.
+/// Return the commit-signing selector, preserving the legacy authentication
+/// fingerprint fallback only when signing has no independent selector.
 pub fn profile_signing_fingerprint(profile: &Profile) -> Option<String> {
-    profile
-        .signing
-        .signing_key
-        .is_none()
-        .then(|| profile.ssh.as_ref().and_then(|ssh| ssh.fingerprint.clone()))
-        .flatten()
+    profile.signing.fingerprint.clone().or_else(|| {
+        profile
+            .signing
+            .signing_key
+            .is_none()
+            .then(|| profile.ssh.as_ref().and_then(|ssh| ssh.fingerprint.clone()))
+            .flatten()
+    })
 }
 
 /// 执行一次带 profile token 的 gh 命令，token 只进入子进程环境。
@@ -2382,6 +2446,19 @@ impl GitOperation {
         )
     }
 
+    fn requires_remote_resolution(&self) -> bool {
+        if matches!(self.name.as_str(), "push" | "pull" | "fetch" | "ls-remote") {
+            return true;
+        }
+        let arguments = git_subcommand_index(&self.arguments)
+            .map(|index| &self.arguments[index + 1..])
+            .unwrap_or_default();
+        matches!(self.name.as_str(), "remote")
+            && arguments
+                .iter()
+                .any(|argument| matches!(argument.as_str(), "update" | "prune"))
+    }
+
     fn may_contact_remote(&self) -> bool {
         if self.conservative_sensitive
             || matches!(
@@ -3063,7 +3140,10 @@ mod tests {
         ] {
             let mut profile = profile();
             profile.signing.signing_key = Some(format!("key::{value}"));
-            assert_eq!(profile_public_key(&profile).unwrap(), value);
+            assert_eq!(
+                profile_public_key(&profile).unwrap().as_deref(),
+                Some(value)
+            );
         }
     }
 

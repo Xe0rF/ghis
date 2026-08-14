@@ -4,7 +4,7 @@ use ghis::agent_context::{AgentContext, AgentContextFormat};
 use ghis::app::{self, AppContext};
 use ghis::config::{
     Config, ConfigPaths, CredentialFailurePolicy, DisplayIdentity, Profile, ResolutionSource, Rule,
-    SigningProfile, SshMode, SshProfile, SshUnmanagedPolicy, UnresolvedPolicy,
+    SigningProfile, SigningTransport, SshMode, SshProfile, SshUnmanagedPolicy, UnresolvedPolicy,
 };
 use ghis::{credential, diagnostics, github, shell, signing};
 use serde::Serialize;
@@ -320,8 +320,14 @@ struct ProfileArgs {
     sign: bool,
     #[arg(long)]
     signing_key: Option<String>,
+    /// Fingerprint of the SSH key used only for commit signing.
+    #[arg(long)]
+    signing_fingerprint: Option<String>,
     #[arg(long)]
     signing_program: Option<PathBuf>,
+    /// SSH signing agent source; forwarded-agent uses only SSH_AUTH_SOCK.
+    #[arg(long, value_enum, default_value_t = SigningTransportArg::LocalAgent)]
+    signing_transport: SigningTransportArg,
 }
 
 #[derive(Debug, Args)]
@@ -367,8 +373,30 @@ struct ProfileEditArgs {
     sign: Option<bool>,
     #[arg(long)]
     signing_key: Option<String>,
+    /// Fingerprint of the SSH key used only for commit signing.
+    #[arg(long)]
+    signing_fingerprint: Option<String>,
     #[arg(long)]
     signing_program: Option<PathBuf>,
+    /// SSH signing agent source; forwarded-agent uses only SSH_AUTH_SOCK.
+    #[arg(long, value_enum)]
+    signing_transport: Option<SigningTransportArg>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum SigningTransportArg {
+    #[default]
+    LocalAgent,
+    ForwardedAgent,
+}
+
+impl From<SigningTransportArg> for SigningTransport {
+    fn from(value: SigningTransportArg) -> Self {
+        match value {
+            SigningTransportArg::LocalAgent => Self::LocalAgent,
+            SigningTransportArg::ForwardedAgent => Self::ForwardedAgent,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -992,6 +1020,27 @@ fn profile_details(id: &str, profile: &Profile) -> String {
             "关闭"
         }
     ));
+    if profile.signing.enabled {
+        lines.push(format!(
+            "签名传输：{}",
+            match profile.signing.transport {
+                SigningTransport::LocalAgent => "local-agent",
+                SigningTransport::ForwardedAgent => "forwarded-agent",
+            }
+        ));
+        lines.push(format!(
+            "签名选择器：{}",
+            match (
+                profile.signing.signing_key.is_some(),
+                profile.signing.fingerprint.is_some(),
+            ) {
+                (true, true) => "public key + fingerprint",
+                (true, false) => "public key",
+                (false, true) => "fingerprint",
+                (false, false) => "未配置",
+            }
+        ));
+    }
     lines.join("\n")
 }
 
@@ -1046,9 +1095,11 @@ fn profile_from_args(args: ProfileArgs, git_email: String) -> Profile {
         }),
         signing: SigningProfile {
             enabled: args.sign,
+            transport: args.signing_transport.into(),
             signing_key: args
                 .signing_key
                 .map(|value| signing::git_signing_key_value(&value)),
+            fingerprint: args.signing_fingerprint,
             program: args.signing_program,
         },
     }
@@ -1103,8 +1154,14 @@ fn update_profile_from_args(profile: &mut Profile, args: ProfileEditArgs) {
     if let Some(signing_key) = args.signing_key {
         profile.signing.signing_key = Some(signing::git_signing_key_value(&signing_key));
     }
+    if let Some(fingerprint) = args.signing_fingerprint {
+        profile.signing.fingerprint = Some(fingerprint);
+    }
     if let Some(signing_program) = args.signing_program {
         profile.signing.program = Some(signing_program);
+    }
+    if let Some(transport) = args.signing_transport {
+        profile.signing.transport = transport.into();
     }
 }
 
@@ -1409,6 +1466,7 @@ struct DoctorReport {
     profile: Option<String>,
     credential_available: Option<bool>,
     ssh_agent: Option<DoctorAgent>,
+    signing_transport: Option<String>,
     signing_program: Option<DoctorSigningProgram>,
     github_signing_key: Option<DoctorGithubSigningKey>,
     git_config: diagnostics::GitConfigReport,
@@ -1549,12 +1607,20 @@ fn doctor(
             },
         );
 
-    let socket = signing::discover_agent_socket(
-        ctx.profile
-            .as_ref()
-            .and_then(|profile| profile.ssh.as_ref())
-            .and_then(|ssh| ssh.agent_socket.as_deref()),
-    );
+    let forwarded_signing = ctx.profile.as_ref().is_some_and(|profile| {
+        profile.signing.enabled
+            && matches!(profile.signing.transport, SigningTransport::ForwardedAgent)
+    });
+    let socket = if forwarded_signing {
+        signing::forwarded_agent_socket()
+    } else {
+        signing::discover_agent_socket(
+            ctx.profile
+                .as_ref()
+                .and_then(|profile| profile.ssh.as_ref())
+                .and_then(|ssh| ssh.agent_socket.as_deref()),
+        )
+    };
     let agent_required = ctx.profile.as_ref().is_some_and(|profile| {
         profile.signing.enabled
             || profile
@@ -1567,11 +1633,18 @@ fn doctor(
         .as_ref()
         .is_some_and(|profile| profile.signing.enabled);
     let (local_signing_key, local_signing_key_error) = if signing_required {
-        match doctor_local_signing_key(ctx.profile.as_ref().expect("signing profile exists")) {
-            Ok(key) => (Some(key), None),
-            Err(error) => {
-                warnings.push(error.clone());
-                (None, Some(error))
+        let fingerprint_only = ctx.profile.as_ref().is_some_and(|profile| {
+            profile.signing.signing_key.is_none() && profile.signing.fingerprint.is_some()
+        });
+        if fingerprint_only {
+            (None, None)
+        } else {
+            match doctor_local_signing_key(ctx.profile.as_ref().expect("signing profile exists")) {
+                Ok(key) => (Some(key), None),
+                Err(error) => {
+                    warnings.push(error.clone());
+                    (None, Some(error))
+                }
             }
         }
     } else {
@@ -1599,10 +1672,14 @@ fn doctor(
                 }
                 Some(DoctorAgent {
                     socket: agent.socket.display().to_string(),
-                    source: match agent.source {
-                        signing::AgentSource::OnePassword => "1password",
-                        signing::AgentSource::System => "system",
-                        signing::AgentSource::Unknown => "unknown",
+                    source: if forwarded_signing {
+                        "forwarded"
+                    } else {
+                        match agent.source {
+                            signing::AgentSource::OnePassword => "1password",
+                            signing::AgentSource::System => "system",
+                            signing::AgentSource::Unknown => "unknown",
+                        }
                     },
                     available: agent.available,
                     key_count: agent.keys.len(),
@@ -1616,7 +1693,9 @@ fn doctor(
                 }
                 Some(DoctorAgent {
                     socket: socket.display().to_string(),
-                    source: if signing::is_onepassword_socket(&socket) {
+                    source: if forwarded_signing {
+                        "forwarded"
+                    } else if signing::is_onepassword_socket(&socket) {
                         "1password"
                     } else {
                         "unknown"
@@ -1636,23 +1715,42 @@ fn doctor(
         }
     };
 
-    let program = signing::discover_signing_program(
-        ctx.profile
-            .as_ref()
-            .and_then(|profile| profile.signing.program.as_deref()),
-    );
+    let program = ctx.profile.as_ref().and_then(|profile| {
+        if matches!(profile.signing.transport, SigningTransport::ForwardedAgent) {
+            profile
+                .signing
+                .program
+                .as_deref()
+                .map(|path| signing::SigningProgram {
+                    path: signing::expand_user(path),
+                    onepassword: false,
+                })
+        } else {
+            signing::discover_signing_program(profile.signing.program.as_deref())
+        }
+    });
     let signing_program = program.map(|program| DoctorSigningProgram {
         available: signing::signing_program_available(&program),
         path: program.path.display().to_string(),
         onepassword: program.onepassword,
     });
     if signing_required
-        && signing_program
-            .as_ref()
-            .is_none_or(|program| !program.available)
+        && (ctx.profile.as_ref().is_some_and(|profile| {
+            matches!(profile.signing.transport, SigningTransport::LocalAgent)
+        }) && signing_program.is_none()
+            || signing_program
+                .as_ref()
+                .is_some_and(|program| !program.available))
     {
         warnings.push("已启用 SSH commit signing，但签名程序不可执行".into());
     }
+    let signing_transport = ctx.profile.as_ref().map(|profile| {
+        match profile.signing.transport {
+            SigningTransport::LocalAgent => "local-agent",
+            SigningTransport::ForwardedAgent => "forwarded-agent",
+        }
+        .to_owned()
+    });
 
     let github_signing_key = doctor_github_signing_key(
         check_github_signing_key,
@@ -1702,6 +1800,7 @@ fn doctor(
         profile: ctx.profile_id().map(str::to_owned),
         credential_available,
         ssh_agent,
+        signing_transport,
         signing_program,
         github_signing_key,
         git_config,
@@ -1754,6 +1853,9 @@ fn doctor(
             );
         } else {
             println!("SSH Agent: 未发现");
+        }
+        if let Some(transport) = &report.signing_transport {
+            println!("SSH 签名传输: {transport}");
         }
         if let Some(program) = &report.signing_program {
             println!(
@@ -2282,8 +2384,7 @@ fn doctor_key_selector(
     }
 
     let public_key = if profile.signing.enabled {
-        let key = signing_public_key?;
-        Some(key.to_owned())
+        signing_public_key.map(str::to_owned)
     } else {
         ssh.and_then(|ssh| ssh.public_key.as_deref())
             .and_then(|path| {
@@ -2297,10 +2398,16 @@ fn doctor_key_selector(
                 }
             })
     };
+    let fingerprint = if profile.signing.enabled {
+        profile.signing.fingerprint.clone()
+    } else {
+        ssh.and_then(|ssh| ssh.fingerprint.clone())
+    };
     Some(signing::SigningProfile {
         enabled: key_required,
+        transport: profile.signing.transport,
         public_key,
-        fingerprint: app::profile_signing_fingerprint(profile),
+        fingerprint,
         ..signing::SigningProfile::default()
     })
 }

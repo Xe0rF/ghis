@@ -22,7 +22,9 @@ fn context(source: ResolutionSource, profile_id: Option<&str>) -> AppContext {
         }),
         signing: SigningProfile {
             enabled: true,
+            transport: ghis::config::SigningTransport::LocalAgent,
             signing_key: Some("CANARY_SIGNING_KEY".into()),
+            fingerprint: None,
             program: Some(PathBuf::from("CANARY_SIGNING_PROGRAM")),
         },
     };

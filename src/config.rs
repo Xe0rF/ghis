@@ -277,12 +277,25 @@ pub enum SshMode {
     Managed,
 }
 
+/// SSH commit-signing agent source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum SigningTransport {
+    /// Discover a local 1Password/system agent and signing program as before.
+    #[default]
+    LocalAgent,
+    /// Use only the SSH agent forwarded into this process.
+    ForwardedAgent,
+}
+
 /// Optional SSH commit-signing settings.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(default)]
 pub struct SigningProfile {
     pub enabled: bool,
+    pub transport: SigningTransport,
     pub signing_key: Option<String>,
+    pub fingerprint: Option<String>,
     pub program: Option<PathBuf>,
 }
 
@@ -496,6 +509,38 @@ impl Config {
             }) {
                 return Err(ConfigError::Validation(format!(
                     "profile `{id}` with managed SSH needs public_key"
+                )));
+            }
+            if profile
+                .signing
+                .fingerprint
+                .as_deref()
+                .is_some_and(|fingerprint| fingerprint.trim().is_empty())
+            {
+                return Err(ConfigError::Validation(format!(
+                    "profile `{id}` signing fingerprint cannot be empty"
+                )));
+            }
+            if matches!(profile.signing.transport, SigningTransport::ForwardedAgent)
+                && profile.signing.enabled
+                && profile
+                    .signing
+                    .signing_key
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                && profile
+                    .signing
+                    .fingerprint
+                    .as_deref()
+                    .is_none_or(str::is_empty)
+                && profile
+                    .ssh
+                    .as_ref()
+                    .and_then(|ssh| ssh.public_key.as_ref())
+                    .is_none_or(|path| path.as_os_str().is_empty())
+            {
+                return Err(ConfigError::Validation(format!(
+                    "profile `{id}` with forwarded-agent signing needs signing_key, signing fingerprint, or SSH public_key"
                 )));
             }
         }
@@ -777,7 +822,17 @@ fn merge_profile(destination: &mut Item, source: &Item) {
     if let (Some(destination), Some(source)) =
         (destination.get_mut("signing"), source.get("signing"))
     {
-        merge_known_table(destination, source, &["enabled", "signing_key", "program"]);
+        merge_known_table(
+            destination,
+            source,
+            &[
+                "enabled",
+                "transport",
+                "signing_key",
+                "fingerprint",
+                "program",
+            ],
+        );
     }
 }
 
@@ -1112,6 +1167,25 @@ mod tests {
         invalid.description = Some("字".repeat(201));
         config.profiles.insert("work".into(), invalid);
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn forwarded_agent_signing_requires_explicit_public_material() {
+        let mut config = Config::default();
+        let mut forwarded = profile();
+        forwarded.signing.enabled = true;
+        forwarded.signing.transport = SigningTransport::ForwardedAgent;
+        config.profiles.insert("work".into(), forwarded.clone());
+        assert!(config.validate().is_err());
+
+        forwarded.ssh = Some(SshProfile {
+            public_key: Some("/keys/work.pub".into()),
+            ..SshProfile::default()
+        });
+        config.profiles.insert("work".into(), forwarded);
+        config
+            .validate()
+            .expect("configured public key is explicit material");
     }
 
     #[test]

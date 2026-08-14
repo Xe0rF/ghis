@@ -5,6 +5,7 @@
 //! are never opened or copied.  1Password is detected by its agent socket and
 //! signing-program names, not through the optional `op` CLI.
 
+use crate::config::SigningTransport;
 use std::env;
 use std::fmt;
 use std::fs;
@@ -115,10 +116,20 @@ pub struct SigningStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct SigningProfile {
     pub enabled: bool,
+    pub transport: SigningTransport,
     pub agent_socket: Option<PathBuf>,
     pub public_key: Option<String>,
     pub fingerprint: Option<String>,
     pub signing_program: Option<PathBuf>,
+}
+
+/// Return the SSH agent socket inherited by the current process. This is used
+/// for forwarded signing: unlike local-agent mode, it intentionally does not
+/// inspect configured sockets or local 1Password locations.
+pub fn forwarded_agent_socket() -> Option<PathBuf> {
+    env::var_os("SSH_AUTH_SOCK")
+        .filter(|socket| !socket.is_empty())
+        .map(PathBuf::from)
 }
 
 /// Return likely 1Password Agent socket paths that exist on this machine.
@@ -413,7 +424,10 @@ pub fn inspect(config: &SigningProfile) -> SigningStatus {
         enabled: config.enabled,
         ..SigningStatus::default()
     };
-    let socket = discover_agent_socket(config.agent_socket.as_deref());
+    let socket = match config.transport {
+        SigningTransport::LocalAgent => discover_agent_socket(config.agent_socket.as_deref()),
+        SigningTransport::ForwardedAgent => forwarded_agent_socket(),
+    };
     if let Some(socket) = socket {
         match inspect_agent(&socket) {
             Ok(agent) => {
@@ -422,25 +436,48 @@ pub fn inspect(config: &SigningProfile) -> SigningStatus {
                 }
                 status.selected_key = select_key(&agent.keys, config);
                 if config.enabled && status.selected_key.is_none() {
-                    status
-                        .warnings
-                        .push("configured signing key was not found in the agent".to_owned());
+                    status.warnings.push(match config.transport {
+                        SigningTransport::LocalAgent => {
+                            "configured signing key was not found in the agent".to_owned()
+                        }
+                        SigningTransport::ForwardedAgent => {
+                            "forwarded SSH agent does not contain the explicitly configured signing key".to_owned()
+                        }
+                    });
                 }
                 status.agent = Some(agent);
             }
             Err(err) => status.warnings.push(err.to_string()),
         }
     } else if config.enabled {
-        status
-            .warnings
-            .push("no SSH_AUTH_SOCK or 1Password Agent socket found".to_owned());
+        status.warnings.push(match config.transport {
+            SigningTransport::LocalAgent => {
+                "no SSH_AUTH_SOCK or 1Password Agent socket found".to_owned()
+            }
+            SigningTransport::ForwardedAgent => {
+                "forwarded-agent signing requires SSH_AUTH_SOCK in the current process".to_owned()
+            }
+        });
     }
-    status.program = discover_signing_program(config.signing_program.as_deref());
+    status.program = match config.transport {
+        SigningTransport::LocalAgent => discover_signing_program(config.signing_program.as_deref()),
+        // A remote process must not infer a local 1Password signing executable.
+        SigningTransport::ForwardedAgent => {
+            config
+                .signing_program
+                .as_deref()
+                .map(|path| SigningProgram {
+                    path: expand_user(path),
+                    onepassword: false,
+                })
+        }
+    };
     if config.enabled
-        && status
-            .program
-            .as_ref()
-            .is_none_or(|program| !is_executable(&program.path))
+        && (matches!(config.transport, SigningTransport::LocalAgent) && status.program.is_none()
+            || status
+                .program
+                .as_ref()
+                .is_some_and(|program| !is_executable(&program.path)))
     {
         status
             .warnings
@@ -463,6 +500,12 @@ pub fn select_key(keys: &[AgentKey], config: &SigningProfile) -> Option<AgentKey
                         }))
             })
             .cloned();
+    }
+    // A forwarded agent belongs to the caller's remote session. Never infer a
+    // signing identity from its only key; callers must name public material or
+    // a fingerprint explicitly.
+    if matches!(config.transport, SigningTransport::ForwardedAgent) {
+        return None;
     }
     (keys.len() == 1).then(|| keys[0].clone())
 }
@@ -547,6 +590,33 @@ fn shell_quote(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn forwarded_agent_never_selects_a_single_unconfigured_key() {
+        let keys = vec![AgentKey {
+            key_type: "ssh-ed25519".into(),
+            public_key: "ssh-ed25519 AAAATEST agent".into(),
+            comment: Some("agent".into()),
+            fingerprint: Some("SHA256:agent".into()),
+        }];
+        let config = SigningProfile {
+            transport: SigningTransport::ForwardedAgent,
+            ..SigningProfile::default()
+        };
+        assert!(select_key(&keys, &config).is_none());
+
+        let by_fingerprint = SigningProfile {
+            transport: SigningTransport::ForwardedAgent,
+            fingerprint: Some("SHA256:agent".into()),
+            ..SigningProfile::default()
+        };
+        assert_eq!(
+            select_key(&keys, &by_fingerprint)
+                .and_then(|key| key.fingerprint)
+                .as_deref(),
+            Some("SHA256:agent")
+        );
+    }
 
     #[test]
     fn identifies_onepassword_paths() {
