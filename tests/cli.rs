@@ -1171,7 +1171,7 @@ fn zsh_chpwd_is_silent_on_source_and_displays_profile_after_directory_change() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
-        stdout.matches("GhIS  Profile  personal").count(),
+        stdout.matches("GHIS Profile: personal").count(),
         1,
         "{stdout}"
     );
@@ -1352,6 +1352,46 @@ exec "$GHIS_REAL_GIT" "$@"
     assert_eq!(output.status.code(), Some(130));
     assert!(String::from_utf8_lossy(&output.stdout).contains("tty-ok"));
     assert!(!String::from_utf8_lossy(&output.stdout).contains("tty-lost"));
+}
+
+#[test]
+fn agent_setup_claude_requires_confirmation_before_writing_settings() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let project = temp.path().join("project");
+    fs::create_dir_all(&project).expect("project directory");
+    let ghis_bin = assert_cmd::cargo::cargo_bin!("ghis");
+    let invocation = format!(
+        "{} agent setup claude --scope project --project {}",
+        ghis::shell::shell_quote(&ghis_bin.to_string_lossy()),
+        ghis::shell::shell_quote(&project.to_string_lossy())
+    );
+    let mut command = Command::new("script");
+    command
+        .args(["-q", "-e", "-c"])
+        .arg(invocation)
+        .arg("/dev/null")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in xdg_environment(&temp) {
+        command.env(key, value);
+    }
+    clear_ghis_environment(&mut command);
+    let mut child = command.spawn().expect("run setup in a pseudo-terminal");
+    std::io::Write::write_all(child.stdin.as_mut().expect("stdin"), b"n\n").expect("decline setup");
+    let output = child.wait_with_output().expect("wait for setup");
+
+    assert!(output.status.success());
+    let transcript = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        transcript.contains("将更新 Claude Code 设置"),
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains("已取消，未修改 Claude Code 设置。"),
+        "{transcript}"
+    );
+    assert!(!project.join(".claude/settings.json").exists());
 }
 
 #[test]

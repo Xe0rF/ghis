@@ -76,6 +76,38 @@ gh pr list
 
 高频参数提供了短形式，例如 Profile 的 `-H/--host`、`-l/--login`、`-n/--name`、`-e/--email`、`-d/--description`，仓库目标的 `-r/--repo`，非交互确认的 `-y/--yes`，以及工作目录的 `-C/--cwd`。低频的 SSH/signing 和清除类参数保留完整长名称。
 
+## 本地隔离沙盒
+
+不想手动准备 fake `gh`、临时 `HOME` 和测试仓库时，可以直接运行：
+
+```sh
+scripts/onboard-sandbox.sh
+```
+
+脚本会创建临时的 HOME、XDG 和 Git 配置，准备一个 Git 仓库，并让 fake `gh` 模拟 `github.com / alice`。退出后临时目录自动删除。可使用逐行兼容模式、进入隔离 shell，或在隔离环境中运行指定命令：
+
+```sh
+scripts/onboard-sandbox.sh --line
+scripts/onboard-sandbox.sh --shell
+scripts/onboard-sandbox.sh -- cargo test --all -- --test-threads=1
+```
+
+隔离 shell 中可运行：
+
+```sh
+cargo run --quiet -- onboard --repo "$GHIS_SANDBOX_REPO"
+git -C "$GHIS_SANDBOX_REPO" config --local --list
+gh              # 只会调用脚本内的 fake gh
+```
+
+若需要保留现场排查：
+
+```sh
+scripts/onboard-sandbox.sh --keep --shell
+```
+
+脚本退出时会打印临时目录路径。这个沙盒不会访问真实 GitHub、使用真实 token，或读写宿主的 gh、Git 和 XDG 配置。
+
 ## 常用命令
 
 ```sh
