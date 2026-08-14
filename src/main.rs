@@ -39,6 +39,8 @@ enum Commands {
     Context(ContextArgs),
     /// 从 gh CLI 发现已有账号
     Discover(JsonArgs),
+    /// 通过中文交互向导创建 Profile 并可选初始化当前仓库
+    Onboard(OnboardArgs),
     /// 管理 profile
     Profile {
         #[command(subcommand)]
@@ -245,6 +247,13 @@ struct SetupArgs {
     /// 跳过修改 zsh 启动文件前的确认，供脚本安装使用
     #[arg(short = 'y', long)]
     yes: bool,
+}
+
+#[derive(Debug, Args, Default)]
+struct OnboardArgs {
+    /// 评估并可选绑定的仓库路径，默认使用当前目录
+    #[arg(short = 'r', long)]
+    repo: Option<PathBuf>,
 }
 
 #[derive(Debug, Args)]
@@ -468,6 +477,7 @@ fn run(cli: Cli) -> app::Result<i32> {
             agent_context(cli.config.as_deref(), cli.profile.as_deref(), args)
         }
         Commands::Discover(args) => discover(cli.config.as_deref(), args.json),
+        Commands::Onboard(args) => onboard(cli.config.as_deref(), args),
         Commands::Profile { command } => profile_command(cli.config.as_deref(), command),
         Commands::Use { profile, repo } => {
             use_profile(cli.config.as_deref(), &profile, repo.as_deref())
@@ -881,6 +891,285 @@ fn cache_discovery(paths: &ConfigPaths, discovery: &github::GhDiscovery) -> Opti
     github::save_discovery_cache(&discovery_cache_path(paths), discovery)
         .err()
         .map(|error| format!("无法更新 gh 账号缓存：{error}"))
+}
+
+fn onboard(path: Option<&Path>, args: OnboardArgs) -> app::Result<i32> {
+    if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
+        return Err(app::AppError::Message(
+            "`ghis onboard` 需要交互终端；脚本环境请使用 `ghis profile add ...`、`ghis use ...` 和 `ghis setup --yes`。".into(),
+        ));
+    }
+
+    let (paths, config) = load_config(path)?;
+    let target = args.repo.unwrap_or(std::env::current_dir()?);
+    let repository = match ghis::repo::discover(&target) {
+        Ok(repository) => Some(repository),
+        Err(ghis::repo::RepoError::NotRepository { .. }) => None,
+        Err(error) => return Err(error.into()),
+    };
+    let (accounts, discovery_notice) = match github::discover_accounts(None) {
+        Ok(discovery) => {
+            let mut notices = Vec::new();
+            if discovery.offline {
+                notices.push("部分账号当前无法联网验证。".to_owned());
+            }
+            if let Some(warning) = cache_discovery(&paths, &discovery) {
+                notices.push(warning);
+            }
+            (
+                discovery.accounts,
+                (!notices.is_empty()).then(|| notices.join(" ")),
+            )
+        }
+        Err(discovery_error) => match github::load_discovery_cache(&discovery_cache_path(&paths)) {
+            Ok(Some(cached)) => (
+                cached.accounts,
+                Some(format!(
+                    "无法从 gh 刷新账号，已使用本地缓存：{discovery_error}"
+                )),
+            ),
+            Ok(None) => (
+                Vec::new(),
+                Some(format!(
+                    "无法从 gh 发现账号，且没有可用缓存：{discovery_error}"
+                )),
+            ),
+            Err(cache_error) => (
+                Vec::new(),
+                Some(format!(
+                    "无法从 gh 发现账号（{discovery_error}），读取缓存也失败（{cache_error}）。"
+                )),
+            ),
+        },
+    };
+
+    let color = std::env::var_os("NO_COLOR").is_none()
+        && std::env::var("TERM")
+            .map(|value| value != "dumb")
+            .unwrap_or(true);
+    let line_mode = std::env::var("TERM")
+        .map(|value| value == "dumb")
+        .unwrap_or(false)
+        || std::env::var_os("GHIS_ONBOARD_LINE_MODE").is_some();
+    let repository_path = repository.as_ref().map(|value| value.command_dir());
+    let mut load_candidates = |host: &str, login: &str| {
+        github::profile_email_candidates(host, login).map_err(|error| error.to_string())
+    };
+    let result = if line_mode {
+        ghis::onboarding::run_line_mode(
+            BufReader::new(io::stdin()),
+            io::stderr(),
+            &config,
+            &accounts,
+            discovery_notice,
+            repository_path,
+            &mut load_candidates,
+        )?
+    } else {
+        match ghis::onboarding::run_terminal(
+            io::stderr(),
+            &config,
+            &accounts,
+            discovery_notice.clone(),
+            repository_path,
+            color,
+            &mut load_candidates,
+        ) {
+            Ok(result) => result,
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                eprintln!("警告：{error}，已切换到逐行兼容模式。");
+                ghis::onboarding::run_line_mode(
+                    BufReader::new(io::stdin()),
+                    io::stderr(),
+                    &config,
+                    &accounts,
+                    discovery_notice,
+                    repository_path,
+                    &mut load_candidates,
+                )?
+            }
+            Err(error) => return Err(error.into()),
+        }
+    };
+    let draft = match result {
+        ghis::onboarding::FlowResult::Cancelled => return Ok(0),
+        ghis::onboarding::FlowResult::Complete(draft) => draft,
+    };
+
+    apply_onboarding(path, &paths, &target, repository.as_ref(), draft)
+}
+
+fn apply_onboarding(
+    path: Option<&Path>,
+    paths: &ConfigPaths,
+    target: &Path,
+    repository: Option<&ghis::repo::Repository>,
+    draft: ghis::onboarding::Draft,
+) -> app::Result<i32> {
+    let profile = Profile {
+        host: github::normalize_host(&draft.host),
+        login: draft.login.clone(),
+        git_name: draft.git_name.clone(),
+        git_email: draft.git_email.clone(),
+        description: draft.description.clone(),
+        ssh: Some(SshProfile::default()),
+        signing: SigningProfile::default(),
+    };
+    let previous_default = Config::load(&paths.config_file)?.behavior.default_profile;
+    let previous_binding = if draft.bind_repository {
+        repository
+            .map(|repository| ghis::repo::local_config(repository, app::PROFILE_CONFIG_KEY))
+            .transpose()?
+            .flatten()
+    } else {
+        None
+    };
+
+    let (saved, ()) = update_config(paths, |config| {
+        if config.profiles.contains_key(&draft.id) {
+            return Err(app::AppError::Message(format!(
+                "Profile `{}` 已存在，请重新运行向导。",
+                draft.id
+            )));
+        }
+        config.profiles.insert(draft.id.clone(), profile.clone());
+        if draft.make_default {
+            config.behavior.default_profile = Some(draft.id.clone());
+        }
+        Ok(())
+    })?;
+
+    if let Err(error) = app::sync_fragments(paths, &saved) {
+        let rollback =
+            rollback_onboarding_profile(paths, &draft.id, &profile, previous_default.as_deref());
+        return Err(with_rollback_context(error, rollback));
+    }
+
+    let mut binding_applied = false;
+    if draft.bind_repository {
+        let result = context(path, Some(&draft.id), target)
+            .and_then(|ctx| app::bind_repository(&ctx, &draft.id));
+        if let Err(error) = result {
+            let binding_rollback =
+                restore_onboarding_binding(path, target, &draft.id, previous_binding.as_deref());
+            let profile_rollback = rollback_onboarding_profile(
+                paths,
+                &draft.id,
+                &profile,
+                previous_default.as_deref(),
+            );
+            return Err(with_two_rollback_context(
+                error,
+                binding_rollback,
+                profile_rollback,
+            ));
+        }
+        binding_applied = true;
+    }
+
+    if draft.setup_zsh {
+        let setup_result = (|| -> app::Result<()> {
+            let home = std::env::var_os("HOME")
+                .ok_or_else(|| app::AppError::Message("HOME 未设置".into()))?;
+            let zshrc = shell::zshrc_path(Path::new(&home), std::env::var_os("ZDOTDIR").as_deref());
+            let init = paths.config_dir.join("init.zsh");
+            shell::setup(zshrc, &init, "ghis")?;
+            Ok(())
+        })();
+        if let Err(error) = setup_result {
+            let binding_rollback = if binding_applied {
+                restore_onboarding_binding(path, target, &draft.id, previous_binding.as_deref())
+            } else {
+                Ok(())
+            };
+            let profile_rollback = rollback_onboarding_profile(
+                paths,
+                &draft.id,
+                &profile,
+                previous_default.as_deref(),
+            );
+            return Err(with_two_rollback_context(
+                error,
+                binding_rollback,
+                profile_rollback,
+            ));
+        }
+    }
+
+    println!("✓ 已完成 ghis 初始设置");
+    println!("\n  Profile  {}", draft.id);
+    println!("  GitHub   {}@{}", draft.login, draft.host);
+    if draft.bind_repository {
+        println!("  仓库     {}", target.display());
+    }
+    println!("\n后续可以运行：\n  ghis status\n  ghis doctor");
+    Ok(0)
+}
+
+fn rollback_onboarding_profile(
+    paths: &ConfigPaths,
+    id: &str,
+    profile: &Profile,
+    previous_default: Option<&str>,
+) -> app::Result<()> {
+    let (config, ()) = update_config(paths, |config| {
+        if config.profiles.get(id) == Some(profile) {
+            config.profiles.remove(id);
+        }
+        if config.behavior.default_profile.as_deref() == Some(id) {
+            config.behavior.default_profile = previous_default.map(str::to_owned);
+        }
+        Ok(())
+    })?;
+    app::sync_fragments(paths, &config)?;
+    Ok(())
+}
+
+fn restore_onboarding_binding(
+    path: Option<&Path>,
+    target: &Path,
+    new_id: &str,
+    previous_binding: Option<&str>,
+) -> app::Result<()> {
+    if let Some(previous) = previous_binding {
+        let ctx = context(path, Some(previous), target)?;
+        app::bind_repository(&ctx, previous)
+    } else {
+        let ctx = context(path, Some(new_id), target)?;
+        app::unbind_repository(&ctx)
+    }
+}
+
+fn with_rollback_context(error: app::AppError, rollback: app::Result<()>) -> app::AppError {
+    match rollback {
+        Ok(()) => app::AppError::Message(format!("初始化失败，已恢复原状态：{error}")),
+        Err(rollback_error) => app::AppError::Message(format!(
+            "初始化失败：{error}；自动恢复也失败：{rollback_error}。请运行 `ghis doctor` 检查残留状态。"
+        )),
+    }
+}
+
+fn with_two_rollback_context(
+    error: app::AppError,
+    first: app::Result<()>,
+    second: app::Result<()>,
+) -> app::AppError {
+    match (first, second) {
+        (Ok(()), Ok(())) => app::AppError::Message(format!("初始化失败，已恢复原状态：{error}")),
+        (first, second) => {
+            let mut failures = Vec::new();
+            if let Err(error) = first {
+                failures.push(error.to_string());
+            }
+            if let Err(error) = second {
+                failures.push(error.to_string());
+            }
+            app::AppError::Message(format!(
+                "初始化失败：{error}；自动恢复不完整：{}。请运行 `ghis doctor` 检查残留状态。",
+                failures.join("；")
+            ))
+        }
+    }
 }
 
 fn profile_command(path: Option<&Path>, command: ProfileCommand) -> app::Result<i32> {

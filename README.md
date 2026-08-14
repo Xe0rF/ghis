@@ -34,7 +34,19 @@ scripts/package-release.sh
 
 ## 快速开始
 
-先确认需要使用的账号都已经由 `gh` 登录，然后创建 Profile、绑定当前仓库并安装 zsh wrapper。下面的账号、姓名、邮箱、路径均为示例，需要替换成自己的值：
+首次使用推荐运行中文初始化向导：
+
+```sh
+ghis onboard
+# 也可以指定要评估并可选绑定的仓库
+ghis onboard --repo ~/src/project
+```
+
+向导使用一个局部动态区域展示四个步骤，并在切换步骤时原地更新；它不会清空终端、进入 alternate screen 或启动全屏 TUI，完成后只留下结果摘要。选择界面同时支持方向键和 Vim 键位：`j/k` 或 `↓/↑` 移动，`h/←/Esc` 返回，`l/→/Enter` 确认，`Space` 切换附加选项，`q` 或 `Ctrl+C` 取消。编辑 Profile ID、姓名等文本时，`h/j/k/l` 是普通输入字符。
+
+设置 `NO_COLOR=1` 可禁用颜色；`TERM=dumb` 或 `GHIS_ONBOARD_LINE_MODE=1` 会使用不含光标控制的中文兼容模式。最终确认前不会修改主配置、仓库或 shell 文件；失败时会尝试恢复原状态并给出检查命令。
+
+也可以继续使用独立命令手工完成相同配置。先确认需要使用的账号都已经由 `gh` 登录，然后创建 Profile、绑定当前仓库并安装 zsh wrapper。下面的账号、姓名、邮箱、路径均为示例，需要替换成自己的值：
 
 ```sh
 ghis discover

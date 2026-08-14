@@ -1355,6 +1355,118 @@ exec "$GHIS_REAL_GIT" "$@"
 }
 
 #[test]
+fn onboard_rejects_noninteractive_input_without_writing_config() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let mut command = isolated_ghis_command();
+    command.arg("onboard").write_stdin("alice\n");
+    for (key, value) in xdg_environment(&temp) {
+        command.env(key, value);
+    }
+    command
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ghis onboard"));
+    assert!(!temp.path().join("config").exists());
+    assert!(!temp.path().join("cache").exists());
+    assert!(!temp.path().join("state").exists());
+}
+
+#[test]
+fn onboard_dynamic_prompt_supports_hjkl_text_and_keeps_terminal_local() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let fake_bin = temp.path().join("bin");
+    let repository = temp.path().join("repo");
+    fs::create_dir_all(&fake_bin).expect("fake bin");
+    fs::create_dir_all(&repository).expect("repository");
+    write_executable(
+        &fake_bin.join("gh"),
+        r#"#!/bin/sh
+set -eu
+case "$*" in
+  'auth status --json hosts')
+    printf '%s\n' '{"hosts":{"github.com":[{"host":"github.com","login":"alice","active":true,"state":"success"}]}}'
+    ;;
+  'auth token --hostname github.com --user alice') printf '%s\n' test-token ;;
+  'api user') printf '%s\n' '{"id":12345,"login":"alice"}' ;;
+  'api user/emails') printf '%s\n' '[{"email":"alice@example.test","primary":true,"verified":true}]' ;;
+  *) printf 'unexpected gh args: %s\n' "$*" >&2; exit 64 ;;
+esac
+"#,
+    );
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repository)
+            .status()
+            .expect("initialize repository")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/alice/example.git",
+            ])
+            .current_dir(&repository)
+            .status()
+            .expect("add remote")
+            .success()
+    );
+
+    let binary = assert_cmd::cargo::cargo_bin!("ghis");
+    let child_command = format!(
+        "{} onboard --repo {}",
+        ghis::shell::shell_quote(&binary.to_string_lossy()),
+        ghis::shell::shell_quote(&repository.to_string_lossy())
+    );
+    let mut command = Command::new("script");
+    command
+        .args(["-q", "-e", "-c"])
+        .arg(child_command)
+        .arg("/dev/null")
+        .env("PATH", prepend_path(&fake_bin))
+        .env("NO_COLOR", "1")
+        .env("COLUMNS", "80")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    for (key, value) in xdg_environment(&temp) {
+        command.env(key, value);
+    }
+    clear_ghis_environment(&mut command);
+    let mut child = command.spawn().expect("spawn onboarding PTY");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let mut stdin = child.stdin.take().expect("PTY stdin");
+    std::io::Write::write_all(
+        &mut stdin,
+        b"\r\x7f\x7f\x7f\x7f\x7fpersonal\rHjkl User\r\rll",
+    )
+    .expect("drive onboarding");
+    drop(stdin);
+    let output = child.wait_with_output().expect("wait for onboarding");
+    assert!(
+        output.status.success(),
+        "onboarding failed: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    let transcript = String::from_utf8_lossy(&output.stdout);
+    assert!(transcript.contains("ghis 初始设置"));
+    assert!(transcript.contains("Hjkl User"));
+    assert!(transcript.contains("✓ 已完成 ghis 初始设置"));
+    assert!(transcript.contains("\x1b["));
+    assert!(!transcript.contains("\x1b[J"));
+    assert!(!transcript.contains("\x1b[2J"));
+    assert!(!transcript.contains("\x1b[?1049h"));
+
+    let config = Config::load(temp.path().join("config/ghis/config.toml")).expect("saved config");
+    let profile = config.profiles.get("personal").expect("created profile");
+    assert_eq!(profile.git_name, "Hjkl User");
+    assert_eq!(profile.git_email, "12345+alice@users.noreply.github.com");
+}
+
+#[test]
 fn setup_respects_zdotdir_and_requires_explicit_noninteractive_consent() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let home = temp.path().join("home");

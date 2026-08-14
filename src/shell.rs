@@ -317,48 +317,112 @@ pub fn setup(
     let zshrc_target = editable_target(&zshrc)?;
     let init_file = init_file.as_ref().to_path_buf();
     let init_target = editable_target(&init_file)?;
+    let backup_path = PathBuf::from(format!("{}.ghis.bak", zshrc.display()));
+    let snapshots = [
+        FileSnapshot::capture(&init_target)?,
+        FileSnapshot::capture(&zshrc_target)?,
+        FileSnapshot::capture(&backup_path)?,
+    ];
 
-    if let Some(parent) = init_target.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let init_content = zsh_init_script(binary);
-    let init_changed = read_optional(&init_target)?.as_deref() != Some(init_content.as_str());
-    if init_changed {
-        atomic_write(
-            &init_target,
-            init_content.as_bytes(),
-            metadata_mode(&init_target),
-        )?;
-    }
+    let result = (|| {
+        if let Some(parent) = init_target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let init_content = zsh_init_script(binary);
+        let init_changed = read_optional(&init_target)?.as_deref() != Some(init_content.as_str());
+        if init_changed {
+            atomic_write(
+                &init_target,
+                init_content.as_bytes(),
+                metadata_mode(&init_target),
+            )?;
+        }
 
-    if let Some(parent) = zshrc_target.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let existing = read_optional(&zshrc_target)?.unwrap_or_default();
-    let block = managed_block(&init_file);
-    let updated = replace_managed_block(&existing, &block);
-    let zshrc_changed = updated != existing;
-    let mut backup = None;
-    if zshrc_changed {
-        let backup_path = PathBuf::from(format!("{}.ghis.bak", zshrc.display()));
-        if !backup_path.exists() {
-            // A backup is made only once so repeated setup cannot overwrite
-            // the user's original file with a later generated version.
-            if zshrc_target.exists() {
-                fs::copy(&zshrc_target, &backup_path)?;
-                backup = Some(backup_path);
+        if let Some(parent) = zshrc_target.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let existing = read_optional(&zshrc_target)?.unwrap_or_default();
+        let block = managed_block(&init_file);
+        let updated = replace_managed_block(&existing, &block);
+        let zshrc_changed = updated != existing;
+        let mut backup = None;
+        if zshrc_changed {
+            if !backup_path.exists() {
+                // A backup is made only once so repeated setup cannot overwrite
+                // the user's original file with a later generated version.
+                if zshrc_target.exists() {
+                    fs::copy(&zshrc_target, &backup_path)?;
+                    backup = Some(backup_path.clone());
+                }
+            }
+            let mode = metadata_mode(&zshrc_target);
+            atomic_write(&zshrc_target, updated.as_bytes(), mode)?;
+        }
+
+        Ok(SetupReport {
+            zshrc: zshrc.clone(),
+            init_file: init_file.clone(),
+            backup,
+            changed: init_changed || zshrc_changed,
+        })
+    })();
+
+    match result {
+        Ok(report) => Ok(report),
+        Err(error) => {
+            let failures = snapshots
+                .iter()
+                .filter_map(|snapshot| snapshot.restore().err())
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>();
+            if failures.is_empty() {
+                Err(error)
+            } else {
+                Err(io::Error::other(format!(
+                    "{error}; shell setup rollback failed: {}",
+                    failures.join("; ")
+                )))
             }
         }
-        let mode = metadata_mode(&zshrc_target);
-        atomic_write(&zshrc_target, updated.as_bytes(), mode)?;
+    }
+}
+
+#[derive(Debug)]
+struct FileSnapshot {
+    path: PathBuf,
+    contents: Option<Vec<u8>>,
+    mode: Option<u32>,
+}
+
+impl FileSnapshot {
+    fn capture(path: &Path) -> io::Result<Self> {
+        let contents = match fs::read(path) {
+            Ok(contents) => Some(contents),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+        Ok(Self {
+            path: path.to_path_buf(),
+            contents,
+            mode: metadata_mode(path),
+        })
     }
 
-    Ok(SetupReport {
-        zshrc,
-        init_file,
-        backup,
-        changed: init_changed || zshrc_changed,
-    })
+    fn restore(&self) -> io::Result<()> {
+        match self.contents.as_deref() {
+            Some(contents) => {
+                if let Some(parent) = self.path.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                atomic_write(&self.path, contents, self.mode)
+            }
+            None => match fs::remove_file(&self.path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error),
+            },
+        }
+    }
 }
 
 /// Remove ghis's managed block from a startup file.
