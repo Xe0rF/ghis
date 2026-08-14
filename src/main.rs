@@ -557,11 +557,18 @@ fn agent_command(
             let shim_dir = paths.cache_dir.join("agent-shims");
             let binary = PathBuf::from(agent_binary());
             ghis::agent::prepare_session_shims(&shim_dir, &binary)?;
+            let session_path = ghis::agent::session_path(&shim_dir)?;
             let spec = match target {
                 AgentTarget::Claude => {
                     ghis::agent::claude::run_spec(&context, "claude", args, &cwd)
                 }
-                AgentTarget::Codex => ghis::agent::codex::run_spec(&context, "codex", args, &cwd),
+                AgentTarget::Codex => ghis::agent::codex::run_spec_with_shell_path(
+                    &context,
+                    "codex",
+                    args,
+                    &cwd,
+                    &session_path,
+                ),
             }
             .map_err(|error| app::AppError::Message(error.to_string()))?;
             let spec = ghis::agent::prepend_path(spec, &shim_dir)?;

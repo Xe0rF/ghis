@@ -1,6 +1,6 @@
 use ghis::agent::codex;
 use ghis::agent::{AgentKind, ContextProvider};
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 
 #[derive(Debug)]
@@ -42,5 +42,31 @@ fn context_is_developer_instruction_and_user_argv_is_not_concatenated() {
         !args
             .iter()
             .any(|arg| arg.to_string_lossy().contains("skill"))
+    );
+}
+
+#[test]
+fn shell_path_is_explicitly_forwarded_to_codex_tool_environments() {
+    let spec = codex::run_spec_with_shell_path(
+        &Provider,
+        "codex",
+        ["exec", "status"],
+        Path::new("/repo"),
+        OsStr::new("/tmp/ghis agent-shims:/usr/bin:/bin"),
+    )
+    .unwrap();
+
+    assert_eq!(
+        spec.arguments(),
+        &[
+            OsString::from("-c"),
+            OsString::from("developer_instructions=selected identity: work"),
+            OsString::from("-c"),
+            OsString::from(
+                "shell_environment_policy.set.PATH=\"/tmp/ghis agent-shims:/usr/bin:/bin\"",
+            ),
+            OsString::from("exec"),
+            OsString::from("status"),
+        ]
     );
 }

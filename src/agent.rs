@@ -134,13 +134,19 @@ pub fn prepare_session_shims(directory: &Path, ghis: &Path) -> std::io::Result<[
 /// Prepend one directory to PATH without changing any existing entries.
 pub fn prepend_path(spec: CommandSpec, directory: &Path) -> std::io::Result<CommandSpec> {
     let inherited = std::env::var_os("PATH").unwrap_or_default();
-    let value = std::env::join_paths(
-        std::iter::once(directory.to_path_buf()).chain(std::env::split_paths(&inherited)),
-    )
-    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    let value = session_path(directory)?;
     Ok(spec
         .env("GHIS_AGENT_REAL_PATH", inherited)
         .env("PATH", value))
+}
+
+/// Return the session PATH with the ghis shim directory ahead of inherited entries.
+pub fn session_path(directory: &Path) -> std::io::Result<OsString> {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    std::env::join_paths(
+        std::iter::once(directory.to_path_buf()).chain(std::env::split_paths(&inherited)),
+    )
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
 }
 
 fn shell_word(value: &OsStr) -> String {

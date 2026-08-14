@@ -10,6 +10,7 @@ use super::{AgentError, AgentKind, ContextProvider, launcher_spec, resolved_cont
 use crate::process::{CommandRunner, CommandSpec};
 
 pub const DEVELOPER_INSTRUCTIONS_KEY: &str = "developer_instructions";
+pub const SHELL_PATH_KEY: &str = "shell_environment_policy.set.PATH";
 pub const DEFAULT_MAX_CONTEXT_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -52,6 +53,33 @@ pub fn run_spec<P: ContextProvider>(
     let context = resolved_context(provider, AgentKind::Codex)?;
     let setting = OsString::from(format!("{DEVELOPER_INSTRUCTIONS_KEY}={context}"));
     let mut args = vec![OsString::from("-c"), setting];
+    args.extend(user_args.into_iter().map(Into::into));
+    Ok(launcher_spec(program, args, cwd))
+}
+
+/// Build a Codex launcher that also pins the shell-tool PATH.
+///
+/// Codex reconstructs shell environments from configuration before each tool
+/// call. Keeping the ghis shim only in the launch process environment is not
+/// sufficient when that environment is isolated or rebuilt, so the same PATH
+/// is passed as a per-session Codex configuration override.
+pub fn run_spec_with_shell_path<P: ContextProvider>(
+    provider: &P,
+    program: impl Into<OsString>,
+    user_args: impl IntoIterator<Item = impl Into<OsString>>,
+    cwd: &Path,
+    shell_path: &OsStr,
+) -> Result<CommandSpec, AgentError> {
+    let context = resolved_context(provider, AgentKind::Codex)?;
+    let developer_instructions = OsString::from(format!("{DEVELOPER_INSTRUCTIONS_KEY}={context}"));
+    let shell_path = toml_edit::Value::from(shell_path.to_string_lossy().as_ref()).to_string();
+    let shell_environment_path = OsString::from(format!("{SHELL_PATH_KEY}={shell_path}"));
+    let mut args = vec![
+        OsString::from("-c"),
+        developer_instructions,
+        OsString::from("-c"),
+        shell_environment_path,
+    ];
     args.extend(user_args.into_iter().map(Into::into));
     Ok(launcher_spec(program, args, cwd))
 }

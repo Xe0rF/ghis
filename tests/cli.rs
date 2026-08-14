@@ -11,17 +11,21 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use tempfile::TempDir;
 
-const GHIS_CONTROL_ENV: [&str; 10] = [
+const GHIS_CONTROL_ENV: [&str; 14] = [
     "GHIS_CONFIG",
     "GHIS_PROFILE",
     "GHIS_BANNER_SHOWN",
     "GHIS_WRAPPER_ACTIVE",
+    "GHIS_AGENT_WRAPPER_ACTIVE",
+    "GHIS_AGENT_REAL_PATH",
     "GHIS_BYPASS",
     "GHIS_DISABLE_CHPWD",
     "GHIS_CHPWD_ENABLED",
     "GHIS_REPO_PROFILE",
     "GHIS_REPO_PROFILE_DISPLAY",
     "GHIS_REPO_ROOT",
+    "GHIS_SHELL_INTEGRATION",
+    "GHIS_SHELL_INTEGRATION_HEALTH",
 ];
 
 fn write_executable(path: &Path, body: &str) {
@@ -1406,8 +1410,18 @@ printf '%s\n' "$@" > "$CODEX_TRACE"
     clear_ghis_environment(&mut command);
     assert!(command.status().expect("run wrapped codex").success());
     let arguments = fs::read_to_string(&trace).expect("trace");
-    assert!(arguments.contains("developer_instructions=ghis session context"));
-    assert!(arguments.contains("--model\ntest"));
+    assert!(
+        arguments.contains("developer_instructions=ghis session context"),
+        "unexpected Codex argv: {arguments:?}"
+    );
+    assert!(
+        arguments.contains("shell_environment_policy.set.PATH="),
+        "unexpected Codex argv: {arguments:?}"
+    );
+    assert!(
+        arguments.contains("--model\ntest"),
+        "unexpected Codex argv: {arguments:?}"
+    );
 
     let mut bypass = Command::new("zsh");
     bypass
