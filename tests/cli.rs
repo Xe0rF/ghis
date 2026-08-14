@@ -81,6 +81,18 @@ fn xdg_environment(temp: &TempDir) -> [(String, PathBuf); 4] {
     ]
 }
 
+fn pseudo_terminal_command(command: &Path) -> Command {
+    let mut pseudo_terminal = Command::new("script");
+    #[cfg(target_os = "macos")]
+    pseudo_terminal.args(["-q", "-e", "/dev/null"]).arg(command);
+    #[cfg(not(target_os = "macos"))]
+    pseudo_terminal
+        .args(["-q", "-e", "-c"])
+        .arg(command)
+        .arg("/dev/null");
+    pseudo_terminal
+}
+
 fn pseudo_terminal_shell(command: &str) -> Command {
     let mut pseudo_terminal = Command::new("script");
     #[cfg(target_os = "macos")]
@@ -1443,6 +1455,7 @@ printf '%s\n' "$@" > "$CODEX_TRACE"
 #[test]
 fn zsh_wrapper_preserves_tty_and_sigint_status() {
     let temp = tempfile::tempdir().expect("temporary directory");
+    let tty_trace = temp.path().join("tty-trace");
     let fake_bin = temp.path().join("fake-bin");
     fs::create_dir_all(&fake_bin).expect("fake bin");
     write_executable(
@@ -1450,9 +1463,9 @@ fn zsh_wrapper_preserves_tty_and_sigint_status() {
         r#"#!/bin/sh
 if [ "${1:-}" = tty-probe ]; then
   if [ -t 0 ] && [ -t 1 ]; then
-    printf 'tty-ok\n'
+    printf 'tty-ok\n' > "$GHIS_TTY_TRACE"
   else
-    printf 'tty-lost\n'
+    printf 'tty-lost\n' > "$GHIS_TTY_TRACE"
     exit 72
   fi
   kill -INT "$$"
@@ -1493,11 +1506,12 @@ exec "$GHIS_REAL_GIT" "$@"
             .expect("real git in PATH")
             .into_os_string()
     });
-    let mut command = pseudo_terminal_shell(&ghis::shell::shell_quote(&probe.to_string_lossy()));
+    let mut command = pseudo_terminal_command(&probe);
     command
         .current_dir(temp.path())
         .env("PATH", path)
         .env("GHIS_REAL_GIT", real_git)
+        .env("GHIS_TTY_TRACE", &tty_trace)
         .env("HOME", temp.path().join("home"))
         .env("XDG_CONFIG_HOME", temp.path().join("config"))
         .env("XDG_CACHE_HOME", temp.path().join("cache"))
@@ -1509,8 +1523,10 @@ exec "$GHIS_REAL_GIT" "$@"
     assert_eq!(output.status.code(), Some(1));
     #[cfg(not(target_os = "macos"))]
     assert_eq!(output.status.code(), Some(130));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("tty-ok"));
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("tty-lost"));
+    assert_eq!(
+        fs::read_to_string(tty_trace).expect("TTY trace"),
+        "tty-ok\n"
+    );
 }
 
 #[test]
