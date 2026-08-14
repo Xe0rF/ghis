@@ -1,6 +1,6 @@
 # GitHub Identity Switcher (`ghis`)
 
-`ghis` 是面向 Linux 和 zsh 的本地 GitHub 提交身份切换器。它按仓库或 worktree 选择 Profile，让普通的 `git commit`、`git push` 和 `gh` 命令使用对应的提交姓名、邮箱与 GitHub 账号，并在敏感操作前显示实际身份。
+`ghis` 是面向 Linux 和 macOS（ARM64）并使用 zsh 的本地 GitHub 提交身份切换器。它按仓库或 worktree 选择 Profile，让普通的 `git commit`、`git push` 和 `gh` 命令使用对应的提交姓名、邮箱与 GitHub 账号，并在敏感操作前显示实际身份。
 
 默认使用 HTTPS，不要求配置 SSH Authentication Key。ghis 不调用 `gh auth switch`，不保存 GitHub token，不改写 remote，也不会修改全局 `user.name` 或 `user.email`。
 
@@ -15,7 +15,7 @@
 
 ## 安装
 
-需要 Linux、Rust 1.97+、Git、GitHub CLI（`gh`）和 zsh。当前安装来源是源码构建或本地 Arch 归档。
+需要 Linux（x86_64 或 ARM64）或 macOS（ARM64）、Rust 1.97+、Git、GitHub CLI（`gh`）和 zsh。创建本地发布归档还需要 Python 3；当前安装来源是源码构建、本地 Arch 归档或 GitHub Release 提供的预编译归档。
 
 ```sh
 cargo install --locked --path .

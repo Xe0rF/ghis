@@ -74,16 +74,44 @@ zsh -n "$package_dir/completions/_ghis"
 
 archive="$dist_dir/$package.tar.gz"
 rm -f -- "$archive" "$archive.sha256"
-epoch=$SOURCE_DATE_EPOCH
-tar --sort=name --owner=0 --group=0 --numeric-owner --mtime="@$epoch" \
-  -C "$stage" -cf - "$package" | gzip -n -9 > "$archive"
+python3 - "$stage" "$package" "$archive" "$SOURCE_DATE_EPOCH" <<'PY'
+from gzip import GzipFile
+from hashlib import sha256
+from pathlib import Path
+import sys
+import tarfile
 
-archive_name=$(basename -- "$archive")
-(
-  cd "$dist_dir"
-  sha256sum "$archive_name" > "$archive_name.sha256"
-  sha256sum -c "$archive_name.sha256"
-)
-tar -tzf "$archive" >/dev/null
+stage = Path(sys.argv[1])
+package = sys.argv[2]
+archive = Path(sys.argv[3])
+epoch = int(sys.argv[4])
+package_dir = stage / package
+archive.parent.mkdir(parents=True, exist_ok=True)
+
+with archive.open("wb") as output:
+    with GzipFile(filename="", mode="wb", fileobj=output, mtime=0) as compressed:
+        with tarfile.open(fileobj=compressed, mode="w", format=tarfile.GNU_FORMAT) as tar:
+            for path in [package_dir, *sorted(package_dir.rglob("*"))]:
+                info = tar.gettarinfo(path, arcname=str(path.relative_to(stage)))
+                info.uid = 0
+                info.gid = 0
+                info.uname = ""
+                info.gname = ""
+                info.mtime = epoch
+                if info.isfile():
+                    with path.open("rb") as source:
+                        tar.addfile(info, source)
+                else:
+                    tar.addfile(info)
+
+digest = sha256(archive.read_bytes()).hexdigest()
+checksum = archive.with_suffix(archive.suffix + ".sha256")
+checksum.write_text(f"{digest}  {archive.name}\n", encoding="ascii")
+if sha256(archive.read_bytes()).hexdigest() != digest:
+    raise SystemExit("归档 SHA-256 校验失败")
+with tarfile.open(archive, mode="r:gz") as tar:
+    if not tar.getmembers():
+        raise SystemExit("归档为空")
+PY
 
 printf '%s\n' "$archive" "$archive.sha256"

@@ -9,7 +9,7 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  verify:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
@@ -31,9 +31,32 @@ jobs:
       - uses: rustsec/audit-check@v2.0.0
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  package:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            artifact: ghis-linux-x86_64
+          - runner: ubuntu-24.04-arm
+            artifact: ghis-linux-aarch64
+          - runner: macos-14
+            artifact: ghis-macos-aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - name: Install zsh
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zsh
+      - run: cargo test --locked
       - run: scripts/package-release.sh
       - uses: actions/upload-artifact@v4
         with:
-          name: ghis-linux-x86_64
+          name: ${{ matrix.artifact }}
           path: dist/*
           if-no-files-found: error
