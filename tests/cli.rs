@@ -81,18 +81,6 @@ fn xdg_environment(temp: &TempDir) -> [(String, PathBuf); 4] {
     ]
 }
 
-fn pseudo_terminal_command(command: &Path) -> Command {
-    let mut pseudo_terminal = Command::new("script");
-    #[cfg(target_os = "macos")]
-    pseudo_terminal.args(["-q", "-e", "/dev/null"]).arg(command);
-    #[cfg(not(target_os = "macos"))]
-    pseudo_terminal
-        .args(["-q", "-e", "-c"])
-        .arg(command)
-        .arg("/dev/null");
-    pseudo_terminal
-}
-
 fn pseudo_terminal_shell(command: &str) -> Command {
     let mut pseudo_terminal = Command::new("script");
     #[cfg(target_os = "macos")]
@@ -1505,7 +1493,7 @@ exec "$GHIS_REAL_GIT" "$@"
             .expect("real git in PATH")
             .into_os_string()
     });
-    let mut command = pseudo_terminal_command(&probe);
+    let mut command = pseudo_terminal_shell(&ghis::shell::shell_quote(&probe.to_string_lossy()));
     command
         .current_dir(temp.path())
         .env("PATH", path)
