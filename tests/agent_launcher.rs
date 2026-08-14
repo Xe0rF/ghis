@@ -46,7 +46,8 @@ exit 37
     assert_eq!(status.code(), Some(37));
     let result = fs::read_to_string(dir.path().join("result")).unwrap();
     let lines: Vec<_> = result.lines().collect();
-    assert_eq!(Path::new(lines[0]), dir.path());
+    let directory = fs::canonicalize(dir.path()).unwrap();
+    assert_eq!(Path::new(lines[0]), directory);
     assert_eq!(
         &lines[1..],
         &["2", "hello world", "semi;colon", "unset", "unset"]
