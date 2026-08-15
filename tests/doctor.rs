@@ -503,7 +503,7 @@ fn doctor_json_reports_includeif_local_and_worktree_sources() {
 "#,
     )
     .expect("included Git config");
-    let git_dir = repo.join(".git");
+    let git_dir = fs::canonicalize(repo.join(".git")).expect("canonical repository Git directory");
     let condition = git_dir.to_string_lossy().replace('\\', "/");
     fs::write(
         &global_config,
