@@ -331,7 +331,9 @@ fn set_private_file(file: &File, path: &Path) -> Result<()> {
 }
 
 fn absolute_path(path: &Path) -> PathBuf {
-    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+    std::fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn sort_records(records: &mut [RepositoryBindingRecord]) {
