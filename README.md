@@ -1,6 +1,6 @@
 # GitHub Identity Switcher (`ghis`)
 
-`ghis` 是跨平台的本地 GitHub 提交身份切换器，支持 Linux、macOS 和 Windows。它按仓库或 worktree 选择 Profile，让普通的 `git commit`、`git push` 和 `gh` 命令使用对应的提交姓名、邮箱与 GitHub 账号，并在敏感操作前显示实际身份。shell 集成支持 zsh、bash、fish 和 PowerShell；Windows 原生环境默认使用 PowerShell。
+`ghis` 是跨平台的本地 GitHub 提交身份切换器，支持 Linux、macOS 和 Windows。它按仓库或 worktree 选择 Profile，让普通的 `git commit`、`git push` 和 `gh` 命令使用对应的提交姓名、邮箱与 GitHub 账号，并在敏感操作前显示实际身份。Unix shell 集成支持 zsh、bash 和 fish；Windows 原生 shell 集成仅支持 PowerShell 7（`pwsh`），不支持 Windows PowerShell 5.1。
 
 默认使用 HTTPS，不要求配置 SSH Authentication Key。ghis 不调用 `gh auth switch`，不保存 GitHub token，不改写 remote，也不会修改全局 `user.name` 或 `user.email`。
 
@@ -15,7 +15,7 @@
 
 ## 安装
 
-Linux、macOS 和 Windows 原生运行需要 Rust 1.97+、Git 与 GitHub CLI（`gh`）；shell 集成按平台使用 zsh、bash、fish 或 PowerShell。创建本地发布归档还需要 Python 3；当前安装来源是源码构建、本地 Arch 归档或 GitHub Release 提供的预编译归档。Windows 上的 SSH signing、1Password socket 发现和 Unix shell（zsh/bash/fish）属于单独的兼容边界，默认使用 HTTPS 与 PowerShell。
+Linux、macOS 和 Windows 原生运行需要 Rust 1.97+、Git 与 GitHub CLI（`gh`）；Unix shell 集成使用 zsh、bash 或 fish，Windows 原生 shell 集成需要 PowerShell 7（`pwsh`）。当前 GitHub Release 已验证的预编译归档 target 为 `x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu` 和 `aarch64-apple-darwin`；其他 target（包括 Windows）需要从源码构建。Windows 上的 SSH signing、1Password socket 发现和 Unix shell 属于单独的兼容边界，默认使用 HTTPS 与 PowerShell 7。
 
 ```sh
 cargo install --locked --path .
@@ -25,7 +25,7 @@ cargo install --locked --path .
 目标平台和 debug/release 模式。设置 `SOURCE_DATE_EPOCH` 后，构建时间使用该 Unix
 时间戳，以便生成可复现的发布产物。
 
-发布归档可以在本地生成：
+本地生成发布归档需要 POSIX `sh`、zsh、bash 和 Python 3：
 
 ```sh
 scripts/package-release.sh
@@ -62,7 +62,7 @@ ghis status
 ghis setup
 ```
 
-Windows PowerShell 使用 `ghis setup`（也可以显式运行 `ghis setup powershell`）；Unix 环境可显式选择 `zsh`、`bash` 或 `fish`。
+PowerShell 7 使用 `ghis setup`（也可以显式运行 `ghis setup powershell`）；Unix 环境可显式选择 `zsh`、`bash` 或 `fish`。
 
 之后照常使用原命令：
 
@@ -144,6 +144,12 @@ ghis gh -- issue list --repo OWNER/REPO
 
 `--cwd` 可以与 `--host`、`--owner`、`--repo` 组合，使规则同时限制工作目录和 GitHub 目标。规则仍遵循显式 `--profile`、仓库绑定、规则优先级和歧义检测；规则只在运行时选择身份，不会把非 Git 目录绑定成仓库。
 
+### 机器可读诊断输出
+
+`ghis status --json`、`ghis doctor --json` 和 `ghis check --operation <git|gh> --json -- ...` 分别输出当前身份状态、环境诊断和单次操作预检；它们是三种不同的 JSON 对象，不能按同一字段集合解析。每个对象都包含整数 `schema_version`。同一 schema 版本内可能增加字段，调用方应忽略未知字段；仓库、配置、工具路径以及其他由运行环境产生的字段不保证跨机器或版本稳定。
+
+退出码应与 JSON 一起判断：`status` 和完成诊断的 `doctor` 返回 `0`，`check` 在存在错误级检查项时返回 `1`，参数、配置或运行时失败返回 `2`，此时不保证 stdout 中有完整 JSON。机器输出不会包含 token 或私钥内容，但不能据此把整份输出视为可公开的脱敏报告：例如 `doctor` 可能包含 SSH Agent socket 路径，路径、账号和环境信息也可能敏感；分享前仍应审阅并按需移除。
+
 ### 远程开发与 SSH Agent forwarding
 
 在远程开发机上使用本地 1Password SSH Agent 时，先由用户自行配置 SSH forwarding，例如 `ssh -A user@host` 或本地 `~/.ssh/config` 的 `ForwardAgent yes`；远端 SSH 服务端也必须允许 `AllowAgentForwarding yes`。登录后 OpenSSH 会为当前会话设置临时 `SSH_AUTH_SOCK`。
@@ -182,7 +188,7 @@ ghis agent setup claude --yes
 ghis agent status claude
 ```
 
-Codex launcher 使用 CLI 的 `developer_instructions` 注入；运行 `ghis setup` 后，zsh 中直接输入 `codex` 也会透明转发到该 launcher。两者都不依赖 MCP、skill 或联网文档。上下文不包含 token、私钥、SSH socket、raw remote URL 或 Doctor 诊断。agent 在具体 `git`/`gh` 操作遇到阻力时，再从 shell 运行 `ghis check` 或 `ghis doctor` 获取结构化修复信息。
+Codex launcher 使用 CLI 的 `developer_instructions` 注入；在 Unix zsh、bash 或 fish 中运行 `ghis setup` 后，直接输入 `codex` 也会透明转发到该 launcher；PowerShell 等其他 shell 可显式运行 `ghis agent run codex --`。两者都不依赖 MCP、skill 或联网文档。上下文不包含 token、私钥、SSH socket、raw remote URL 或 Doctor 诊断。agent 在具体 `git`/`gh` 操作遇到阻力时，再从 shell 运行 `ghis check` 或 `ghis doctor` 获取结构化修复信息。
 
 完整的配置、规则、1Password、SSH 签名、安全边界、Shell 说明和排障方法见 [Wiki](../../wiki)。
 

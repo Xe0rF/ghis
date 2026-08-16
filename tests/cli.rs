@@ -511,6 +511,39 @@ cwd = "*prompt-rule-cwd*"
 }
 
 #[test]
+fn diagnostic_json_uses_shared_schema_version() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+
+    let run = |args: &[&str]| {
+        let mut command = isolated_ghis_command();
+        command.current_dir(temp.path()).args(args);
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.output().expect("run ghis")
+    };
+
+    let status = run(&["status", "--json"]);
+    assert!(status.status.success());
+    let status_report: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status JSON");
+    assert_eq!(
+        status_report["schema_version"],
+        serde_json::Value::from(ghis::SCHEMA_VERSION)
+    );
+
+    let check = run(&["check", "--operation", "git", "--json", "--", "status"]);
+    assert!(matches!(check.status.code(), Some(0 | 1)));
+    let check_report: serde_json::Value =
+        serde_json::from_slice(&check.stdout).expect("check JSON");
+    assert_eq!(
+        check_report["schema_version"],
+        serde_json::Value::from(ghis::SCHEMA_VERSION)
+    );
+}
+
+#[test]
 fn prompt_profile_format_rejects_control_characters_but_json_escapes_them() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let config_directory = temp.path().join("config/ghis");

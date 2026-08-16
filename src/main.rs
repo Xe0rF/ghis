@@ -81,16 +81,16 @@ enum Commands {
     },
     /// 安装 shell 包装器
     Setup(SetupArgs),
-    /// 移除 shell 启动文件中的 ghis 管理块
+    /// 移除 ghis shell 集成
     Uninstall(ShellArgs),
     /// 输出 shell 初始化脚本
     Init(ShellArgs),
     /// 输出 shell 补全脚本
     Completion(ShellArgs),
-    /// 由 zsh wrapper 调用，透明执行真实 git
+    /// 由 shell wrapper 调用，透明执行真实 git
     #[command(trailing_var_arg = true)]
     Git(Passthrough),
-    /// 由 zsh wrapper 调用，为真实 gh 注入当前 profile token
+    /// 由 shell wrapper 调用，为真实 gh 注入当前 profile token
     #[command(trailing_var_arg = true)]
     Gh(Passthrough),
     /// Git credential helper 内部命令
@@ -269,7 +269,7 @@ struct SetupArgs {
     /// 只打印将要写入的 shell 初始化脚本
     #[arg(long)]
     print: bool,
-    /// 跳过修改 zsh 启动文件前的确认，供脚本安装使用
+    /// 跳过修改 shell 启动文件前的确认，供脚本安装使用
     #[arg(short = 'y', long)]
     yes: bool,
 }

@@ -90,5 +90,10 @@ jobs:
           toolchain: 1.97.1
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --all-targets -- --test-threads=1
+      - name: Exercise PowerShell wrapper runtime
+        run: >-
+          cargo test --locked --lib
+          shell::powershell::tests::pwsh_parses_wrapper_and_preserves_git_stdout_and_exit_status
+          -- --exact --ignored --test-threads=1
       - run: cargo build --locked --release
       - run: ./target/release/ghis.exe --version

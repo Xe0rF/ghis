@@ -3289,6 +3289,7 @@ fn push_unique(values: &mut Vec<String>, value: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::process::Command;
     use tempfile::tempdir;
 
