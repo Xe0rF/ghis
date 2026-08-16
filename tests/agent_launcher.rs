@@ -2,9 +2,12 @@
 
 use ghis::agent;
 use ghis::process::{CommandRunner, SystemCommandRunner};
+use std::ffi::OsString;
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 use tempfile::tempdir;
 
 #[test]
@@ -54,16 +57,141 @@ exit 37
     );
 }
 
+fn write_executable(path: &Path, contents: &str) {
+    fs::write(path, contents).unwrap();
+    let mut permissions = fs::metadata(path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(path, permissions).unwrap();
+}
+
+fn prepend_path(directory: &Path) -> OsString {
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    std::env::join_paths(
+        std::iter::once(directory.to_path_buf()).chain(std::env::split_paths(&inherited)),
+    )
+    .unwrap()
+}
+
+fn write_config(path: &Path) {
+    fs::write(
+        path,
+        r#"version = 1
+
+[behavior]
+default_profile = "work"
+
+[profiles.work]
+host = "github.com"
+login = "worker"
+git_name = "Worker"
+git_email = "worker@example.test"
+"#,
+    )
+    .unwrap();
+}
+
+fn wait_for(path: &Path) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !path.exists() {
+        assert!(Instant::now() < deadline, "timed out waiting for {path:?}");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
 #[test]
-fn session_shim_is_replaceable() {
-    let dir = tempdir().unwrap();
-    let target = dir.path().join("target");
-    fs::write(&target, "binary").unwrap();
-    let shim_dir = dir.path().join("shim");
-    let first =
-        agent::install_session_shim(&shim_dir, std::ffi::OsStr::new("claude"), &target).unwrap();
-    let second =
-        agent::install_session_shim(&shim_dir, std::ffi::OsStr::new("claude"), &target).unwrap();
-    assert_eq!(first, second);
-    assert_eq!(fs::read_link(second).unwrap(), target);
+fn session_shims_are_private_and_removed_after_the_child_exits() {
+    let root = tempdir().unwrap();
+    let temporary = root.path().join("temporary");
+    let bin = root.path().join("bin");
+    let readonly = root.path().join("readonly");
+    fs::create_dir_all(&temporary).unwrap();
+    fs::create_dir_all(&bin).unwrap();
+    fs::create_dir_all(&readonly).unwrap();
+    for name in ["home", "config", "cache", "state"] {
+        let path = readonly.join(name);
+        fs::create_dir(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o500)).unwrap();
+    }
+    let config = root.path().join("config.toml");
+    write_config(&config);
+    let release = root.path().join("release");
+    let launcher = bin.join("codex");
+    write_executable(
+        &launcher,
+        r#"#!/bin/sh
+set -eu
+directory=${PATH%%:*}
+printf '%s\n' "$directory" > "$OBSERVATION"
+while [ ! -f "$RELEASE" ]; do sleep 0.01; done
+exit 37
+"#,
+    );
+
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_ghis"));
+    let mut children = Vec::new();
+    let mut observations = Vec::new();
+    for index in 0..2 {
+        let observation = root.path().join(format!("observation-{index}"));
+        let mut command = Command::new(&binary);
+        command
+            .args([
+                "--config",
+                config.to_str().unwrap(),
+                "agent",
+                "run",
+                "codex",
+            ])
+            .arg("--")
+            .arg("inspect")
+            .current_dir(root.path())
+            .env("HOME", readonly.join("home"))
+            .env("XDG_CONFIG_HOME", readonly.join("config"))
+            .env("XDG_CACHE_HOME", readonly.join("cache"))
+            .env("XDG_STATE_HOME", readonly.join("state"))
+            .env("TMPDIR", &temporary)
+            .env("PATH", prepend_path(&bin))
+            .env("OBSERVATION", &observation)
+            .env("RELEASE", &release)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        children.push(command.spawn().unwrap());
+        observations.push(observation);
+    }
+
+    for observation in &observations {
+        wait_for(observation);
+    }
+    let directories = observations
+        .iter()
+        .map(|observation| PathBuf::from(fs::read_to_string(observation).unwrap().trim()))
+        .collect::<Vec<_>>();
+    assert_ne!(directories[0], directories[1]);
+    for directory in &directories {
+        assert!(directory.starts_with(&temporary));
+        assert_eq!(
+            fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        for command in ["git", "gh"] {
+            let shim = directory.join(command);
+            assert_eq!(
+                fs::metadata(shim).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+
+    fs::write(&release, "go\n").unwrap();
+    for mut child in children {
+        assert_eq!(child.wait().unwrap().code(), Some(37));
+    }
+    let remaining = fs::read_dir(&temporary)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert!(
+        remaining.is_empty(),
+        "temporary entries remain: {remaining:?}"
+    );
 }

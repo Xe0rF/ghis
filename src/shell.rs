@@ -541,6 +541,9 @@ fn metadata_mode(path: &Path) -> Option<u32> {
 }
 
 fn atomic_write(path: &Path, contents: &[u8], mode: Option<u32>) -> io::Result<()> {
+    #[cfg(not(unix))]
+    let _ = mode;
+
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     let name = path
         .file_name()

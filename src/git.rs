@@ -439,10 +439,11 @@ pub fn install_hook_if_missing(repository: &Repository, hook_name: &str) -> Resu
     }
     let temporary = path.with_extension("ghis.tmp");
     fs::write(&temporary, hook_script(hook_name))?;
-    let mut permissions = fs::metadata(&temporary)?.permissions();
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(&temporary)?.permissions();
         permissions.set_mode(0o755);
         fs::set_permissions(&temporary, permissions)?;
     }

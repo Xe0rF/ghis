@@ -553,10 +553,8 @@ fn agent_command(
         AgentCommand::Run { target, cwd, args } => {
             let cwd = cwd.unwrap_or(std::env::current_dir()?);
             let context = AgentContext::from_app(&context(path, explicit, &cwd)?);
-            let paths = ConfigPaths::discover()?;
-            let shim_dir = paths.cache_dir.join("agent-shims");
             let binary = PathBuf::from(agent_binary());
-            ghis::agent::prepare_session_shims(&shim_dir, &binary)?;
+            let shims = ghis::agent::SessionShims::create(&binary)?;
             let spec = match target {
                 AgentTarget::Claude => {
                     ghis::agent::claude::run_spec(&context, "claude", args, &cwd)
@@ -564,9 +562,10 @@ fn agent_command(
                 AgentTarget::Codex => ghis::agent::codex::run_spec(&context, "codex", args, &cwd),
             }
             .map_err(|error| app::AppError::Message(error.to_string()))?;
-            let spec = ghis::agent::prepend_path(spec, &shim_dir)?;
-            ghis::agent::launch(&ghis::process::SystemCommandRunner::new(), &spec)
-                .map_err(|error| app::AppError::Message(error.to_string()))
+            let spec = ghis::agent::prepend_path(spec, shims.directory())?;
+            let launched = ghis::agent::launch_session(&spec);
+            drop(shims);
+            launched.map_err(|error| app::AppError::Message(error.to_string()))
         }
         AgentCommand::Hook {
             target: AgentTarget::Claude,

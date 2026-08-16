@@ -6,8 +6,12 @@
 pub mod claude;
 pub mod codex;
 
-use std::ffi::{OsStr, OsString};
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::ffi::OsStr;
+use std::ffi::OsString;
+use std::path::Path;
+#[cfg(unix)]
+use std::path::PathBuf;
 
 use thiserror::Error;
 
@@ -62,73 +66,114 @@ pub fn launch<R: CommandRunner>(runner: &R, spec: &CommandSpec) -> Result<i32, A
     Ok(status.code().unwrap_or(1))
 }
 
-/// Create a PATH shim directory for one session without editing shell startup
-/// files. This is intentionally small so the shell-agent implementation can
-/// merge it into its own session environment mechanism.
-#[cfg(unix)]
-pub fn install_session_shim(
-    directory: &Path,
-    name: &OsStr,
-    target: &Path,
-) -> std::io::Result<std::path::PathBuf> {
-    use std::os::unix::fs::symlink;
-
-    std::fs::create_dir_all(directory)?;
-    let shim = directory.join(name);
-    match std::fs::remove_file(&shim) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
+/// Run a command with inherited stdio while retaining control of its lifecycle.
+///
+/// Unlike the Unix process runner's `exec` fast path, this waits for the child
+/// so the private shim directory is removed before the caller returns.
+pub fn launch_session(spec: &CommandSpec) -> Result<i32, AgentError> {
+    let mut command = std::process::Command::new(spec.program());
+    command.args(spec.arguments());
+    for key in spec.removed_environment() {
+        command.env_remove(key);
     }
-    symlink(target, &shim)?;
-    Ok(shim)
+    for (key, value) in spec.environment() {
+        command.env(key, value);
+    }
+    if let Some(directory) = spec.current_directory() {
+        command.current_dir(directory);
+    }
+    let status = command.status().map_err(|source| {
+        AgentError::Process(ProcessError::Wait {
+            command: spec.display(),
+            source,
+        })
+    })?;
+    Ok(status.code().unwrap_or(1))
+}
+
+/// A private PATH shim directory which remains available for the child process.
+///
+/// The directory is removed when this value is dropped. Callers must keep it
+/// alive until the launched process has exited.
+pub struct SessionShims {
+    directory: tempfile::TempDir,
+}
+
+impl SessionShims {
+    /// Create an isolated shim directory outside the workspace and user cache.
+    ///
+    /// On Unix, an absolute `TMPDIR` is preferred and `/tmp` is the fallback.
+    /// Other platforms fail closed until an equivalent private launcher can be
+    /// provided without relying on Unix shell scripts.
+    pub fn create(ghis: &Path) -> std::io::Result<Self> {
+        create_session_shims(ghis)
+    }
+
+    /// Directory prepended to the launched process's PATH.
+    pub fn directory(&self) -> &Path {
+        self.directory.path()
+    }
+}
+
+#[cfg(unix)]
+fn create_session_shims(ghis: &Path) -> std::io::Result<SessionShims> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = create_session_directory()?;
+    std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
+    write_shim(directory.path(), "git", ghis)?;
+    write_shim(directory.path(), "gh", ghis)?;
+    Ok(SessionShims { directory })
+}
+
+#[cfg(unix)]
+fn create_session_directory() -> std::io::Result<tempfile::TempDir> {
+    let temporary = std::env::var_os("TMPDIR")
+        .filter(|path| Path::new(path).is_absolute())
+        .and_then(|path| {
+            tempfile::Builder::new()
+                .prefix("ghis-agent-")
+                .tempdir_in(path)
+                .ok()
+        });
+
+    match temporary {
+        Some(directory) => Ok(directory),
+        None => tempfile::Builder::new()
+            .prefix("ghis-agent-")
+            .tempdir_in("/tmp"),
+    }
+}
+
+#[cfg(unix)]
+fn write_shim(directory: &Path, command: &str, ghis: &Path) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+
+    let destination = directory.join(command);
+    let contents = format!(
+        "#!/bin/sh\nPATH=\"${{GHIS_AGENT_REAL_PATH:-$PATH}}\"; export PATH\nexec {} {} -- \"$@\"\n",
+        shell_word(ghis.as_os_str()),
+        command,
+    );
+    let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
+    temporary.write_all(contents.as_bytes())?;
+    temporary.as_file_mut().sync_all()?;
+    std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700))?;
+    temporary.as_file_mut().sync_all()?;
+    temporary
+        .persist(&destination)
+        .map_err(|error| error.error)?;
+    std::fs::File::open(directory)?.sync_all()?;
+    Ok(destination)
 }
 
 #[cfg(not(unix))]
-pub fn install_session_shim(
-    _directory: &Path,
-    _name: &OsStr,
-    _target: &Path,
-) -> std::io::Result<std::path::PathBuf> {
+fn create_session_shims(_ghis: &Path) -> std::io::Result<SessionShims> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
-        "session shims are currently supported on Unix only",
+        "private launch shims are unavailable on this platform; refusing to bypass managed commands",
     ))
-}
-
-pub fn prepare_session_shims(directory: &Path, ghis: &Path) -> std::io::Result<[PathBuf; 2]> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
-        std::fs::create_dir_all(directory)?;
-        let ghis = shell_word(ghis.as_os_str());
-        let mut written = Vec::new();
-        for command in ["git", "gh"] {
-            let path = directory.join(command);
-            let temporary = directory.join(format!(".{command}.ghis-tmp-{}", std::process::id()));
-            let contents = format!(
-                "#!/bin/sh\nPATH=\"${{GHIS_AGENT_REAL_PATH:-$PATH}}\"; export PATH\nexec {ghis} {command} -- \"$@\"\n"
-            );
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true).mode(0o700);
-            let mut file = options.open(&temporary)?;
-            std::io::Write::write_all(&mut file, contents.as_bytes())?;
-            file.sync_all()?;
-            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o700))?;
-            std::fs::rename(&temporary, &path)?;
-            written.push(path);
-        }
-        Ok([written.remove(0), written.remove(0)])
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (directory, ghis);
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Unsupported,
-            "session shims are currently supported on Unix only",
-        ))
-    }
 }
 
 /// Prepend one directory to PATH without changing any existing entries.
@@ -143,6 +188,7 @@ pub fn prepend_path(spec: CommandSpec, directory: &Path) -> std::io::Result<Comm
         .env("PATH", value))
 }
 
+#[cfg(unix)]
 fn shell_word(value: &OsStr) -> String {
     let value = value.to_string_lossy();
     format!("'{}'", value.replace('\'', "'\\''"))

@@ -13,6 +13,7 @@ pub mod diagnostics;
 pub mod git;
 pub mod github;
 pub mod onboarding;
+pub mod platform;
 pub mod process;
 pub mod repo;
 pub mod shell;

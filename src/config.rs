@@ -7,14 +7,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use fd_lock::RwLock;
 use globset::{Glob, GlobBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tempfile::NamedTempFile;
 use thiserror::Error;
 use toml_edit::{ArrayOfTables, DocumentMut, Item};
 
@@ -45,24 +44,13 @@ pub struct ConfigPaths {
 impl ConfigPaths {
     /// Resolve paths from the process environment.
     pub fn discover() -> Result<Self, ConfigError> {
-        let home = env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| ConfigError::Paths("HOME is not set".into()))?;
-        let config_base = xdg_dir("XDG_CONFIG_HOME", home.join(".config"));
-        let cache_base = xdg_dir("XDG_CACHE_HOME", home.join(".cache"));
-        let state_base = xdg_dir("XDG_STATE_HOME", home.join(".local").join("state"));
-        let config_dir = config_base.join("ghis");
-        let cache_dir = cache_base.join("ghis");
-        let state_dir = state_base.join("ghis");
-        Ok(Self {
-            config_file: config_dir.join("config.toml"),
-            fragments_dir: config_dir.join("fragments"),
-            log_file: state_dir.join("ghis.log"),
-            repositories_file: state_dir.join("repositories.json"),
-            config_dir,
-            cache_dir,
-            state_dir,
-        })
+        let directories = crate::platform::UserDirectories::discover()
+            .map_err(|error| ConfigError::Paths(error.to_string()))?;
+        Ok(Self::from_bases(
+            directories.config_base,
+            directories.cache_base,
+            directories.state_base,
+        ))
     }
 
     /// Build paths under explicit XDG base directories.  This is useful for
@@ -165,14 +153,6 @@ fn config_namespace_base(path: &Path) -> PathBuf {
     } else {
         path.to_path_buf()
     }
-}
-
-fn xdg_dir(variable: &str, fallback: PathBuf) -> PathBuf {
-    xdg_dir_from_value(env::var_os(variable).map(PathBuf::from), fallback)
-}
-
-fn xdg_dir_from_value(value: Option<PathBuf>, fallback: PathBuf) -> PathBuf {
-    value.filter(|path| path.is_absolute()).unwrap_or(fallback)
 }
 
 /// Policy for a repository whose profile cannot be resolved uniquely.
@@ -423,9 +403,9 @@ impl Config {
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
         self.validate()?;
         let path = path.as_ref();
-        with_config_write_lock(path, |parent| {
+        with_config_write_lock(path, || {
             let document = load_document(path)?;
-            write_document(path, parent, document, self)
+            write_document(path, document, self)
         })
     }
 
@@ -440,11 +420,11 @@ impl Config {
         F: FnOnce(&mut Self) -> std::result::Result<T, E>,
     {
         let path = path.as_ref();
-        with_config_write_lock(path, |parent| {
+        with_config_write_lock(path, || {
             let (document, mut config) = load_document_and_config(path).map_err(E::from)?;
             let result = update(&mut config)?;
             config.validate().map_err(E::from)?;
-            write_document(path, parent, document, &config).map_err(E::from)?;
+            write_document(path, document, &config).map_err(E::from)?;
             Ok((config, result))
         })
     }
@@ -609,7 +589,7 @@ fn config_lock_path(path: &Path) -> PathBuf {
 fn with_config_write_lock<T, E, F>(path: &Path, operation: F) -> std::result::Result<T, E>
 where
     E: From<ConfigError>,
-    F: FnOnce(&Path) -> std::result::Result<T, E>,
+    F: FnOnce() -> std::result::Result<T, E>,
 {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
@@ -628,7 +608,7 @@ where
         .map_err(E::from)?;
     let mut lock = RwLock::new(lock_file);
     let _guard = lock.write().map_err(ConfigError::Lock).map_err(E::from)?;
-    operation(parent)
+    operation()
 }
 
 fn load_document(path: &Path) -> Result<DocumentMut, ConfigError> {
@@ -670,7 +650,6 @@ fn load_document_and_config(path: &Path) -> Result<(DocumentMut, Config), Config
 
 fn write_document(
     path: &Path,
-    parent: &Path,
     mut document: DocumentMut,
     config: &Config,
 ) -> Result<(), ConfigError> {
@@ -679,42 +658,13 @@ fn write_document(
         .parse::<DocumentMut>()
         .map_err(|error| ConfigError::Validation(format!("invalid generated TOML: {error}")))?;
     merge_document(&mut document, &replacement);
-
-    let mut temp = NamedTempFile::new_in(parent).map_err(|source| ConfigError::Io {
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    temp.write_all(document.to_string().as_bytes())
-        .map_err(|source| ConfigError::Io {
-            path: temp.path().to_path_buf(),
+    crate::platform::atomic_write(path, document.to_string().as_bytes()).map_err(|source| {
+        ConfigError::Io {
+            path: path.to_path_buf(),
             source,
-        })?;
-    temp.as_file()
-        .sync_all()
-        .map_err(|source| ConfigError::Io {
-            path: temp.path().to_path_buf(),
-            source,
-        })?;
-    if let Ok(metadata) = fs::metadata(path) {
-        let _ = fs::set_permissions(temp.path(), metadata.permissions());
-    } else {
-        set_private_permissions(temp.path());
-    }
-    temp.persist(path).map_err(|error| ConfigError::Io {
-        path: path.to_path_buf(),
-        source: error.error,
-    })?;
-    Ok(())
+        }
+    })
 }
-
-#[cfg(unix)]
-fn set_private_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-}
-
-#[cfg(not(unix))]
-fn set_private_permissions(_path: &Path) {}
 
 fn merge_document(dst: &mut DocumentMut, src: &DocumentMut) {
     for (key, source_item) in src.iter() {
@@ -1405,24 +1355,6 @@ profile = "work"
         assert!(saved.contains("# keep this comment"));
         assert!(saved.contains("unknown = true"));
         assert!(saved.contains("[profiles.personal]"));
-    }
-
-    #[test]
-    fn xdg_paths_ignore_empty_and_relative_overrides() {
-        let fallback = PathBuf::from("/home/alice/.config");
-        assert_eq!(xdg_dir_from_value(None, fallback.clone()), fallback);
-        assert_eq!(
-            xdg_dir_from_value(Some(PathBuf::new()), fallback.clone()),
-            fallback
-        );
-        assert_eq!(
-            xdg_dir_from_value(Some(PathBuf::from("relative")), fallback.clone()),
-            fallback
-        );
-        assert_eq!(
-            xdg_dir_from_value(Some(PathBuf::from("/var/tmp/config")), fallback),
-            PathBuf::from("/var/tmp/config")
-        );
     }
 
     #[test]
