@@ -226,3 +226,50 @@ jobs:
       - name: Cargo compile-only check
         if: steps.std.outputs.available == 'true'
         run: cargo check --locked --target "${{ matrix.target }}"
+
+  container-policy:
+    name: Container mount and credential isolation smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify read-only config/fragments and isolated state
+        run: |
+          set -eu
+          root=$(mktemp -d)
+          trap 'rm -rf "$root"' EXIT
+          mkdir -p "$root/config" "$root/fragments" "$root/cache" "$root/state"
+          printf '%s\n' 'version = 1' > "$root/config/config.toml"
+          printf '%s\n' '[include]' > "$root/fragments/work.gitconfig"
+          docker run --rm --read-only \
+            --tmpfs /tmp \
+            --mount "type=bind,src=$root/config,dst=/mnt/config,readonly" \
+            --mount "type=bind,src=$root/fragments,dst=/mnt/fragments,readonly" \
+            --mount "type=bind,src=$root/cache,dst=/mnt/cache" \
+            --mount "type=bind,src=$root/state,dst=/mnt/state" \
+            alpine:3.22 \
+            sh -eu -c '
+              test -s /mnt/config/config.toml
+              test -s /mnt/fragments/work.gitconfig
+              if touch /mnt/config/should-not-write 2>/dev/null; then exit 1; fi
+              if touch /mnt/fragments/should-not-write 2>/dev/null; then exit 1; fi
+              touch /mnt/cache/cache-entry /mnt/state/state-entry /tmp/session-entry
+              test ! -e /root/.config/gh
+              for name in GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_HOST SSH_AUTH_SOCK; do
+                if env | grep -Fq "${name}="; then
+                  echo "unexpected inherited credential environment: ${name}" >&2
+                  exit 1
+                fi
+              done
+            '
+
+  ssh-proxyjump:
+    name: Real ProxyJump and forwarded-agent signing smoke
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --locked --release
+      - run: scripts/ssh-proxyjump-smoke.sh

@@ -206,8 +206,12 @@ if ($env:GHIS_SHELL_INTEGRATION_HEALTH -ne '{HEALTHY_MARKER}') {{ exit 21 }}
 $application = Get-Command -Name ghis -CommandType Application -ErrorAction Stop | Select-Object -First 1
 if ([IO.Path]::GetExtension($application.Path) -ine '.exe') {{ exit 22 }}
 Write-Output "APP=$($application.Path)"
-$ghisVersion = & ghis --version | Select-Object -First 1
-if ($LASTEXITCODE -ne 0 -or -not $ghisVersion.StartsWith('ghis ')) {{ exit 23 }}
+$ghisOutput = @(& ghis --version)
+$ghisExitCode = $LASTEXITCODE
+$ghisVersion = $ghisOutput | Select-Object -First 1
+Write-Output "GHIS_EXIT=$ghisExitCode"
+Write-Output "GHIS_RAW=$ghisVersion"
+if ($ghisExitCode -ne 0 -or -not $ghisVersion.StartsWith('ghis ')) {{ exit 23 }}
 $gitVersion = git --version
 if ($LASTEXITCODE -ne 0 -or -not $gitVersion.StartsWith('git version ')) {{ exit 24 }}
 Write-Output "GHIS=$ghisVersion"

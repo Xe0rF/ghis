@@ -345,6 +345,11 @@ fn with_fragment_write_lock<T>(
         .read(true)
         .write(true)
         .open(paths.fragments_dir.join(".lock"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        lock_file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
     let mut lock = RwLock::new(lock_file);
     let _guard = lock.write()?;
     operation()

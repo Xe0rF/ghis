@@ -136,7 +136,10 @@ install -m 0644 README.md LICENSE "$package_dir/"
 "$completion_binary" completion bash > "$package_dir/completions/ghis.bash"
 "$completion_binary" completion fish > "$package_dir/completions/ghis.fish"
 "$completion_binary" completion powershell > "$package_dir/completions/ghis.ps1"
-zsh -n "$package_dir/completions/_ghis"
+case "$target" in
+  *-windows-*) ;;
+  *) zsh -n "$package_dir/completions/_ghis" ;;
+esac
 bash -n "$package_dir/completions/ghis.bash"
 
 archive_format=tar.gz
