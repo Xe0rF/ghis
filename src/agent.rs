@@ -120,9 +120,10 @@ fn create_session_shims(ghis: &Path) -> std::io::Result<SessionShims> {
     use std::os::unix::fs::PermissionsExt;
 
     let directory = create_session_directory()?;
+    let real_path = session_real_path()?;
     std::fs::set_permissions(directory.path(), std::fs::Permissions::from_mode(0o700))?;
-    write_shim(directory.path(), "git", ghis)?;
-    write_shim(directory.path(), "gh", ghis)?;
+    write_shim(directory.path(), "git", ghis, &real_path)?;
+    write_shim(directory.path(), "gh", ghis, &real_path)?;
     Ok(SessionShims { directory })
 }
 
@@ -146,18 +147,25 @@ fn create_session_directory() -> std::io::Result<tempfile::TempDir> {
 }
 
 #[cfg(unix)]
-fn write_shim(directory: &Path, command: &str, ghis: &Path) -> std::io::Result<PathBuf> {
+fn write_shim(
+    directory: &Path,
+    command: &str,
+    ghis: &Path,
+    real_path: &OsStr,
+) -> std::io::Result<PathBuf> {
     use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
     let destination = directory.join(command);
-    let contents = format!(
-        "#!/bin/sh\nPATH=\"${{GHIS_AGENT_REAL_PATH:-$PATH}}\"; export PATH\nexec {} {} -- \"$@\"\n",
-        shell_word(ghis.as_os_str()),
-        command,
-    );
+    let mut contents = b"#!/bin/sh\n# ghis-agent-shim\nPATH=".to_vec();
+    push_shell_word(&mut contents, real_path);
+    contents.extend_from_slice(b"; export PATH\nexec ");
+    push_shell_word(&mut contents, ghis.as_os_str());
+    contents.push(b' ');
+    contents.extend_from_slice(command.as_bytes());
+    contents.extend_from_slice(b" -- \"$@\"\n");
     let mut temporary = tempfile::NamedTempFile::new_in(directory)?;
-    temporary.write_all(contents.as_bytes())?;
+    temporary.write_all(&contents)?;
     temporary.as_file_mut().sync_all()?;
     std::fs::set_permissions(temporary.path(), std::fs::Permissions::from_mode(0o700))?;
     temporary.as_file_mut().sync_all()?;
@@ -178,7 +186,7 @@ fn create_session_shims(_ghis: &Path) -> std::io::Result<SessionShims> {
 
 /// Prepend one directory to PATH without changing any existing entries.
 pub fn prepend_path(spec: CommandSpec, directory: &Path) -> std::io::Result<CommandSpec> {
-    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let inherited = session_real_path()?;
     let value = std::env::join_paths(
         std::iter::once(directory.to_path_buf()).chain(std::env::split_paths(&inherited)),
     )
@@ -189,9 +197,60 @@ pub fn prepend_path(spec: CommandSpec, directory: &Path) -> std::io::Result<Comm
 }
 
 #[cfg(unix)]
-fn shell_word(value: &OsStr) -> String {
-    let value = value.to_string_lossy();
-    format!("'{}'", value.replace('\'', "'\\''"))
+fn session_real_path() -> std::io::Result<OsString> {
+    session_real_path_from(
+        crate::process::configured_agent_real_path(),
+        std::env::var_os("PATH"),
+    )
+}
+
+#[cfg(unix)]
+fn session_real_path_from(
+    configured: Option<OsString>,
+    inherited: Option<OsString>,
+) -> std::io::Result<OsString> {
+    if let Some(path) = configured {
+        return Ok(path);
+    }
+    let inherited = inherited.unwrap_or_default();
+    std::env::join_paths(
+        std::env::split_paths(&inherited).filter(|path| !is_agent_shim_directory(path)),
+    )
+    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+}
+
+#[cfg(unix)]
+fn is_agent_shim_directory(path: &Path) -> bool {
+    ["git", "gh"].iter().all(|command| {
+        let Ok(contents) = std::fs::read(path.join(command)) else {
+            return false;
+        };
+        contents.starts_with(b"#!/bin/sh\n# ghis-agent-shim\n")
+            || (contents.starts_with(b"#!/bin/sh\nPATH=\"${GHIS_AGENT_REAL_PATH:-$PATH}\"")
+                && contents
+                    .windows(b"\nexec ".len())
+                    .any(|part| part == b"\nexec "))
+    })
+}
+
+#[cfg(not(unix))]
+fn session_real_path() -> std::io::Result<OsString> {
+    Ok(crate::process::agent_real_path().unwrap_or_default())
+}
+
+#[cfg(unix)]
+fn push_shell_word(output: &mut Vec<u8>, value: &OsStr) {
+    use std::os::unix::ffi::OsStrExt;
+
+    output.push(b'\'');
+    for byte in value.as_bytes() {
+        if *byte == b'\'' {
+            output.extend_from_slice(b"'\\''");
+        } else {
+            output.push(*byte);
+        }
+    }
+    output.push(b'\'');
 }
 
 pub(crate) fn resolved_context<P: ContextProvider>(
@@ -204,4 +263,109 @@ pub(crate) fn resolved_context<P: ContextProvider>(
     provider
         .render_for(kind)
         .map_err(|error| AgentError::Context(Box::new(error)))
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    #[cfg(not(target_os = "macos"))]
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+
+    fn executable(path: &Path, contents: &str) {
+        std::fs::write(path, contents).unwrap();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    #[test]
+    fn nested_session_path_removes_recognized_old_and_new_shims() {
+        let root = tempfile::tempdir().unwrap();
+        let legacy = root.path().join("legacy");
+        let current = root.path().join("current");
+        let real = root.path().join("real");
+        std::fs::create_dir(&legacy).unwrap();
+        std::fs::create_dir(&current).unwrap();
+        std::fs::create_dir(&real).unwrap();
+
+        for command in ["git", "gh"] {
+            std::fs::write(
+                legacy.join(command),
+                format!(
+                    "#!/bin/sh\nPATH=\"${{GHIS_AGENT_REAL_PATH:-$PATH}}\"; export PATH\nexec ghis {command} -- \"$@\"\n"
+                ),
+            )
+            .unwrap();
+        }
+        let ghis = root.path().join("ghis");
+        executable(&ghis, "#!/bin/sh\nexit 0\n");
+        for command in ["git", "gh"] {
+            write_shim(&current, command, &ghis, real.as_os_str()).unwrap();
+        }
+
+        let inherited = std::env::join_paths([legacy, current, real.clone()]).unwrap();
+        assert_eq!(
+            session_real_path_from(None, Some(inherited)).unwrap(),
+            std::env::join_paths([real]).unwrap()
+        );
+    }
+
+    #[test]
+    fn shim_uses_embedded_real_path_when_control_environment_is_cleared() {
+        let root = tempfile::tempdir().unwrap();
+        #[cfg(target_os = "macos")]
+        let real_bin = root.path().join("real'bin");
+        #[cfg(not(target_os = "macos"))]
+        let real_bin = root
+            .path()
+            .join(std::ffi::OsStr::from_bytes(b"real'\xffbin"));
+        let shim_bin = root.path().join("shims");
+        let trace = root.path().join("trace");
+        std::fs::create_dir(&real_bin).unwrap();
+        std::fs::create_dir(&shim_bin).unwrap();
+
+        let ghis = root.path().join("ghis");
+        executable(
+            &ghis,
+            r#"#!/bin/sh
+set -eu
+depth=${GHIS_TEST_DEPTH:-0}
+if [ "$depth" -ge 1 ]; then
+    printf 'recursed\n' >> "$TRACE"
+    exit 90
+fi
+GHIS_TEST_DEPTH=$((depth + 1)); export GHIS_TEST_DEPTH
+printf 'ghis\n' >> "$TRACE"
+[ "$1" = git ]; shift
+[ "$1" = -- ]; shift
+exec git "$@"
+"#,
+        );
+        executable(
+            &real_bin.join("git"),
+            r#"#!/bin/sh
+printf 'git:%s\n' "$*" >> "$TRACE"
+"#,
+        );
+
+        let shim = write_shim(&shim_bin, "git", &ghis, real_bin.as_os_str()).unwrap();
+        let output = Command::new(shim)
+            .args(["rev-parse", "--git-dir", "--git-common-dir"])
+            .env("PATH", &shim_bin)
+            .env("TRACE", &trace)
+            .env_remove("GHIS_AGENT_REAL_PATH")
+            .env_remove("GHIS_TEST_DEPTH")
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "shim failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(
+            std::fs::read_to_string(trace).unwrap(),
+            "ghis\ngit:rev-parse --git-dir --git-common-dir\n"
+        );
+    }
 }

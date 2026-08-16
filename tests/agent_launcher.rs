@@ -99,6 +99,39 @@ fn wait_for(path: &Path) {
 }
 
 #[test]
+fn internal_git_uses_the_pre_shim_path() {
+    let root = tempdir().unwrap();
+    let real_bin = root.path().join("real-bin");
+    let shim_bin = root.path().join("shim-bin");
+    fs::create_dir(&real_bin).unwrap();
+    fs::create_dir(&shim_bin).unwrap();
+    write_executable(
+        &real_bin.join("git"),
+        "#!/bin/sh\nprintf 'real-git:%s\\n' \"$*\"\n",
+    );
+    write_executable(
+        &shim_bin.join("git"),
+        "#!/bin/sh\nprintf 'shim-reentered\\n' >&2\nexit 91\n",
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_ghis"))
+        .args(["git", "--", "status", "--short"])
+        .current_dir(root.path())
+        .env("PATH", &shim_bin)
+        .env("GHIS_AGENT_REAL_PATH", &real_bin)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "ghis git failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(output.stdout, b"real-git:status --short\n");
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("shim-reentered"));
+}
+
+#[test]
 fn session_shims_are_private_and_removed_after_the_child_exits() {
     let root = tempdir().unwrap();
     let temporary = root.path().join("temporary");

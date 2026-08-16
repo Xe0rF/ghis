@@ -869,7 +869,7 @@ pub fn run_git(
     // the wrapper must not create any ghis config/cache/state artifacts for a
     // command that can be proven not to need profile resolution.
     if is_local_read_only_git(args) {
-        let command = CommandSpec::new("git").args(args.iter().cloned());
+        let command = CommandSpec::git().args(args.iter().cloned());
         let status = SystemCommandRunner::new().run_passthrough(&command)?;
         return Ok(status.code().unwrap_or(128));
     }
@@ -920,7 +920,7 @@ pub fn run_git(
     // particular, forwarding `git -C relative/path` after changing into that
     // path would make Git apply the relative path a second time.
     let policy_index = git_policy_insertion_index(args);
-    let mut command = CommandSpec::new("git");
+    let mut command = CommandSpec::git();
     if let (Some(id), Some(profile)) = (ctx.profile_id(), ctx.profile.as_ref())
         && !repository_binding
         && !should_auto_bind

@@ -4,13 +4,14 @@
 //! this module never feeds user-controlled repository paths or profile values
 //! through `sh -c`.
 
+use crate::process::git_command;
 use crate::repo::{self, RepoError, Repository};
 use crate::signing;
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::OnceLock;
 
 #[derive(Debug)]
@@ -386,7 +387,7 @@ pub fn remove_named_hooks(repository: &Repository) -> Result<()> {
 pub fn supports_named_hooks() -> bool {
     static SUPPORTS_NAMED_HOOKS: OnceLock<bool> = OnceLock::new();
     *SUPPORTS_NAMED_HOOKS.get_or_init(|| {
-        Command::new("git")
+        git_command()
             .args(["help", "--config"])
             .output()
             .map(|output| {
@@ -540,7 +541,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    Command::new("git").args(args).current_dir(dir).output()
+    git_command().args(args).current_dir(dir).output()
 }
 
 fn command_error(operation: impl Into<String>, output: &Output) -> GitError {

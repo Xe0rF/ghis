@@ -4,11 +4,13 @@
 //! itself knows about worktrees, alternates and unusual repository layouts, so
 //! asking it for the paths also keeps this code correct for those layouts.
 
+use crate::process::git_command;
+
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 
 use tempfile::tempdir;
 
@@ -421,7 +423,7 @@ fn effective_explicit_url(
         return Err(command_error("config URL rewrites", &rules));
     }
     let scratch = tempdir()?;
-    let init = Command::new("git")
+    let init = git_command()
         .args(["init", "--bare", "-q"])
         .current_dir(scratch.path())
         .output()?;
@@ -434,7 +436,7 @@ fn effective_explicit_url(
         let Some((key, value)) = record.split_once('\n') else {
             continue;
         };
-        let output = Command::new("git")
+        let output = git_command()
             .args(["config", "--local", "--add", key, value])
             .current_dir(scratch.path())
             .output()?;
@@ -442,7 +444,7 @@ fn effective_explicit_url(
             return Err(command_error("configure URL rewrite", &output));
         }
     }
-    let add = Command::new("git")
+    let add = git_command()
         .args(["remote", "add", "synthetic", target])
         .current_dir(scratch.path())
         .output()?;
@@ -454,7 +456,7 @@ fn effective_explicit_url(
         get_args.push("--push");
     }
     get_args.push("synthetic");
-    let output = Command::new("git")
+    let output = git_command()
         .args(get_args)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_CONFIG_GLOBAL", &empty_global)
@@ -1205,7 +1207,7 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    Command::new("git").args(args).current_dir(dir).output()
+    git_command().args(args).current_dir(dir).output()
 }
 
 fn clean_stderr(output: &Output) -> String {
@@ -1224,7 +1226,6 @@ fn command_error(operation: impl Into<String>, output: &Output) -> RepoError {
 mod tests {
     use super::*;
     use std::fs;
-    use std::process::Command;
 
     #[test]
     fn parses_common_remote_urls() {
@@ -1301,7 +1302,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let repository_path = directory.path().join("repository");
         fs::create_dir_all(repository_path.join("nested")).unwrap();
-        let init = Command::new("git")
+        let init = git_command()
             .args(["init", "-q"])
             .current_dir(&repository_path)
             .output()
@@ -1317,7 +1318,7 @@ mod tests {
     fn discovers_bare_repository() {
         let directory = tempfile::tempdir().unwrap();
         let bare = directory.path().join("remote.git");
-        let init = Command::new("git")
+        let init = git_command()
             .args(["init", "-q", "--bare"])
             .arg(&bare)
             .output()
@@ -1335,7 +1336,7 @@ mod tests {
         let repository_path = directory.path().join("repository");
         fs::create_dir_all(&repository_path).unwrap();
         assert!(
-            Command::new("git")
+            git_command()
                 .args(["init", "-q"])
                 .current_dir(&repository_path)
                 .status()
@@ -1361,7 +1362,7 @@ mod tests {
         let repository_path = directory.path().join("repository");
         fs::create_dir_all(&repository_path).unwrap();
         assert!(
-            Command::new("git")
+            git_command()
                 .args(["init", "-q"])
                 .current_dir(&repository_path)
                 .status()
@@ -1369,7 +1370,7 @@ mod tests {
                 .success()
         );
         let configure = |args: &[&str]| {
-            let status = Command::new("git")
+            let status = git_command()
                 .args(args)
                 .current_dir(&repository_path)
                 .status()
@@ -1460,7 +1461,7 @@ mod tests {
         let path = directory.path().join("repository");
         fs::create_dir_all(&path).unwrap();
         assert!(
-            Command::new("git")
+            git_command()
                 .args(["init", "-q"])
                 .current_dir(&path)
                 .status()
@@ -1469,7 +1470,7 @@ mod tests {
         );
         let configure = |args: &[&str]| {
             assert!(
-                Command::new("git")
+                git_command()
                     .args(args)
                     .current_dir(&path)
                     .status()
@@ -1530,7 +1531,7 @@ mod tests {
         let path = directory.path().join("repository");
         fs::create_dir_all(&path).unwrap();
         assert!(
-            Command::new("git")
+            git_command()
                 .args(["init", "-q"])
                 .current_dir(&path)
                 .status()
@@ -1542,7 +1543,7 @@ mod tests {
             ("backup", "git@github.com:acme/backup.git"),
         ] {
             assert!(
-                Command::new("git")
+                git_command()
                     .args(["remote", "add", name, url])
                     .current_dir(&path)
                     .status()
@@ -1591,7 +1592,7 @@ mod tests {
         let path = directory.path().join("repository");
         fs::create_dir_all(&path).unwrap();
         assert!(
-            Command::new("git")
+            git_command()
                 .args(["init", "-q"])
                 .current_dir(&path)
                 .status()
@@ -1600,7 +1601,7 @@ mod tests {
         );
         let configure = |args: &[&str]| {
             assert!(
-                Command::new("git")
+                git_command()
                     .args(args)
                     .current_dir(&path)
                     .status()
