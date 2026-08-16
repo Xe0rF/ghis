@@ -890,6 +890,7 @@ pub fn run_git(
             "当前仓库身份无法唯一解析，已按 unresolved=fail 停止操作".into(),
         ));
     }
+    validate_commit_signing_argv(&ctx, args, &operation)?;
     validate_git_auth_safety(&ctx, args, &operation)?;
     let execution_policy = validate_profile_operation(&ctx, &operation)?;
     let repository_binding = matches!(ctx.resolution.source, ResolutionSource::RepositoryBinding);
@@ -942,6 +943,12 @@ pub fn run_git(
             .arg("-c")
             .arg(format!("user.signingKey={signing_key}"));
     }
+    if execution_policy.force_commit_signing {
+        // Keep this after caller-supplied global options. The argv validator
+        // also rejects unsafe overrides embedded in aliases, where insertion
+        // order cannot reliably restore the Profile policy.
+        command = command.arg("-c").arg("commit.gpgSign=true");
+    }
     if let Some(profile) = ctx.profile.as_ref() {
         // Restrict the fail-closed helper to this Profile's GitHub host. Other
         // HTTPS services and cross-host submodules keep their own helper chain.
@@ -973,6 +980,7 @@ pub fn run_git(
 struct GitExecutionPolicy {
     ssh_command: Option<String>,
     signing_key: Option<String>,
+    force_commit_signing: bool,
 }
 
 /// Return true only for Git invocations whose command and relevant options are
@@ -1174,6 +1182,7 @@ fn validate_profile_operation(
         return Ok(policy);
     };
     if operation.name == "commit" && profile.signing.enabled {
+        policy.force_commit_signing = true;
         let status = inspect_profile_signing(profile)?;
         if !status.warnings.is_empty() {
             return Err(AppError::Message(format!(
@@ -2950,6 +2959,95 @@ fn push_config_override(values: &mut Vec<GitConfigOverride>, assignment: &str, s
     });
 }
 
+fn validate_commit_signing_argv(
+    ctx: &AppContext,
+    args: &[String],
+    operation: &GitOperation,
+) -> Result<()> {
+    let signing_enabled = ctx
+        .profile
+        .as_ref()
+        .is_some_and(|profile| profile.signing.enabled);
+    validate_commit_signing_policy(signing_enabled, args, operation)
+}
+
+fn validate_commit_signing_policy(
+    signing_enabled: bool,
+    args: &[String],
+    operation: &GitOperation,
+) -> Result<()> {
+    if !signing_enabled || operation.name != "commit" {
+        return Ok(());
+    }
+
+    if commit_disables_signing(&operation.arguments) {
+        return Err(AppError::Message(
+            "当前 Profile 要求提交签名，不能使用 `commit --no-gpg-sign`；请移除该参数，或改用已禁用 signing 的 Profile"
+                .into(),
+        ));
+    }
+
+    let mut overrides = command_line_git_config(args);
+    overrides.extend(command_line_git_config(&operation.arguments));
+    if overrides
+        .iter()
+        .any(|item| item.key == "commit.gpgsign" && !git_boolean_is_enabled(&item.value))
+    {
+        return Err(AppError::Message(
+            "当前 Profile 要求提交签名，命令行 Git 配置不能关闭 `commit.gpgSign`；请移除该配置覆盖，或改用已禁用 signing 的 Profile"
+                .into(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn commit_disables_signing(args: &[String]) -> bool {
+    let Some(command) = git_subcommand_index(args) else {
+        return false;
+    };
+    let mut index = command + 1;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            break;
+        }
+        if argument == "--no-gpg-sign" {
+            return true;
+        }
+        // Do not interpret the value of an option as another option. This list
+        // covers commit options whose value can be supplied as the next argv.
+        let takes_value = matches!(
+            argument.as_str(),
+            "-m" | "--message"
+                | "-F"
+                | "--file"
+                | "-C"
+                | "--reuse-message"
+                | "-c"
+                | "--reedit-message"
+                | "--fixup"
+                | "--squash"
+                | "--author"
+                | "--date"
+                | "--cleanup"
+                | "-t"
+                | "--template"
+                | "--trailer"
+                | "--pathspec-from-file"
+                | "--untracked-files"
+        );
+        index += if takes_value { 2 } else { 1 };
+    }
+    false
+}
+
+fn git_boolean_is_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "yes" | "on" | "1"
+    )
+}
+
 fn validate_git_auth_safety(
     ctx: &AppContext,
     args: &[String],
@@ -3674,6 +3772,95 @@ mod tests {
             "commit".into(),
         ];
         assert_eq!(git_subcommand(&args), "commit");
+    }
+
+    #[test]
+    fn commit_signing_policy_rejects_no_gpg_sign_before_launching_git() {
+        let args = vec![
+            "commit".into(),
+            "--allow-empty".into(),
+            "--no-gpg-sign".into(),
+        ];
+        let operation = GitOperation {
+            name: "commit".into(),
+            conservative_sensitive: false,
+            uninspectable_alias: false,
+            arguments: args.clone(),
+        };
+
+        let error = validate_commit_signing_policy(true, &args, &operation)
+            .expect_err("enabled signing must reject --no-gpg-sign");
+        let message = error.to_string();
+        assert!(message.contains("--no-gpg-sign"));
+        assert!(message.contains("移除"));
+    }
+
+    #[test]
+    fn commit_signing_policy_rejects_false_global_config_overrides() {
+        for value in ["false", "no", "off", "0", ""] {
+            let args = vec![
+                "-c".into(),
+                format!("commit.gpgSign={value}"),
+                "commit".into(),
+            ];
+            let operation = GitOperation {
+                name: "commit".into(),
+                conservative_sensitive: false,
+                uninspectable_alias: false,
+                arguments: vec!["commit".into()],
+            };
+
+            let error = validate_commit_signing_policy(true, &args, &operation)
+                .expect_err("enabled signing must reject a false config override");
+            let message = error.to_string();
+            assert!(message.contains("commit.gpgSign"));
+            assert!(!message.contains(value) || value.is_empty());
+        }
+    }
+
+    #[test]
+    fn commit_signing_policy_allows_disabled_profiles_and_non_commit_commands() {
+        let bypass_args = vec![
+            "-c".into(),
+            "commit.gpgSign=false".into(),
+            "commit".into(),
+            "--no-gpg-sign".into(),
+        ];
+        let commit = GitOperation {
+            name: "commit".into(),
+            conservative_sensitive: false,
+            uninspectable_alias: false,
+            arguments: vec!["commit".into(), "--no-gpg-sign".into()],
+        };
+        validate_commit_signing_policy(false, &bypass_args, &commit)
+            .expect("disabled signing keeps normal Git behavior");
+
+        let status = GitOperation {
+            name: "status".into(),
+            conservative_sensitive: false,
+            uninspectable_alias: false,
+            arguments: vec!["status".into(), "--no-gpg-sign".into()],
+        };
+        validate_commit_signing_policy(true, &bypass_args, &status)
+            .expect("non-commit commands are unaffected");
+    }
+
+    #[test]
+    fn commit_signing_policy_ignores_option_values_and_pathspecs() {
+        for args in [
+            vec!["commit", "-m", "--no-gpg-sign"],
+            vec!["commit", "--", "--no-gpg-sign"],
+        ] {
+            let arguments = args.into_iter().map(String::from).collect::<Vec<_>>();
+            let operation = GitOperation {
+                name: "commit".into(),
+                conservative_sensitive: false,
+                uninspectable_alias: false,
+                arguments: arguments.clone(),
+            };
+            validate_commit_signing_policy(true, &arguments, &operation)
+                .expect("non-option values must not be rejected");
+        }
     }
 
     #[test]
