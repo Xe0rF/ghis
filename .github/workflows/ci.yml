@@ -8,6 +8,9 @@ on:
 permissions:
   contents: read
 
+env:
+  RUST_TOOLCHAIN: 1.97.1
+
 jobs:
   verify:
     runs-on: ubuntu-24.04
@@ -15,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.97.1
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
       - name: Install zsh, fish, and PowerShell
@@ -45,31 +48,46 @@ jobs:
           token: ${{ secrets.GITHUB_TOKEN }}
 
   package:
+    name: Runtime package (${{ matrix.target }})
     strategy:
       fail-fast: false
       matrix:
         include:
           - runner: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            artifact: ghis-linux-x86_64
+            artifact: ghis-linux-gnu-x86_64
+            alpine_smoke: false
           - runner: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
-            artifact: ghis-linux-aarch64
-          - runner: macos-14
+            artifact: ghis-linux-gnu-aarch64
+            alpine_smoke: false
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+            artifact: ghis-linux-musl-x86_64
+            alpine_smoke: true
+          # ubuntu-24.04-arm is a native GitHub-hosted Arm64 runner. Keep the
+          # Alpine runtime smoke native; do not replace it with emulation.
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            artifact: ghis-linux-musl-aarch64
+            alpine_smoke: true
+          - runner: macos-15
             target: aarch64-apple-darwin
             artifact: ghis-macos-aarch64
+            alpine_smoke: false
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.97.1
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
-      - name: Install zsh, fish, and PowerShell
+      - name: Install Linux build and shell dependencies
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y zsh fish
+          sudo apt-get install -y zsh fish musl-tools
           if ! command -v pwsh >/dev/null 2>&1; then
             curl -fsSL https://packages.microsoft.com/config/ubuntu/24.04/packages-microsoft-prod.deb \
               -o "$RUNNER_TEMP/packages-microsoft-prod.deb"
@@ -80,6 +98,26 @@ jobs:
           pwsh --version
       - run: cargo test --locked -- --test-threads=1
       - run: scripts/package-release.sh --target "${{ matrix.target }}"
+      - name: Alpine runtime smoke without gcompat
+        if: matrix.alpine_smoke
+        env:
+          GHIS_TARGET: ${{ matrix.target }}
+        run: |
+          archive=$(find dist -maxdepth 1 -type f -name "ghis-v*-${GHIS_TARGET}.tar.gz" -print -quit)
+          test -n "$archive"
+          package=$(basename "$archive" .tar.gz)
+          docker run --rm \
+            -e GHIS_PACKAGE="$package" \
+            -v "$PWD/$archive:/tmp/ghis.tar.gz:ro" \
+            alpine:3.22 \
+            sh -eu -c '
+              if apk info --installed gcompat >/dev/null 2>&1; then
+                echo "Alpine smoke image unexpectedly contains gcompat" >&2
+                exit 1
+              fi
+              tar -xzf /tmp/ghis.tar.gz -C /tmp
+              "/tmp/${GHIS_PACKAGE}/ghis" --version
+            '
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -92,7 +130,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          toolchain: 1.97.1
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --locked --all-targets -- --test-threads=1
       - name: Exercise PowerShell wrapper runtime
@@ -102,3 +140,89 @@ jobs:
           -- --exact --ignored --test-threads=1
       - run: cargo build --locked --release
       - run: ./target/release/ghis.exe --version
+
+  macos-intel-build-only:
+    name: Build-only probe (macOS x86_64, no runtime claim)
+    runs-on: macos-15-intel
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: x86_64-apple-darwin
+      - uses: Swatinem/rust-cache@v2
+      - name: Confirm Intel runner and compile without execution
+        run: |
+          test "$(uname -m)" = x86_64
+          cargo build --locked --release --target x86_64-apple-darwin
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-only-macos-x86_64
+          path: target/x86_64-apple-darwin/release/ghis
+          if-no-files-found: error
+
+  windows-arm64-build-only:
+    name: Build-only probe (Windows ARM64, no runtime claim)
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: aarch64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      - name: Confirm ARM64 runner and compile without execution
+        shell: pwsh
+        run: |
+          if ($env:PROCESSOR_ARCHITECTURE -ne 'ARM64') {
+            throw "Expected native ARM64 runner, got $env:PROCESSOR_ARCHITECTURE"
+          }
+          cargo build --locked --release --target aarch64-pc-windows-msvc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: build-only-windows-aarch64
+          path: target/aarch64-pc-windows-msvc/release/ghis.exe
+          if-no-files-found: error
+
+  bsd-compile-probe:
+    name: Compile-only probe (${{ matrix.system }}, no runtime claim)
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: FreeBSD
+            target: x86_64-unknown-freebsd
+          - system: NetBSD
+            target: x86_64-unknown-netbsd
+          - system: OpenBSD
+            target: x86_64-unknown-openbsd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+      - uses: Swatinem/rust-cache@v2
+      - name: Probe official rustup std availability
+        id: std
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          target_list=$(rustup target list --toolchain "$RUST_TOOLCHAIN") || {
+            echo "rustup failed to list targets for $RUST_TOOLCHAIN" >&2
+            exit 1
+          }
+          if printf '%s\n' "$target_list" \
+            | sed 's/ (.*)$//' \
+            | grep -Fxq "$TARGET"; then
+            echo "available=true" >> "$GITHUB_OUTPUT"
+            rustup target add --toolchain "$RUST_TOOLCHAIN" "$TARGET"
+          else
+            echo "available=false" >> "$GITHUB_OUTPUT"
+            echo "### $TARGET compile-only probe skipped" >> "$GITHUB_STEP_SUMMARY"
+            echo "Rust $RUST_TOOLCHAIN does not distribute std for this target." \
+              >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Cargo compile-only check
+        if: steps.std.outputs.available == 'true'
+        run: cargo check --locked --target "${{ matrix.target }}"

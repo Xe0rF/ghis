@@ -15,7 +15,7 @@
 
 ## 安装
 
-Linux、macOS 和 Windows 原生运行需要 Rust 1.97+、Git 与 GitHub CLI（`gh`）；Unix shell 集成使用 zsh、bash 或 fish，Windows 原生 shell 集成需要 PowerShell 7（`pwsh`）。当前 GitHub Release 已验证的预编译归档 target 为 `x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu` 和 `aarch64-apple-darwin`；其他 target（包括 Windows）需要从源码构建。Windows 上的 SSH signing、1Password socket 发现和 Unix shell 属于单独的兼容边界，默认使用 HTTPS 与 PowerShell 7。
+Linux、macOS 和 Windows 原生运行需要 Rust 1.97+、Git 与 GitHub CLI（`gh`）；Unix shell 集成使用 zsh、bash 或 fish，Windows 原生 shell 集成需要 PowerShell 7（`pwsh`）。当前 GitHub Release 已验证的预编译归档 target 为 `x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、`x86_64-unknown-linux-musl`、`aarch64-unknown-linux-musl`、`aarch64-apple-darwin` 和 `x86_64-pc-windows-msvc`；musl 归档会在无 `gcompat` 的 Alpine 3.22 中执行 runtime smoke。macOS x86_64 与 Windows ARM64 目前只有 build-only CI，不作为稳定 Release 制品；BSD 仅在官方 Rust std 可用时做 compile-only 探测，不声明运行时支持。Windows 上的 SSH signing、1Password socket 发现和 Unix shell 属于单独的兼容边界，默认使用 HTTPS 与 PowerShell 7。
 
 ```sh
 cargo install --locked --path .
