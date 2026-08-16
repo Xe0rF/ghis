@@ -53,12 +53,16 @@ jobs:
       matrix:
         include:
           - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
             artifact: ghis-linux-x86_64
           - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
             artifact: ghis-linux-aarch64
           - runner: macos-14
+            target: aarch64-apple-darwin
             artifact: ghis-macos-aarch64
           - runner: windows-latest
+            target: x86_64-pc-windows-msvc
             artifact: ghis-windows-x86_64
     runs-on: ${{ matrix.runner }}
     steps:
@@ -86,7 +90,7 @@ jobs:
         shell: pwsh
         run: |
           & 'C:\msys64\usr\bin\bash.exe' -lc 'pacman -S --needed --noconfirm zsh python'
-      - run: scripts/package-release.sh
+      - run: scripts/package-release.sh --target "${{ matrix.target }}"
         shell: bash
         env:
           GHIS_RELEASE_TAG: ${{ github.ref_name }}
