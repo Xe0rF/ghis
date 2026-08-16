@@ -213,8 +213,8 @@ impl AppContext {
     /// available through `ghis status` and should not accompany every command.
     pub fn operation_banner(&self) -> String {
         match self.profile_id() {
-            Some(id) => format!("ghis: profile={id}"),
-            None => "ghis: profile=未解析".into(),
+            Some(id) => format!("GHIS Profile: {id}"),
+            None => "GHIS Profile: 未解析".into(),
         }
     }
 
@@ -869,23 +869,37 @@ fn resolution_source_name(source: &ResolutionSource) -> String {
 }
 
 /// 执行一次经过身份解析的 git 命令。
-pub fn run_git(
-    args: &[String],
+pub fn run_git<A>(
+    args: &[A],
     config_path: Option<&Path>,
     explicit: Option<&str>,
     cwd: &Path,
-) -> Result<i32> {
+) -> Result<i32>
+where
+    A: AsRef<std::ffi::OsStr>,
+{
+    let forwarded_args = args
+        .iter()
+        .map(|arg| arg.as_ref().to_os_string())
+        .collect::<Vec<_>>();
     // The CLI wrapper invokes this command as `ghis git -- "$@"` so Clap can
     // preserve arbitrary Git options. Remove that transport separator before
     // handing arguments to Git; otherwise `ghis git -- --version` turns the
     // version flag into a subcommand and Git reports a misleading `-c` error.
-    let args = args.strip_prefix(&["--".to_string()]).unwrap_or(args);
+    let forwarded_args = forwarded_args
+        .strip_prefix(&[std::ffi::OsString::from("--")])
+        .unwrap_or(&forwarded_args);
+    let argument_view = forwarded_args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let args = argument_view.as_slice();
     // A small, closed whitelist lets ordinary local inspection keep Git's own
     // argv, cwd and stdio untouched. Keep this before ConfigPaths::discover:
     // the wrapper must not create any ghis config/cache/state artifacts for a
     // command that can be proven not to need profile resolution.
     if is_local_read_only_git(args) {
-        let command = CommandSpec::git().args(args.iter().cloned());
+        let command = CommandSpec::git().args(forwarded_args.iter().cloned());
         let status = SystemCommandRunner::new().run_passthrough(&command)?;
         return Ok(status.code().unwrap_or(128));
     }
@@ -953,7 +967,7 @@ pub fn run_git(
     // credential policy after caller global options, but before Git's `--`
     // option terminator/subcommand. Appending `-c` after `--` makes Git treat it
     // as a command (notably for `git --version` and `ghis git -- --version`).
-    command = command.args(args[..policy_index].iter().cloned());
+    command = command.args(forwarded_args[..policy_index].iter().cloned());
     if let Some(signing_key) = execution_policy.signing_key.as_deref() {
         command = command
             .arg("-c")
@@ -981,7 +995,7 @@ pub fn run_git(
         // the same custom cache/state namespace after Git changes directory.
         command = command.env("GHIS_CONFIG", ctx.paths.config_file.as_os_str());
     }
-    command = command.args(args[policy_index..].iter().cloned());
+    command = command.args(forwarded_args[policy_index..].iter().cloned());
     if let Some(ssh_command) = execution_policy.ssh_command {
         command = apply_managed_ssh_environment(command, ssh_command);
     }
@@ -1365,12 +1379,24 @@ pub fn profile_signing_fingerprint(profile: &Profile) -> Option<String> {
 }
 
 /// 执行一次带 profile token 的 gh 命令，token 只进入子进程环境。
-pub fn run_gh(
-    args: &[String],
+pub fn run_gh<A>(
+    args: &[A],
     config_path: Option<&Path>,
     explicit: Option<&str>,
     cwd: &Path,
-) -> Result<i32> {
+) -> Result<i32>
+where
+    A: AsRef<std::ffi::OsStr>,
+{
+    let forwarded_args = args
+        .iter()
+        .map(|arg| arg.as_ref().to_os_string())
+        .collect::<Vec<_>>();
+    let argument_view = forwarded_args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let args = argument_view.as_slice();
     let mut paths = ConfigPaths::discover()?;
     if let Some(path) = config_path {
         paths.set_config_file(path)?;
@@ -1396,8 +1422,8 @@ pub fn run_gh(
         if !ctx.warnings.is_empty() {
             eprintln!("ghis: {}", ctx.warnings.join("；"));
         }
-        let mut command = CommandSpec::new("gh")
-            .args(args.iter().cloned())
+        let mut command = CommandSpec::gh()
+            .args(forwarded_args.iter().cloned())
             .current_dir(cwd);
         if config_path.is_some() {
             command = command.env("GHIS_CONFIG", ctx.paths.config_file.as_os_str());
@@ -1432,8 +1458,8 @@ pub fn run_gh(
     let token_text = token
         .as_str()
         .ok_or_else(|| AppError::Message("gh 返回的 token 不是 UTF-8".into()))?;
-    let mut command = CommandSpec::new("gh")
-        .args(args.iter().cloned())
+    let mut command = CommandSpec::gh()
+        .args(forwarded_args.iter().cloned())
         .clear_github_auth_env()
         .remove_env("GH_REPO")
         .env_secret(

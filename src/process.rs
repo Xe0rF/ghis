@@ -87,6 +87,15 @@ impl CommandSpec {
         command
     }
 
+    /// Start the real GitHub CLI, bypassing an active agent shim.
+    pub fn gh() -> Self {
+        let mut command = Self::new("gh");
+        if let Some(path) = agent_real_path() {
+            command.environment.insert(OsString::from("PATH"), path);
+        }
+        command
+    }
+
     /// Add one argument, preserving it as an independent argv element.
     pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
         self.args.push(arg.into());

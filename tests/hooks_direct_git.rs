@@ -260,7 +260,7 @@ fn named_hooks_coexist_with_core_hooks_path_and_run_on_direct_push() {
     );
     assert_success(&committed, "commit through direct Git");
     assert!(
-        String::from_utf8_lossy(&committed.stderr).contains("ghis: profile=work"),
+        String::from_utf8_lossy(&committed.stderr).contains("GHIS Profile: work"),
         "named ghis hook did not run: {}",
         String::from_utf8_lossy(&committed.stderr)
     );
@@ -309,7 +309,7 @@ fn named_hooks_coexist_with_core_hooks_path_and_run_on_direct_push() {
         String::from_utf8_lossy(&pushed.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&pushed.stderr).contains("ghis: profile=work"),
+        String::from_utf8_lossy(&pushed.stderr).contains("GHIS Profile: work"),
         "named ghis pre-push hook did not run: {}",
         String::from_utf8_lossy(&pushed.stderr)
     );
@@ -387,7 +387,7 @@ fn husky_style_hooks_path_coexists_with_named_hooks_and_nested_absolute_git() {
     );
     assert_success(&committed, "commit through Husky-style hooks path");
     assert!(
-        String::from_utf8_lossy(&committed.stderr).contains("ghis: profile=work"),
+        String::from_utf8_lossy(&committed.stderr).contains("GHIS Profile: work"),
         "ghis prepare-commit-msg named hook did not run: {}",
         String::from_utf8_lossy(&committed.stderr)
     );
@@ -451,7 +451,7 @@ fn pre_commit_style_legacy_chain_coexists_with_ghis_named_hooks() {
     );
     assert_success(&committed, "commit through legacy hook chain");
     assert!(
-        String::from_utf8_lossy(&committed.stderr).contains("ghis: profile=work"),
+        String::from_utf8_lossy(&committed.stderr).contains("GHIS Profile: work"),
         "ghis prepare-commit-msg named hook did not run: {}",
         String::from_utf8_lossy(&committed.stderr)
     );

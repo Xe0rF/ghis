@@ -1,14 +1,22 @@
 #[cfg(windows)]
 #[test]
-fn windows_private_shims_fail_closed_without_an_argv_transparent_native_launcher() {
-    let error = ghis::agent::SessionShims::create(std::path::Path::new("ghis.exe"))
-        .err()
-        .expect("Windows must fail closed without a native shim");
-    assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
-    let message = error.to_string();
-    assert!(message.contains("Windows agent launcher is currently unavailable"));
-    assert!(message.contains("argv-transparent native launcher"));
-    assert!(message.contains("run the target CLI directly"));
+fn windows_private_shims_are_native_executable_copies() {
+    let source = assert_cmd::cargo::cargo_bin!("ghis");
+
+    let source_size = std::fs::metadata(&source).unwrap().len();
+    assert!(source_size > 0);
+
+    let shims = ghis::agent::SessionShims::create(&source).unwrap();
+    for command in ["git.exe", "gh.exe"] {
+        assert_eq!(
+            std::fs::metadata(shims.directory().join(command))
+                .unwrap()
+                .len(),
+            source_size
+        );
+    }
+    assert!(!shims.directory().join("git.cmd").exists());
+    assert!(!shims.directory().join("gh.cmd").exists());
 }
 
 #[cfg(not(any(unix, windows)))]

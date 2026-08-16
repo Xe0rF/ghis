@@ -196,7 +196,7 @@ git_email = "work@example.test"
         "Work Identity|work@example.test"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("ghis: profile=work"));
+    assert!(stderr.contains("GHIS Profile: work"));
     assert!(!stderr.contains("Work Identity"));
     assert!(!stderr.contains("work@example.test"));
 
@@ -215,7 +215,7 @@ git_email = "work@example.test"
         identity(&git, &plain, &temp, &global),
         "Global Identity|global@example.test"
     );
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("ghis: profile=work"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("GHIS Profile: work"));
 
     // `command git` and an absolute path bypass the zsh function too.
     let output = run_wrapped(

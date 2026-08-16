@@ -103,8 +103,8 @@ impl SessionShims {
     /// Create an isolated shim directory outside the workspace and user cache.
     ///
     /// On Unix, an absolute `TMPDIR` is preferred and `/tmp` is the fallback.
-    /// Other platforms fail closed until an argv-transparent native launcher is
-    /// available; batch files cannot safely forward arbitrary Windows argv.
+    /// On Windows, native copies of `ghis.exe` are materialized as `git.exe`
+    /// and `gh.exe`; the binary dispatches them without a command shell.
     pub fn create(ghis: &Path) -> std::io::Result<Self> {
         create_session_shims(ghis)
     }
@@ -177,11 +177,45 @@ fn write_shim(
 }
 
 #[cfg(windows)]
-fn create_session_shims(_ghis: &Path) -> std::io::Result<SessionShims> {
-    Err(std::io::Error::new(
-        std::io::ErrorKind::Unsupported,
-        "Windows agent launcher is currently unavailable without an argv-transparent native launcher; run the target CLI directly instead",
-    ))
+fn create_session_shims(ghis: &Path) -> std::io::Result<SessionShims> {
+    let ghis = ghis.canonicalize()?;
+    if !ghis.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "Windows agent launcher executable does not exist",
+        ));
+    }
+
+    let directory = tempfile::Builder::new().prefix("ghis-agent-").tempdir()?;
+    for command in ["git.exe", "gh.exe"] {
+        let destination = directory.path().join(command);
+        std::fs::copy(&ghis, &destination)?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&destination)?
+            .sync_all()?;
+    }
+    Ok(SessionShims { directory })
+}
+
+/// Return the managed command selected by a native Windows agent shim.
+///
+/// The control environment is mandatory so merely renaming `ghis.exe` cannot
+/// accidentally turn a normal invocation into an agent shim. Arguments are
+/// still collected with `args_os` by the entrypoint and never joined into a
+/// command string.
+#[cfg(windows)]
+pub fn windows_native_shim_command() -> Option<&'static str> {
+    crate::process::configured_agent_real_path()?;
+    let executable = std::env::current_exe().ok()?;
+    let file_name = executable.file_name()?.to_string_lossy();
+    if file_name.eq_ignore_ascii_case("git.exe") {
+        Some("git")
+    } else if file_name.eq_ignore_ascii_case("gh.exe") {
+        Some("gh")
+    } else {
+        None
+    }
 }
 
 #[cfg(not(any(unix, windows)))]

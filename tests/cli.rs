@@ -203,6 +203,40 @@ git_email = "alice@example.test"
     .expect("config");
 }
 
+fn assert_same_json_shape(default: &serde_json::Value, redacted: &serde_json::Value) {
+    match (default, redacted) {
+        (serde_json::Value::Object(left), serde_json::Value::Object(right)) => {
+            assert_eq!(
+                left.keys().collect::<Vec<_>>(),
+                right.keys().collect::<Vec<_>>()
+            );
+            for (key, value) in left {
+                assert_same_json_shape(value, &right[key]);
+            }
+        }
+        (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
+            assert_eq!(left.len(), right.len());
+            for (left, right) in left.iter().zip(right) {
+                assert_same_json_shape(left, right);
+            }
+        }
+        (serde_json::Value::Null, serde_json::Value::Null)
+        | (serde_json::Value::Bool(_), serde_json::Value::Bool(_))
+        | (serde_json::Value::Number(_), serde_json::Value::Number(_))
+        | (serde_json::Value::String(_), serde_json::Value::String(_)) => {}
+        pair => panic!("JSON shape changed: {pair:?}"),
+    }
+}
+
+fn assert_share_safe_json(output: &[u8], forbidden_path: &Path) -> serde_json::Value {
+    let rendered = String::from_utf8_lossy(output);
+    assert!(!rendered.contains(&forbidden_path.display().to_string()));
+    assert!(!rendered.contains('\u{1b}'));
+    assert!(!rendered.contains('\u{7}'));
+    assert!(!rendered.contains("AAAA_SHARE_SAFE_KEY_MATERIAL"));
+    serde_json::from_slice(output).expect("share-safe JSON")
+}
+
 #[test]
 fn long_version_reports_build_provenance() {
     isolated_ghis_command()
@@ -394,6 +428,155 @@ signing_key = {inline_key:?}
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("status JSON");
     assert_eq!(report["signing"]["key"], "<签名公钥路径已隐藏>");
     assert!(!String::from_utf8_lossy(&output.stdout).contains(sensitive_path));
+}
+
+#[test]
+fn status_redacted_json_preserves_shape_and_identity_but_hides_paths_and_controls() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+    let repository = temp.path().join("repo-\u{1b}[31m-status-\u{7}");
+    fs::create_dir_all(&repository).expect("repository");
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repository)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let run = |args: &[&str]| {
+        let mut command = isolated_ghis_command();
+        command.current_dir(&repository).args(args);
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.output().expect("run status")
+    };
+    let default = run(&["status", "--json"]);
+    let redacted = run(&["status", "--redacted"]);
+    assert!(default.status.success() && redacted.status.success());
+    let default: serde_json::Value = serde_json::from_slice(&default.stdout).unwrap();
+    let redacted_value = assert_share_safe_json(&redacted.stdout, temp.path());
+    assert_same_json_shape(&default, &redacted_value);
+    assert_eq!(redacted_value["schema_version"], default["schema_version"]);
+    assert_eq!(redacted_value["profile"], "personal");
+    assert_eq!(redacted_value["github"]["host"], "github.com");
+    assert_eq!(redacted_value["github"]["login"], "alice");
+    assert_eq!(redacted_value["repository"], "<路径已隐藏>");
+}
+
+#[test]
+fn doctor_redacted_json_preserves_statuses_and_fingerprints_but_hides_environment_details() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+    let repository = temp.path().join("repo-doctor");
+    fs::create_dir_all(&repository).expect("repository");
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repository)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let socket = temp.path().join("agent-\u{1b}[2J-\u{7}.sock");
+
+    let run = |args: &[&str]| {
+        let mut command = isolated_ghis_command();
+        command
+            .current_dir(&repository)
+            .args(args)
+            .env("SSH_AUTH_SOCK", &socket);
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.output().expect("run doctor")
+    };
+    let default = run(&["doctor", "--json"]);
+    let redacted = run(&["doctor", "--redacted"]);
+    assert!(default.status.success() && redacted.status.success());
+    let default: serde_json::Value = serde_json::from_slice(&default.stdout).unwrap();
+    let redacted_value = assert_share_safe_json(&redacted.stdout, temp.path());
+    assert_same_json_shape(&default, &redacted_value);
+    assert_eq!(redacted_value["schema_version"], default["schema_version"]);
+    assert_eq!(redacted_value["profile"], "personal");
+    assert_eq!(redacted_value["repository"], "<路径已隐藏>");
+    assert!(
+        redacted_value["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|check| { check.get("code").is_some() && check.get("severity").is_some() })
+    );
+    assert!(
+        redacted_value["repairs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|repair| { repair.get("kind").is_some() })
+    );
+}
+
+#[test]
+fn check_redacted_json_preserves_operation_summary_and_repairs_but_hides_config_origins() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+    let repository = temp.path().join("repo-\u{1b}[3J-check-\u{7}");
+    fs::create_dir_all(&repository).expect("repository");
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repository)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .current_dir(&repository)
+            .args(["config", "--local", "user.email", "wrong@example.test"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let run = |args: &[&str]| {
+        let mut command = isolated_ghis_command();
+        command.current_dir(&repository).args(args);
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.output().expect("run check")
+    };
+    let default = run(&["check", "--operation", "git", "--json", "--", "commit"]);
+    let redacted = run(&["check", "--operation", "git", "--redacted", "--", "commit"]);
+    assert!(matches!(default.status.code(), Some(0 | 1)));
+    assert_eq!(default.status.code(), redacted.status.code());
+    let default: serde_json::Value = serde_json::from_slice(&default.stdout).unwrap();
+    let redacted_value = assert_share_safe_json(&redacted.stdout, temp.path());
+    assert_same_json_shape(&default, &redacted_value);
+    assert_eq!(redacted_value["schema_version"], default["schema_version"]);
+    assert_eq!(
+        redacted_value["operation_summary"],
+        default["operation_summary"]
+    );
+    assert!(
+        redacted_value["git_config"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|diagnostic| diagnostic["origin"] == "<路径已隐藏>"
+                && diagnostic.get("code").is_some()
+                && diagnostic.get("severity").is_some())
+    );
+    assert!(
+        redacted_value["repairs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|repair| { repair.get("kind").is_some() })
+    );
 }
 
 #[test]
@@ -2771,7 +2954,7 @@ exit 42
         }
         hook.assert()
             .success()
-            .stderr(predicate::str::contains("profile=work"))
+            .stderr(predicate::str::contains("GHIS Profile: work"))
             .stderr(predicate::str::contains("Work Identity").not())
             .stderr(predicate::str::contains("Alice").not());
     }
@@ -2980,7 +3163,7 @@ git_email = "work@example.test"
     commit
         .assert()
         .success()
-        .stderr(predicate::str::contains("profile=work"))
+        .stderr(predicate::str::contains("GHIS Profile: work"))
         .stderr(predicate::str::contains("Work Identity").not())
         .stderr(predicate::str::contains("work@example.test").not());
 
@@ -3173,6 +3356,7 @@ fn direct_hook_banner_reports_git_resolved_author_and_committer() {
     }
     hook.assert()
         .success()
+        .stderr(predicate::str::contains("ghis: 警告："))
         .stderr(predicate::str::contains(
             "实际作者=Actual Author <actual-author@example.test>",
         ))

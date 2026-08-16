@@ -152,6 +152,9 @@ struct JsonArgs {
 struct StatusArgs {
     #[arg(short = 'j', long)]
     json: bool,
+    /// JSON 中隐藏环境路径、配置来源和程序细节
+    #[arg(long)]
+    redacted: bool,
     /// 供 chpwd hook 使用：不访问网络，也不输出正文
     #[arg(long, hide = true)]
     shell: bool,
@@ -177,6 +180,9 @@ enum PromptFormatArg {
 struct DoctorArgs {
     #[arg(short = 'j', long)]
     json: bool,
+    /// JSON 中隐藏环境路径、配置来源和程序细节
+    #[arg(long)]
+    redacted: bool,
     /// 显式访问 GitHub API，核对当前 Profile 的 SSH signing 公钥
     #[arg(long, visible_alias = "check-github-signing-keys")]
     check_github_signing_key: bool,
@@ -188,6 +194,9 @@ struct CheckArgs {
     operation: CheckOperation,
     #[arg(short = 'j', long)]
     json: bool,
+    /// JSON 中隐藏环境路径、配置来源和程序细节
+    #[arg(long)]
+    redacted: bool,
     #[arg(last = true, allow_hyphen_values = true)]
     args: Vec<String>,
 }
@@ -284,7 +293,7 @@ struct OnboardArgs {
 #[derive(Debug, Args)]
 struct Passthrough {
     #[arg(allow_hyphen_values = true)]
-    args: Vec<String>,
+    args: Vec<std::ffi::OsString>,
 }
 
 #[derive(Debug, Args, Default)]
@@ -485,7 +494,7 @@ enum ConfigCommand {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = parse_cli();
     match run(cli) {
         Ok(code) => std::process::exit(code),
         Err(error) => {
@@ -493,6 +502,20 @@ fn main() {
             std::process::exit(2);
         }
     }
+}
+
+fn parse_cli() -> Cli {
+    #[cfg(windows)]
+    if let Some(command) = ghis::agent::windows_native_shim_command() {
+        let mut arguments = Vec::with_capacity(std::env::args_os().len() + 2);
+        arguments.push(std::ffi::OsString::from("ghis"));
+        arguments.push(std::ffi::OsString::from(command));
+        arguments.push(std::ffi::OsString::from("--"));
+        arguments.extend(std::env::args_os().skip(1));
+        return Cli::parse_from(arguments);
+    }
+
+    Cli::parse()
 }
 
 fn run(cli: Cli) -> app::Result<i32> {
@@ -519,6 +542,7 @@ fn run(cli: Cli) -> app::Result<i32> {
             cli.config.as_deref(),
             cli.profile.as_deref(),
             args.json,
+            args.redacted,
             args.check_github_signing_key,
         ),
         Commands::Check(args) => check(cli.config.as_deref(), cli.profile.as_deref(), args),
@@ -537,7 +561,12 @@ fn run(cli: Cli) -> app::Result<i32> {
         }
         Commands::Completion(args) => completion(resolve_shell(args.shell)?),
         Commands::Git(args) => {
-            let cwd = git_working_directory(&args.args)?;
+            let argument_view = args
+                .args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let cwd = git_working_directory(&argument_view)?;
             app::run_git(
                 &args.args,
                 cli.config.as_deref(),
@@ -780,7 +809,9 @@ fn status(path: Option<&Path>, explicit: Option<&str>, args: StatusArgs) -> app:
         return Ok(0);
     }
     let report = app::display_status(&ctx);
-    if args.json {
+    if args.redacted {
+        print_redacted_json(&report)?;
+    } else if args.json {
         print_json(&report)?;
     } else {
         println!("{}", ctx.status_summary());
@@ -1903,6 +1934,7 @@ fn doctor(
     path: Option<&Path>,
     explicit: Option<&str>,
     json: bool,
+    redacted: bool,
     check_github_signing_key: bool,
 ) -> app::Result<i32> {
     let ctx = context(path, explicit, std::env::current_dir()?)?;
@@ -2164,7 +2196,9 @@ fn doctor(
         repairs,
         warnings,
     };
-    if json {
+    if redacted {
+        print_redacted_json(&report)?;
+    } else if json {
         print_json(&report)?;
     } else {
         println!("Git: {}", tool_text(&report.git));
@@ -2480,7 +2514,9 @@ fn check(path: Option<&Path>, explicit: Option<&str>, args: CheckArgs) -> app::R
         checks,
         repairs,
     };
-    if args.json {
+    if args.redacted {
+        print_redacted_json(&report)?;
+    } else if args.json {
         print_json(&report)?;
     } else {
         println!(
@@ -3196,6 +3232,13 @@ fn join_git_c_directory(base: &Path, next: &Path) -> PathBuf {
     }
 }
 
+fn print_redacted_json<T: Serialize>(value: &T) -> app::Result<()> {
+    let mut value =
+        serde_json::to_value(value).map_err(|error| app::AppError::Message(error.to_string()))?;
+    diagnostics::redact_json_value(&mut value);
+    print_json(&value)
+}
+
 fn print_json<T: Serialize>(value: &T) -> app::Result<()> {
     serde_json::to_writer_pretty(io::stdout(), value)
         .map_err(|error| app::AppError::Message(error.to_string()))?;
@@ -3382,6 +3425,33 @@ mod tests {
             settings.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
             KNOWN_BEHAVIOR_KEYS
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_shim_parser_preserves_arbitrary_windows_os_arguments() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let non_unicode = std::ffi::OsString::from_wide(&[b'a' as u16, 0xd800, b'b' as u16]);
+        let expected = vec![
+            std::ffi::OsString::new(),
+            std::ffi::OsString::from("space quote \" & | ^ % trailing\\"),
+            non_unicode,
+        ];
+        let cli = Cli::try_parse_from(
+            [
+                std::ffi::OsString::from("ghis"),
+                std::ffi::OsString::from("git"),
+                std::ffi::OsString::from("--"),
+            ]
+            .into_iter()
+            .chain(expected.iter().cloned()),
+        )
+        .unwrap();
+        let Commands::Git(parsed) = cli.command.unwrap() else {
+            panic!("expected native git shim dispatch");
+        };
+        assert_eq!(parsed.args, expected);
     }
 
     #[test]

@@ -6,6 +6,7 @@ use crate::git::{self, ConfigEntry, EffectiveIdentities};
 use crate::repo::Remote;
 use crate::signing;
 use serde::Serialize;
+use serde_json::Value;
 use std::path::Path;
 
 /// Diagnostic severity shared by CLI JSON and text output.
@@ -841,6 +842,109 @@ fn strip_ansi_sequences(value: &str) -> String {
         }
     }
     output
+}
+
+/// Build the explicitly requested share-safe JSON view without changing the
+/// long-standing default JSON schema. Structural fields remain present, while
+/// environment-specific paths, external tool details, identity data and
+/// executable repair commands are replaced in-place.
+pub fn redact_json_value(value: &mut Value) {
+    redact_json_node(None, value);
+}
+
+fn redact_json_node(key: Option<&str>, value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (field, child) in object {
+                if redacted_json_field(key, field) {
+                    if !child.is_null() {
+                        *child = Value::String(redacted_json_placeholder(field).into());
+                    }
+                } else {
+                    redact_json_node(Some(field), child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_json_node(key, item);
+            }
+        }
+        Value::String(text) => {
+            let sanitized = sanitize_display_text(text);
+            if contains_sensitive_text(&sanitized) || contains_absolute_path(&sanitized) {
+                *text = "<已隐藏>".into();
+            } else {
+                *text = sanitized;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn redacted_json_field(parent: Option<&str>, field: &str) -> bool {
+    if parent == Some("operation_summary") {
+        return false;
+    }
+    matches!(
+        field,
+        "repository"
+            | "origin"
+            | "socket"
+            | "path"
+            | "key"
+            | "version"
+            | "shell_kind"
+            | "name"
+            | "email"
+            | "command"
+            | "health_marker"
+    ) || {
+        let lower = field.to_ascii_lowercase();
+        matches!(
+            lower.as_str(),
+            "token" | "access_token" | "secret" | "password" | "authorization"
+        )
+    }
+}
+
+fn redacted_json_placeholder(field: &str) -> &'static str {
+    match field {
+        "repository" | "origin" | "socket" | "path" => "<路径已隐藏>",
+        "command" => "<命令已隐藏>",
+        "key" => "<密钥已隐藏>",
+        "version" | "shell_kind" => "<工具信息已隐藏>",
+        "name" | "email" => "<身份信息已隐藏>",
+        _ => "<已隐藏>",
+    }
+}
+
+fn contains_sensitive_text(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("key::")
+        || lower.contains("authorization:")
+        || lower.contains("password=")
+        || lower.contains("token=")
+        || lower.contains("secret=")
+}
+
+fn contains_absolute_path(value: &str) -> bool {
+    if value.starts_with('/') || value.contains("file:/") {
+        return true;
+    }
+    value.split_whitespace().any(|word| {
+        let word = word.trim_matches(|character: char| {
+            matches!(
+                character,
+                '`' | '\'' | '"' | '(' | ')' | '[' | ']' | ',' | ';'
+            )
+        });
+        word.starts_with('/')
+            || word.starts_with("~/")
+            || (word.len() >= 3
+                && word.as_bytes()[1] == b':'
+                && matches!(word.as_bytes()[2], b'/' | b'\\'))
+    })
 }
 
 /// Escape terminal control characters before a value is rendered in text.
