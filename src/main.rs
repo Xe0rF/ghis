@@ -1,5 +1,4 @@
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
-use clap_complete::{Shell, generate};
 use ghis::agent_context::{AgentContext, AgentContextFormat};
 use ghis::app::{self, AppContext};
 use ghis::config::{
@@ -78,14 +77,14 @@ enum Commands {
         #[command(subcommand)]
         command: AgentCommand,
     },
-    /// 安装 zsh 包装器
+    /// 安装 shell 包装器
     Setup(SetupArgs),
-    /// 从 .zshrc 移除 ghis 管理块
-    Uninstall,
+    /// 移除 shell 启动文件中的 ghis 管理块
+    Uninstall(ShellArgs),
     /// 输出 shell 初始化脚本
-    Init { shell: ShellKind },
+    Init(ShellArgs),
     /// 输出 shell 补全脚本
-    Completion { shell: ShellKind },
+    Completion(ShellArgs),
     /// 由 zsh wrapper 调用，透明执行真实 git
     #[command(trailing_var_arg = true)]
     Git(Passthrough),
@@ -108,9 +107,17 @@ enum Commands {
     },
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum ShellKind {
-    Zsh,
+#[derive(Debug, Args, Default)]
+struct ShellArgs {
+    /// Shell family; when omitted, ghis detects the current shell.
+    #[arg(value_name = "SHELL", value_parser = parse_shell_kind)]
+    shell: Option<shell::ShellKind>,
+}
+
+fn parse_shell_kind(value: &str) -> Result<shell::ShellKind, String> {
+    value
+        .parse()
+        .map_err(|error: shell::ShellError| error.to_string())
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -241,7 +248,9 @@ enum AgentCommand {
 
 #[derive(Debug, Args)]
 struct SetupArgs {
-    /// 只打印将要写入的 zsh 初始化脚本
+    #[command(flatten)]
+    shell: ShellArgs,
+    /// 只打印将要写入的 shell 初始化脚本
     #[arg(long)]
     print: bool,
     /// 跳过修改 zsh 启动文件前的确认，供脚本安装使用
@@ -500,22 +509,16 @@ fn run(cli: Cli) -> app::Result<i32> {
             agent_command(cli.config.as_deref(), cli.profile.as_deref(), command)
         }
         Commands::Setup(args) => setup(args),
-        Commands::Uninstall => uninstall(),
-        Commands::Init {
-            shell: ShellKind::Zsh,
-        } => {
-            print!("{}", shell::zsh_init_script("ghis"));
+        Commands::Uninstall(args) => uninstall(args),
+        Commands::Init(args) => {
+            print!(
+                "{}",
+                shell::render_init(resolve_shell(args.shell)?, "ghis")
+                    .map_err(|error| app::AppError::Message(error.to_string()))?
+            );
             Ok(0)
         }
-        Commands::Completion {
-            shell: ShellKind::Zsh,
-        } => {
-            let mut command = Cli::command();
-            let mut completion = Vec::new();
-            generate(Shell::Zsh, &mut command, "ghis", &mut completion);
-            write_stdout(&completion)?;
-            Ok(0)
-        }
+        Commands::Completion(args) => completion(resolve_shell(args.shell)?),
         Commands::Git(args) => {
             let cwd = git_working_directory(&args.args)?;
             app::run_git(
@@ -1083,9 +1086,11 @@ fn apply_onboarding(
         let setup_result = (|| -> app::Result<()> {
             let home = std::env::var_os("HOME")
                 .ok_or_else(|| app::AppError::Message("HOME 未设置".into()))?;
-            let zshrc = shell::zshrc_path(Path::new(&home), std::env::var_os("ZDOTDIR").as_deref());
-            let init = paths.config_dir.join("init.zsh");
-            shell::setup(zshrc, &init, "ghis")?;
+            let renderer = shell::renderer(shell::ShellKind::Zsh)
+                .map_err(|error| app::AppError::Message(error.to_string()))?;
+            let init = paths.config_dir.join(renderer.spec().init_file_name());
+            let startup_file = renderer.startup_file(Path::new(&home));
+            renderer.install(&startup_file, &init, &renderer.render_init("ghis"))?;
             Ok(())
         })();
         if let Err(error) = setup_result {
@@ -1803,6 +1808,7 @@ struct DoctorShellIntegration {
     setup_installed: bool,
     repository_bound: bool,
     advice: String,
+    repair_command: String,
 }
 
 #[derive(Serialize)]
@@ -1862,7 +1868,7 @@ fn doctor(
 ) -> app::Result<i32> {
     let ctx = context(path, explicit, std::env::current_dir()?)?;
     let mut warnings = ctx.warnings.clone();
-    let shell_integration = doctor_shell_integration(&ctx);
+    let shell_integration = doctor_shell_integration(&ctx)?;
     let diagnostic_cwd = ctx
         .repository
         .as_ref()
@@ -2265,7 +2271,7 @@ fn build_doctor_checks(
             Severity::Warning
         },
         shell.advice.clone(),
-        (!shell.wrapper_loaded).then(|| RepairAction::confirmation("ghis setup")),
+        (!shell.wrapper_loaded).then(|| RepairAction::confirmation(shell.repair_command.clone())),
     ));
     if credential_available == Some(false) {
         let command = ctx.profile.as_ref().map_or_else(
@@ -2363,7 +2369,7 @@ fn check(path: Option<&Path>, explicit: Option<&str>, args: CheckArgs) -> app::R
         ctx.remote.as_ref(),
         ctx.identities.as_ref(),
     )?;
-    let shell = doctor_shell_integration(&ctx);
+    let shell = doctor_shell_integration(&ctx)?;
     let checks = build_doctor_checks(
         &ctx,
         &shell,
@@ -2409,18 +2415,22 @@ fn check(path: Option<&Path>, explicit: Option<&str>, args: CheckArgs) -> app::R
     )
 }
 
-fn doctor_shell_integration(ctx: &AppContext) -> DoctorShellIntegration {
-    let health = shell::integration_health();
-    let wrapper_loaded = shell::integration_is_loaded();
+fn doctor_shell_integration(ctx: &AppContext) -> app::Result<DoctorShellIntegration> {
+    let kind = resolve_shell(None)?;
+    let renderer =
+        shell::renderer(kind).map_err(|error| app::AppError::Message(error.to_string()))?;
+    let health = renderer.integration_health();
+    let wrapper_loaded = renderer.integration_is_loaded();
     let wrapper_healthy = health == shell::IntegrationHealth::Healthy;
-    let health_marker = std::env::var_os(shell::HEALTH_ENV)
+    let health_marker = renderer
+        .inherited_health_marker()
         .map(|value| diagnostics::sanitize_display_text(&value.to_string_lossy()));
-    let init_file = ctx.paths.config_dir.join("init.zsh");
+    let init_file = ctx.paths.config_dir.join(renderer.spec().init_file_name());
     let setup_installed = std::env::var_os("HOME")
         .map(PathBuf::from)
         .map(|home| {
-            let zshrc = shell::zshrc_path(&home, std::env::var_os("ZDOTDIR").as_deref());
-            shell::integration_is_installed(&zshrc, &init_file, "ghis")
+            let startup_file = renderer.startup_file(&home);
+            renderer.integration_is_installed(&startup_file, &init_file, "ghis")
         })
         .unwrap_or(false);
     let repository_bound = ctx
@@ -2428,15 +2438,16 @@ fn doctor_shell_integration(ctx: &AppContext) -> DoctorShellIntegration {
         .as_ref()
         .is_some_and(repository_has_ghis_persistence);
     let state = classify_shell_integration(health, setup_installed, repository_bound);
-    DoctorShellIntegration {
+    Ok(DoctorShellIntegration {
         state,
         wrapper_loaded,
         wrapper_healthy,
         health_marker,
         setup_installed,
         repository_bound,
-        advice: doctor_shell_integration_advice(state).into(),
-    }
+        advice: doctor_shell_integration_advice(state, kind).into(),
+        repair_command: renderer.setup_command().into(),
+    })
 }
 
 fn repository_has_ghis_persistence(repository: &ghis::repo::Repository) -> bool {
@@ -2509,6 +2520,7 @@ fn classify_shell_integration(
             DoctorShellIntegrationState::RepositoryOnly
         }
         shell::IntegrationHealth::NotLoaded => DoctorShellIntegrationState::NotIntegrated,
+        _ => DoctorShellIntegrationState::NotIntegrated,
     }
 }
 
@@ -2522,7 +2534,10 @@ fn doctor_shell_integration_text(state: DoctorShellIntegrationState) -> &'static
     }
 }
 
-fn doctor_shell_integration_advice(state: DoctorShellIntegrationState) -> &'static str {
+fn doctor_shell_integration_advice(
+    state: DoctorShellIntegrationState,
+    _kind: shell::ShellKind,
+) -> &'static str {
     match state {
         DoctorShellIntegrationState::WrapperLoaded => {
             "普通 git/gh 会经过 ghis；command git、绝对路径或 GHIS_BYPASS=1 仍可明确绕过 wrapper"
@@ -2765,24 +2780,44 @@ fn tool_text(status: &ToolStatus) -> String {
     }
 }
 
+/// Preserve the established zsh CLI default. Environment detection remains a
+/// public shell-layer capability for future shell-aware callers, but setup-like
+/// commands must not reinterpret a user's login shell as an install target.
+fn resolve_shell(explicit: Option<shell::ShellKind>) -> app::Result<shell::ShellKind> {
+    Ok(explicit.unwrap_or(shell::ShellKind::Zsh))
+}
+
+fn completion(kind: shell::ShellKind) -> app::Result<i32> {
+    let renderer =
+        shell::renderer(kind).map_err(|error| app::AppError::Message(error.to_string()))?;
+    let mut command = Cli::command();
+    let output = renderer.render_completion(&mut command, "ghis");
+    write_stdout(&output)?;
+    Ok(0)
+}
+
 fn setup(args: SetupArgs) -> app::Result<i32> {
+    let kind = resolve_shell(args.shell.shell)?;
+    let renderer =
+        shell::renderer(kind).map_err(|error| app::AppError::Message(error.to_string()))?;
+    let init_script = renderer.render_init("ghis");
     let paths = ConfigPaths::discover()?;
-    let init = paths.config_dir.join("init.zsh");
+    let init = paths.config_dir.join(renderer.spec().init_file_name());
     if args.print {
-        print!("{}", shell::zsh_init_script("ghis"));
+        print!("{init_script}");
         return Ok(0);
     }
     let home =
         std::env::var_os("HOME").ok_or_else(|| app::AppError::Message("HOME 未设置".into()))?;
-    let zshrc = shell::zshrc_path(Path::new(&home), std::env::var_os("ZDOTDIR").as_deref());
+    let startup_file = renderer.startup_file(Path::new(&home));
     if !args.yes {
         if !io::stdin().is_terminal() {
             return Err(app::AppError::Message(format!(
                 "非交互环境不会自动修改 {}；确认目标后重新运行 `ghis setup --yes`",
-                zshrc.display()
+                startup_file.display()
             )));
         }
-        eprint!("将备份并更新 {}，继续吗？[y/N] ", zshrc.display());
+        eprint!("将备份并更新 {}，继续吗？[y/N] ", startup_file.display());
         io::stderr().flush()?;
         let mut answer = String::new();
         io::stdin().read_line(&mut answer)?;
@@ -2791,7 +2826,7 @@ fn setup(args: SetupArgs) -> app::Result<i32> {
             return Ok(0);
         }
     }
-    let report = shell::setup(zshrc, &init, "ghis")?;
+    let report = renderer.install(&startup_file, &init, &init_script)?;
     println!(
         "zsh 集成{}：{}",
         if report.changed {
@@ -2814,11 +2849,14 @@ fn setup(args: SetupArgs) -> app::Result<i32> {
     Ok(0)
 }
 
-fn uninstall() -> app::Result<i32> {
+fn uninstall(args: ShellArgs) -> app::Result<i32> {
+    let kind = resolve_shell(args.shell)?;
+    let renderer =
+        shell::renderer(kind).map_err(|error| app::AppError::Message(error.to_string()))?;
     let home =
         std::env::var_os("HOME").ok_or_else(|| app::AppError::Message("HOME 未设置".into()))?;
-    let zshrc = shell::zshrc_path(Path::new(&home), std::env::var_os("ZDOTDIR").as_deref());
-    let changed = shell::uninstall(&zshrc)?;
+    let startup_file = renderer.startup_file(Path::new(&home));
+    let changed = renderer.uninstall(&startup_file)?;
     println!(
         "{}",
         if changed {
@@ -3033,6 +3071,46 @@ mod tests {
     #[test]
     fn cli_short_options_are_conflict_free() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn shell_commands_share_optional_shell_arguments() {
+        for command in ["setup", "uninstall", "init", "completion"] {
+            let parsed = Cli::try_parse_from(["ghis", command, "zsh"])
+                .unwrap_or_else(|error| panic!("{command} should accept zsh: {error}"));
+            assert!(matches!(
+                parsed.command,
+                Some(Commands::Setup(SetupArgs {
+                    shell: ShellArgs {
+                        shell: Some(shell::ShellKind::Zsh)
+                    },
+                    ..
+                })) | Some(Commands::Uninstall(ShellArgs {
+                    shell: Some(shell::ShellKind::Zsh)
+                })) | Some(Commands::Init(ShellArgs {
+                    shell: Some(shell::ShellKind::Zsh)
+                })) | Some(Commands::Completion(ShellArgs {
+                    shell: Some(shell::ShellKind::Zsh)
+                }))
+            ));
+        }
+    }
+
+    #[test]
+    fn shell_commands_keep_zsh_as_the_implicit_default() {
+        assert_eq!(resolve_shell(None).unwrap(), shell::ShellKind::Zsh);
+        assert_eq!(
+            resolve_shell(Some(shell::ShellKind::PowerShell)).unwrap(),
+            shell::ShellKind::PowerShell
+        );
+    }
+
+    #[test]
+    fn unknown_shell_is_rejected_during_cli_parsing() {
+        let error =
+            Cli::try_parse_from(["ghis", "init", "nu"]).expect_err("unknown shell must not parse");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(error.to_string().contains("未知 shell `nu`"));
     }
 
     #[test]

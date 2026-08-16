@@ -85,6 +85,10 @@ fn initialize_bare_remote(root: &Path) -> PathBuf {
     remote
 }
 
+fn canonical_worktree(repository: &Path) -> PathBuf {
+    fs::canonicalize(repository).expect("canonical repository path")
+}
+
 fn write_config(root: &Path) -> PathBuf {
     let config = root.join("identity config/ghis.toml");
     fs::create_dir_all(config.parent().expect("config parent")).expect("config directory");
@@ -163,6 +167,7 @@ fn named_hooks_coexist_with_core_hooks_path_and_run_on_direct_push() {
     let temporary = TempDir::new().expect("temporary directory");
     let root = temporary.path();
     let repository = initialize_repository(root);
+    let canonical_repository = canonical_worktree(&repository);
     let remote = initialize_bare_remote(root);
     let config = write_config(root);
     let hook_directory = root.join("existing hooks");
@@ -233,7 +238,12 @@ fn named_hooks_coexist_with_core_hooks_path_and_run_on_direct_push() {
         String::from_utf8_lossy(&committed.stderr)
     );
     let record = fs::read_to_string(&hook_record).expect("traditional hook record");
-    assert!(record.contains(&format!("cwd={}", repository.display())));
+    let expected_hook_cwd = format!("cwd={}", canonical_repository.display());
+    assert_eq!(
+        record.lines().next(),
+        Some(expected_hook_cwd.as_str()),
+        "traditional hook did not run in the canonical repository working directory: {record}"
+    );
     assert!(
         !record.contains("args=\n"),
         "hook did not receive hook arguments: {record}"
@@ -288,7 +298,7 @@ fn named_hooks_coexist_with_core_hooks_path_and_run_on_direct_push() {
         fs::read_to_string(&push_record).expect("traditional pre-push record"),
         format!(
             "repository={}\nremote_name=recording\nremote_url={}\nstdin:\n{expected_stdin}",
-            repository.display(),
+            canonical_repository.display(),
             remote.display(),
         )
     );
@@ -312,6 +322,7 @@ fn absolute_git_reads_bound_fragment_and_credential_helper() {
     let temporary = TempDir::new().expect("temporary directory");
     let root = temporary.path();
     let repository = initialize_repository(root);
+    let canonical_repository = canonical_worktree(&repository);
     let config = write_config(root);
     let bin_directory = root.join("bin");
     let gh_record = root.join("gh-invocation");
@@ -367,8 +378,13 @@ fn absolute_git_reads_bound_fragment_and_credential_helper() {
     assert!(response.contains("username=worker"));
     assert!(response.contains("password=credential-token"));
     let invocation = fs::read_to_string(&gh_record).expect("gh invocation record");
-    assert!(invocation.contains(&format!("cwd={}", repository.display())));
-    assert!(invocation.contains("args=auth token --hostname github.com --user worker"));
+    assert_eq!(
+        invocation,
+        format!(
+            "cwd={}\nargs=auth token --hostname github.com --user worker\n",
+            canonical_repository.display()
+        )
+    );
 }
 
 #[test]

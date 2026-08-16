@@ -1883,6 +1883,111 @@ fn init_output_is_valid_when_piped_directly_to_zsh() {
 }
 
 #[test]
+fn shell_commands_fail_closed_for_known_and_unknown_shells() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).expect("home directory");
+
+    let mut known = isolated_ghis_command();
+    known
+        .args(["setup", "bash", "--yes"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
+        .env("SHELL", "/usr/bin/zsh");
+    known
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("shell `bash` 尚未支持"));
+    assert!(!home.join(".bashrc").exists());
+
+    let mut unknown = isolated_ghis_command();
+    unknown.arg("init").arg("nu");
+    unknown
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("未知 shell `nu`"));
+}
+
+#[test]
+fn setup_print_keeps_the_zsh_rendering_without_writing_startup_files() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).expect("home directory");
+
+    let mut command = isolated_ghis_command();
+    command
+        .args(["setup", "zsh", "--print"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", temp.path().join("config"));
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ghis_dispatch()"));
+    assert!(!home.join(".zshrc").exists());
+}
+
+#[test]
+fn implicit_setup_and_uninstall_keep_zsh_without_environment_hints() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).expect("home directory");
+
+    let configure = |command: &mut AssertCommand| {
+        command
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", temp.path().join("config"))
+            .env_remove("SHELL")
+            .env_remove("ZDOTDIR")
+            .env_remove("PSModulePath");
+    };
+
+    let mut setup = isolated_ghis_command();
+    setup.args(["setup", "--yes"]);
+    configure(&mut setup);
+    setup
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("zsh 集成"));
+    let zshrc = home.join(".zshrc");
+    assert!(
+        fs::read_to_string(&zshrc)
+            .expect("zshrc")
+            .contains(ghis::shell::START_MARKER)
+    );
+
+    let mut uninstall = isolated_ghis_command();
+    uninstall.arg("uninstall");
+    configure(&mut uninstall);
+    uninstall.assert().success();
+    assert!(
+        !fs::read_to_string(&zshrc)
+            .expect("zshrc")
+            .contains(ghis::shell::START_MARKER)
+    );
+}
+
+#[test]
+fn zsh_environment_hint_beats_a_bash_login_shell_for_implicit_print() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let home = temp.path().join("home");
+    let zdotdir = temp.path().join("zsh");
+    fs::create_dir_all(&home).expect("home directory");
+    fs::create_dir_all(&zdotdir).expect("zsh directory");
+
+    let mut command = isolated_ghis_command();
+    command
+        .args(["setup", "--print"])
+        .env("HOME", &home)
+        .env("ZDOTDIR", &zdotdir)
+        .env("SHELL", "/bin/bash")
+        .env("XDG_CONFIG_HOME", temp.path().join("config"));
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ghis_dispatch()"));
+}
+
+#[test]
 fn git_wrapper_resolves_bound_profile_after_value_option_and_repeated_c() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let outer = temp.path().join("outer");
