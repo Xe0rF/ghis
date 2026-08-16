@@ -306,6 +306,109 @@ program = {signing_program:?}
 }
 
 #[test]
+fn doctor_sanitizes_untrusted_ssh_agent_stdout_and_stderr_but_keeps_exit_status() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let fake_bin = temp.path().join("bin");
+    let config_home = temp.path().join("config");
+    let cache_home = temp.path().join("cache");
+    let state_home = temp.path().join("state");
+    let config_file = config_home.join("ghis/config.toml");
+    let public_key = temp.path().join("managed.pub");
+    let agent_socket = temp.path().join("agent.sock");
+    fs::create_dir_all(&fake_bin).expect("fake bin");
+    fs::create_dir_all(config_file.parent().expect("config parent")).expect("config directory");
+    fs::write(&public_key, "ssh-ed25519 AAAAMANAGED managed\n").expect("public key");
+    fs::write(&agent_socket, "socket placeholder").expect("socket placeholder");
+    executable(
+        &fake_bin.join("gh"),
+        "#!/bin/sh\n[ \"$1 $2\" = \"auth status\" ] && printf '%s\\n' '{\"hosts\":{}}' && exit 0\nexit 64\n",
+    );
+    executable(
+        &fake_bin.join("ssh-add"),
+        r#"#!/bin/sh
+payload=$(printf '\033[31mAuthorization: Bearer agent-header-token\033[0m\nGH_TOKEN=agent-env-token\nssh-ed25519 AAAAAGENTSECRET raw agent comment\nline\033[2Jinjection\n%s' 'XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX')
+if [ "$PROBE_CHANNEL" = "stderr" ]; then
+  printf '%s\n' "$payload" >&2
+else
+  printf '%s\n' "$payload"
+fi
+exit 73
+"#,
+    );
+    fs::write(
+        &config_file,
+        format!(
+            r#"version = 1
+
+[behavior]
+default_profile = "work"
+
+[profiles.work]
+host = "github.com"
+login = "worker"
+git_name = "Work"
+git_email = "work@example.test"
+
+[profiles.work.ssh]
+mode = "managed"
+public_key = {public_key:?}
+fingerprint = "SHA256:managed"
+agent_socket = {agent_socket:?}
+"#
+        ),
+    )
+    .expect("config");
+
+    let inherited_path = std::env::var_os("PATH").expect("PATH");
+    let path = std::env::join_paths(
+        std::iter::once(fake_bin).chain(std::env::split_paths(&inherited_path)),
+    )
+    .expect("joined PATH");
+    for channel in ["stdout", "stderr"] {
+        let output = AssertCommand::cargo_bin("ghis")
+            .expect("ghis binary")
+            .args([
+                "--config",
+                config_file.to_str().expect("UTF-8 config path"),
+                "doctor",
+                "--json",
+            ])
+            .current_dir(temp.path())
+            .env("PATH", &path)
+            .env("PROBE_CHANNEL", channel)
+            .env("HOME", temp.path())
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_CACHE_HOME", &cache_home)
+            .env("XDG_STATE_HOME", &state_home)
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env_remove("GIT_CONFIG_NOSYSTEM")
+            .env_remove("GHIS_CONFIG")
+            .env_remove("GHIS_PROFILE")
+            .output()
+            .expect("run doctor");
+        assert!(output.status.success());
+        let report: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+        let error = report["ssh_agent"]["error"]
+            .as_str()
+            .expect("SSH Agent error");
+        assert!(error.contains("exit 73"));
+        assert!(error.chars().count() <= 163);
+        let rendered = String::from_utf8_lossy(&output.stdout);
+        for secret in [
+            "agent-header-token",
+            "agent-env-token",
+            "AAAAAGENTSECRET",
+            "raw agent comment",
+        ] {
+            assert!(!rendered.contains(secret), "leaked {secret} from {channel}");
+        }
+        assert!(!output.stdout.contains(&0x1b));
+        assert!(!rendered.contains(&"X".repeat(200)));
+    }
+}
+
+#[test]
 fn doctor_json_reports_system_and_global_git_conflicts_without_leaking_headers() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let fake_bin = temp.path().join("bin");

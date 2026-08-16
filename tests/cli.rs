@@ -340,6 +340,63 @@ fn status_shows_only_profile_and_description() {
 }
 
 #[test]
+fn status_json_redacts_inline_signing_material_and_key_paths() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let directory = temp.path().join("config/ghis");
+    fs::create_dir_all(&directory).expect("config directory");
+    let config = directory.join("config.toml");
+    let inline_key = "key::ssh-ed25519 AAAASTATUSSECRET private status comment";
+    fs::write(
+        &config,
+        format!(
+            r#"version = 1
+
+[behavior]
+default_profile = "work"
+
+[profiles.work]
+host = "github.com"
+login = "worker"
+git_name = "Work"
+git_email = "work@example.test"
+
+[profiles.work.signing]
+enabled = true
+signing_key = {inline_key:?}
+"#
+        ),
+    )
+    .expect("config");
+
+    let run = || {
+        let mut command = isolated_ghis_command();
+        command.current_dir(temp.path()).args(["status", "--json"]);
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.output().expect("run status JSON")
+    };
+
+    let output = run();
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("status JSON");
+    assert_eq!(report["signing"]["key"], "inline:ssh-ed25519");
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(!rendered.contains("AAAASTATUSSECRET"));
+    assert!(!rendered.contains("private status comment"));
+    assert!(!rendered.contains("key::"));
+
+    let sensitive_path = "/home/private/account/secrets/signing-key.pub";
+    let contents = fs::read_to_string(&config).expect("read config");
+    fs::write(&config, contents.replace(inline_key, sensitive_path)).expect("replace signing key");
+    let output = run();
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("status JSON");
+    assert_eq!(report["signing"]["key"], "<签名公钥路径已隐藏>");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(sensitive_path));
+}
+
+#[test]
 fn prompt_is_compact_read_only_and_preserves_resolution_precedence() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let repository = temp.path().join("repository");
@@ -541,6 +598,37 @@ fn diagnostic_json_uses_shared_schema_version() {
         check_report["schema_version"],
         serde_json::Value::from(ghis::SCHEMA_VERSION)
     );
+
+    let cases = [
+        ("git", "status", "status"),
+        ("git", "commit", "commit"),
+        ("git", "push", "push"),
+        ("gh", "repo", "repo"),
+    ];
+    let mut summaries = Vec::new();
+    for (operation, arg, expected_command) in cases {
+        let output = run(&[
+            "check",
+            "--operation",
+            operation,
+            "--json",
+            "--",
+            arg,
+            "--message",
+            "super-secret-token",
+            "https://user:password@example.test/private",
+        ]);
+        assert!(matches!(output.status.code(), Some(0 | 1)));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("check JSON");
+        assert_eq!(report["operation_summary"]["target"], operation);
+        assert_eq!(report["operation_summary"]["command"], expected_command);
+        assert!(report["operation_summary"]["sensitive_arguments_redacted"] == true);
+        let json = String::from_utf8_lossy(&output.stdout);
+        assert!(!json.contains("super-secret-token"));
+        assert!(!json.contains("user:password@example.test"));
+        summaries.push(report["operation_summary"].clone());
+    }
+    assert!(summaries.windows(2).all(|pair| pair[0] != pair[1]));
 }
 
 #[test]

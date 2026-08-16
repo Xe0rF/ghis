@@ -297,12 +297,20 @@ pub fn inspect_agent(socket: impl AsRef<Path>) -> Result<AgentInfo> {
                 error: None,
             });
         }
+        let code = output
+            .status
+            .code()
+            .map_or_else(|| "signal".to_owned(), |code| format!("exit {code}"));
         return Ok(AgentInfo {
             socket,
             source,
             available: false,
             keys: Vec::new(),
-            error: Some(message),
+            error: Some(if message.is_empty() {
+                format!("ssh-add -L failed ({code})")
+            } else {
+                format!("ssh-add -L failed ({code}): {message}")
+            }),
         });
     }
     let mut keys = Vec::new();

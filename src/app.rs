@@ -817,7 +817,7 @@ impl StatusReport {
                 config::SigningTransport::ForwardedAgent => "forwarded-agent",
             }
             .into(),
-            key: profile.signing.signing_key.clone(),
+            key: status_signing_key_selector(profile),
         });
         Self {
             schema_version: crate::SCHEMA_VERSION,
@@ -835,6 +835,22 @@ impl StatusReport {
             warnings: ctx.warnings.clone(),
         }
     }
+}
+
+fn status_signing_key_selector(profile: &Profile) -> Option<String> {
+    if let Some(fingerprint) = profile.signing.fingerprint.as_deref() {
+        return Some(format!(
+            "fingerprint:{}",
+            crate::diagnostics::sanitize_display_text(fingerprint.trim())
+        ));
+    }
+    let key = profile.signing.signing_key.as_deref()?;
+    let inline = key.trim_start().strip_prefix("key::").unwrap_or(key);
+    if signing::is_public_key_line(inline) {
+        let key_type = inline.split_whitespace().next().unwrap_or("unknown");
+        return Some(format!("inline:{key_type}"));
+    }
+    Some("<签名公钥路径已隐藏>".into())
 }
 
 fn resolution_source_name(source: &ResolutionSource) -> String {

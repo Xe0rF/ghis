@@ -2006,10 +2006,14 @@ fn doctor(
     let ssh_agent = match socket {
         Some(socket) => match signing::inspect_agent(&socket) {
             Ok(agent) => {
+                let agent_error = agent
+                    .error
+                    .as_deref()
+                    .map(diagnostics::sanitize_external_output);
                 if agent_required && !agent.available {
                     warnings.push(format!(
                         "SSH Agent 不可用：{}",
-                        agent.error.as_deref().unwrap_or("未知错误")
+                        agent_error.as_deref().unwrap_or("未知错误")
                     ));
                 }
                 let selected_key = selector
@@ -2032,10 +2036,11 @@ fn doctor(
                     available: agent.available,
                     key_count: agent.keys.len(),
                     selected_key_fingerprint: selected_key.and_then(|key| key.fingerprint),
-                    error: agent.error,
+                    error: agent_error,
                 })
             }
             Err(error) => {
+                let error = diagnostics::sanitize_external_output(&error.to_string());
                 if agent_required {
                     warnings.push(format!("SSH Agent 检查失败：{error}"));
                 }
@@ -2051,7 +2056,7 @@ fn doctor(
                     available: false,
                     key_count: 0,
                     selected_key_fingerprint: None,
-                    error: Some(error.to_string()),
+                    error: Some(error),
                 })
             }
         },
@@ -2390,10 +2395,50 @@ fn collect_repairs(
         .collect()
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct CheckOperationSummary {
+    target: String,
+    command: String,
+    argument_count: usize,
+    sensitive_arguments_redacted: bool,
+}
+
+fn summarize_check_operation(operation: CheckOperation, args: &[String]) -> CheckOperationSummary {
+    let command = args
+        .iter()
+        .find(|arg| !arg.starts_with('-'))
+        .map(|arg| match arg.as_str() {
+            "status" | "diff" | "log" | "show" | "fetch" | "pull" | "push" | "commit"
+            | "branch" | "remote" | "config" | "auth" | "api" | "repo" => arg.clone(),
+            _ => "unrecognized".to_owned(),
+        })
+        .unwrap_or_else(|| "default".to_owned());
+    let sensitive_arguments_redacted = args.iter().any(|arg| {
+        let lower = arg.to_ascii_lowercase();
+        lower.contains("token")
+            || lower.contains("authorization")
+            || lower.contains("password")
+            || lower.contains("://")
+            || lower.contains('@')
+            || lower.starts_with("-") && (lower.contains("body") || lower.contains("message"))
+    });
+    CheckOperationSummary {
+        target: match operation {
+            CheckOperation::Git => "git".to_owned(),
+            CheckOperation::Gh => "gh".to_owned(),
+        },
+        command,
+        argument_count: args.len(),
+        sensitive_arguments_redacted,
+    }
+}
+
 #[derive(Serialize)]
 struct CheckReport {
     schema_version: u32,
     operation: CheckOperation,
+    operation_summary: CheckOperationSummary,
+    git_config: diagnostics::GitConfigReport,
     checks: Vec<diagnostics::DiagnosticCheck>,
     repairs: Vec<diagnostics::RepairAction>,
 }
@@ -2430,12 +2475,25 @@ fn check(path: Option<&Path>, explicit: Option<&str>, args: CheckArgs) -> app::R
     let report = CheckReport {
         schema_version: ghis::SCHEMA_VERSION,
         operation: args.operation,
+        operation_summary: summarize_check_operation(args.operation, &args.args),
+        git_config,
         checks,
         repairs,
     };
     if args.json {
         print_json(&report)?;
     } else {
+        println!(
+            "操作\t{} {}\t参数 {} 个{}",
+            report.operation_summary.target,
+            report.operation_summary.command,
+            report.operation_summary.argument_count,
+            if report.operation_summary.sensitive_arguments_redacted {
+                "（敏感参数已隐藏）"
+            } else {
+                ""
+            }
+        );
         for check in &report.checks {
             println!(
                 "{}\t{:?}\t{}",

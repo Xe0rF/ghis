@@ -695,6 +695,154 @@ fn bounded(value: &str) -> String {
     }
 }
 
+/// Sanitize untrusted output captured from an external diagnostic probe.
+///
+/// Probe output can contain credentials as well as terminal sequences crafted
+/// to make a JSON consumer display misleading diagnostics. Keep useful text
+/// such as exit statuses, but hide common credential/header forms, public-key
+/// material and comments, remove ANSI sequences, escape remaining controls,
+/// and cap the resulting field.
+pub fn sanitize_external_output(value: &str) -> String {
+    let without_ansi = strip_ansi_sequences(value);
+    let mut redacted = Vec::new();
+    for line in without_ansi.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        redacted.push(redact_external_line(trimmed));
+    }
+    bounded(&redacted.join("\\n"))
+}
+
+fn redact_external_line(line: &str) -> String {
+    let words = line.split_whitespace().collect::<Vec<_>>();
+    if let Some(index) = words.iter().enumerate().position(|(index, word)| {
+        let word = word.trim_matches(|character: char| {
+            matches!(character, '"' | '\'' | '(' | '[' | '{' | ':' | ',')
+        });
+        is_public_key_algorithm(word)
+            && words.get(index + 1).is_some_and(|material| {
+                !material.starts_with('-')
+                    && material.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
+                    })
+            })
+    }) {
+        let prefix = words[..index].join(" ");
+        return if prefix.is_empty() {
+            "<SSH 公钥内容已隐藏>".into()
+        } else {
+            format!("{prefix} <SSH 公钥内容已隐藏>")
+        };
+    }
+
+    let lower = line.to_ascii_lowercase();
+    for header in ["authorization:", "proxy-authorization:"] {
+        if let Some(index) = lower.find(header) {
+            return format!(
+                "{}{} <已隐藏>",
+                &line[..index],
+                &line[index..index + header.len()]
+            );
+        }
+    }
+
+    let mut output = Vec::with_capacity(words.len());
+    let mut hide_next = false;
+    for word in words {
+        if hide_next {
+            output.push("<已隐藏>".to_owned());
+            hide_next = false;
+            continue;
+        }
+        let lower = word.to_ascii_lowercase();
+        if lower == "bearer" {
+            output.push(word.to_owned());
+            hide_next = true;
+            continue;
+        }
+        let separator = word.find(['=', ':']);
+        if let Some(index) = separator {
+            let name = lower[..index].trim_matches(|character: char| {
+                !character.is_ascii_alphanumeric() && character != '_' && character != '-'
+            });
+            if is_sensitive_external_name(name) {
+                output.push(format!("{}<已隐藏>", &word[..=index]));
+                continue;
+            }
+        }
+        if is_sensitive_external_name(lower.trim_matches(|character: char| {
+            !character.is_ascii_alphanumeric() && character != '_' && character != '-'
+        })) {
+            output.push(word.to_owned());
+            hide_next = true;
+            continue;
+        }
+        output.push(word.to_owned());
+    }
+    output.join(" ")
+}
+
+fn is_public_key_algorithm(value: &str) -> bool {
+    value.starts_with("ssh-ed25519")
+        || value.starts_with("ssh-rsa")
+        || value.starts_with("ecdsa-sha2-")
+        || value.starts_with("sk-ssh-")
+        || value.starts_with("sk-ecdsa-")
+        || value.starts_with("rsa-sha2-")
+}
+
+fn is_sensitive_external_name(name: &str) -> bool {
+    matches!(
+        name,
+        "token"
+            | "access_token"
+            | "auth_token"
+            | "github_token"
+            | "gh_token"
+            | "api_key"
+            | "apikey"
+            | "secret"
+    )
+}
+
+fn strip_ansi_sequences(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\u{1b}' {
+            output.push(character);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('[') => {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                let mut previous_escape = false;
+                for next in chars.by_ref() {
+                    if next == '\u{7}' || previous_escape && next == '\\' {
+                        break;
+                    }
+                    previous_escape = next == '\u{1b}';
+                }
+            }
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    output
+}
+
 /// Escape terminal control characters before a value is rendered in text.
 /// JSON would escape controls, but the text doctor output consumes these
 /// fields directly.
@@ -1165,5 +1313,27 @@ mod tests {
         assert!(!rendered.contains("Alice\nwarning"));
         assert!(rendered.contains("Alice\\nwarning\\r\\t\\u{0007}"));
         assert!(rendered.contains("file:/tmp/evil\\u{001B}[2J"));
+    }
+
+    #[test]
+    fn sanitizes_external_probe_credentials_keys_controls_and_length() {
+        let long = "x".repeat(400);
+        let raw = format!(
+            "\u{1b}[31mAuthorization: Bearer header-secret\u{1b}[0m\nGH_TOKEN=token-secret\nssh-ed25519 AAAAKEY raw-key-comment\nexit 73: {long}\r\u{7}"
+        );
+        let sanitized = sanitize_external_output(&raw);
+        assert!(sanitized.contains("exit 73"));
+        for secret in [
+            "header-secret",
+            "token-secret",
+            "AAAAKEY",
+            "raw-key-comment",
+        ] {
+            assert!(!sanitized.contains(secret));
+        }
+        assert!(!sanitized.contains('\u{1b}'));
+        assert!(!sanitized.contains('\r'));
+        assert!(!sanitized.contains('\u{7}'));
+        assert!(sanitized.chars().count() <= 163);
     }
 }

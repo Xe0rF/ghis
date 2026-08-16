@@ -46,7 +46,7 @@ fn completion_cli_output_bytes_match_goldens() {
     for (shell, expected) in [
         (
             "zsh",
-            "946cd9d31dd7519615841eaf23e555e77ec1e0788c07e79d3d58b9e1cd8cbc86",
+            "fbae48f3c627e21d659cb288cc29d0193e5ddc97e966b23564f07279be5e8f06",
         ),
         (
             "bash",
@@ -54,11 +54,11 @@ fn completion_cli_output_bytes_match_goldens() {
         ),
         (
             "fish",
-            "e525a0bd38d27b7340baad43a190d805983fdf8c36038eb5db308cbd05afce9b",
+            "a24280e22342f856942e94ecba25ebe8b618c84f991fee23d5237c44fa14b5ea",
         ),
         (
             "powershell",
-            "f2c8c52011d995f21e4dc718c4d5d0393b5d4190ff59bbc4489b2a49fd97c760",
+            "0229f3130f1c622e407ddfbd0c5f4f67a8fa4bb32ea945029b2ba50705522cb5",
         ),
     ] {
         assert_eq!(
