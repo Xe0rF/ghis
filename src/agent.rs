@@ -103,8 +103,9 @@ impl SessionShims {
     /// Create an isolated shim directory outside the workspace and user cache.
     ///
     /// On Unix, an absolute `TMPDIR` is preferred and `/tmp` is the fallback.
+    /// On Windows, private `.cmd` launchers are written into a temporary directory.
     /// Other platforms fail closed until an equivalent private launcher can be
-    /// provided without relying on Unix shell scripts.
+    /// provided without relying on a Unix shell script.
     pub fn create(ghis: &Path) -> std::io::Result<Self> {
         create_session_shims(ghis)
     }
@@ -176,7 +177,66 @@ fn write_shim(
     Ok(destination)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn create_session_shims(ghis: &Path) -> std::io::Result<SessionShims> {
+    let directory = tempfile::Builder::new().prefix("ghis-agent-").tempdir()?;
+    let real_path = session_real_path()?;
+    write_windows_shim(directory.path(), "git", ghis, &real_path)?;
+    write_windows_shim(directory.path(), "gh", ghis, &real_path)?;
+    Ok(SessionShims { directory })
+}
+
+#[cfg(windows)]
+fn write_windows_shim(
+    directory: &Path,
+    command: &str,
+    ghis: &Path,
+    real_path: &OsString,
+) -> std::io::Result<()> {
+    let path = real_path.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows agent PATH is not valid Unicode",
+        )
+    })?;
+    let ghis = ghis.to_str().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Windows ghis path is not valid Unicode",
+        )
+    })?;
+    let path = cmd_escape(path)?;
+    let ghis = cmd_escape(ghis)?;
+    let destination = directory.join(format!("{command}.cmd"));
+    let contents = format!(
+        "@echo off\r\nsetlocal\r\nset \"PATH={path}\"\r\nset \"GHIS_AGENT_REAL_PATH={path}\"\r\n\"{ghis}\" {command} -- %*\r\nexit /b %ERRORLEVEL%\r\n"
+    );
+    std::fs::write(destination, contents)
+}
+
+#[cfg(windows)]
+fn cmd_escape(value: &str) -> std::io::Result<String> {
+    if value.contains('"') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows agent paths containing quotes are unsupported",
+        ));
+    }
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '%' => escaped.push_str("%%"),
+            '^' | '&' | '|' | '<' | '>' => {
+                escaped.push('^');
+                escaped.push(character);
+            }
+            _ => escaped.push(character),
+        }
+    }
+    Ok(escaped)
+}
+
+#[cfg(not(any(unix, windows)))]
 fn create_session_shims(_ghis: &Path) -> std::io::Result<SessionShims> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,

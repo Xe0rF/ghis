@@ -215,7 +215,7 @@ pub enum ShellError {
     Unknown(String),
     #[error("无法检测当前 shell；请显式指定 zsh、bash、fish 或 powershell")]
     Undetected,
-    #[error("shell `{0}` 尚未支持；当前仅支持 zsh")]
+    #[error("shell `{0}` 尚未支持；可用值：zsh、bash、fish、powershell")]
     Unsupported(ShellKind),
 }
 
