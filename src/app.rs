@@ -817,6 +817,16 @@ pub fn run_git(
     // handing arguments to Git; otherwise `ghis git -- --version` turns the
     // version flag into a subcommand and Git reports a misleading `-c` error.
     let args = args.strip_prefix(&["--".to_string()]).unwrap_or(args);
+    // A small, closed whitelist lets ordinary local inspection keep Git's own
+    // argv, cwd and stdio untouched. Keep this before ConfigPaths::discover:
+    // the wrapper must not create any ghis config/cache/state artifacts for a
+    // command that can be proven not to need profile resolution.
+    if is_local_read_only_git(args) {
+        let command = CommandSpec::new("git").args(args.iter().cloned());
+        let status = SystemCommandRunner::new().run_passthrough(&command)?;
+        return Ok(status.code().unwrap_or(128));
+    }
+
     let mut paths = ConfigPaths::discover()?;
     if let Some(path) = config_path {
         paths.set_config_file(path)?;
@@ -916,6 +926,124 @@ pub fn run_git(
 struct GitExecutionPolicy {
     ssh_command: Option<String>,
     signing_key: Option<String>,
+}
+
+/// Return true only for Git invocations whose command and relevant options are
+/// in the local-inspection allowlist. Unknown commands and aliases deliberately
+/// return false: resolving an alias would require consulting Git config, and a
+/// shell alias can run arbitrary commands or contact a remote.
+fn is_local_read_only_git(args: &[String]) -> bool {
+    if args.is_empty()
+        || args.iter().any(|arg| {
+            arg == "-c"
+                || arg.starts_with("-c")
+                || arg == "--config-env"
+                || arg.starts_with("--config-env=")
+        })
+    {
+        return false;
+    }
+
+    let Some(index) = git_subcommand_index(args) else {
+        return matches!(args, [flag] if matches!(flag.as_str(), "--version" | "--help" | "-h"));
+    };
+    let command = args[index].as_str();
+    let command_args = &args[index + 1..];
+    match command {
+        "branch" => is_read_only_branch(command_args),
+        "config" => is_read_only_config(command_args),
+        "remote" => is_read_only_remote(command_args),
+        "reflog" => is_read_only_reflog(command_args),
+        "stash" => is_read_only_stash(command_args),
+        "tag" => is_read_only_tag(command_args),
+        "worktree" => command_args.first().is_some_and(|arg| arg == "list"),
+        "sparse-checkout" => command_args.first().is_some_and(|arg| arg == "list"),
+        "status" | "log" | "diff" | "show" | "rev-parse" | "rev-list" | "describe" | "ls-files"
+        | "ls-tree" | "cat-file" | "for-each-ref" | "for-each-reflog" | "name-rev" | "shortlog"
+        | "blame" | "grep" | "check-ignore" | "check-attr" | "verify-commit" | "verify-tag"
+        | "whatchanged" => true,
+        _ => false,
+    }
+}
+
+fn is_read_only_branch(args: &[String]) -> bool {
+    if args.is_empty() {
+        return true;
+    }
+    if args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "-d" | "-D"
+                | "-m"
+                | "-M"
+                | "-c"
+                | "-C"
+                | "--delete"
+                | "--move"
+                | "--copy"
+                | "--set-upstream-to"
+                | "-u"
+                | "--unset-upstream"
+                | "--edit-description"
+                | "--create-reflog"
+                | "--track"
+                | "--no-track"
+        ) || arg.starts_with("--delete=")
+            || arg.starts_with("--move=")
+            || arg.starts_with("--copy=")
+            || arg.starts_with("--set-upstream-to=")
+    }) {
+        return false;
+    }
+    // Require an explicit listing selector when options are present. This
+    // intentionally declines harmless but harder-to-parse forms rather than
+    // risking that a branch creation option is treated as a read.
+    args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--list" | "-l" | "-a" | "--all" | "-r" | "--remotes"
+        )
+    })
+}
+
+fn is_read_only_config(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--get"
+                | "--get-all"
+                | "--get-regexp"
+                | "--get-urlmatch"
+                | "--list"
+                | "-l"
+                | "--name-only"
+                | "--show-origin"
+                | "--show-scope"
+        )
+    })
+}
+
+fn is_read_only_remote(args: &[String]) -> bool {
+    args.is_empty()
+        || args
+            .iter()
+            .all(|arg| matches!(arg.as_str(), "-v" | "--verbose" | "get-url"))
+}
+
+fn is_read_only_reflog(args: &[String]) -> bool {
+    args.first().is_some_and(|arg| arg == "show")
+}
+
+fn is_read_only_stash(args: &[String]) -> bool {
+    args.first()
+        .is_some_and(|arg| matches!(arg.as_str(), "list" | "show"))
+}
+
+fn is_read_only_tag(args: &[String]) -> bool {
+    args.is_empty()
+        || args
+            .first()
+            .is_some_and(|arg| matches!(arg.as_str(), "--list" | "-l"))
 }
 
 #[derive(Debug)]
@@ -3496,6 +3624,36 @@ mod tests {
             "commit".into(),
         ];
         assert_eq!(git_subcommand(&args), "commit");
+    }
+
+    #[test]
+    fn local_git_classifier_allows_only_proven_read_operations() {
+        for args in [
+            vec!["status"],
+            vec!["log", "-1"],
+            vec!["-C", "nested", "diff"],
+            vec!["branch", "--list"],
+            vec!["remote", "-v"],
+            vec!["config", "--get", "user.name"],
+            vec!["--", "show", "HEAD"],
+        ] {
+            let args = args.into_iter().map(String::from).collect::<Vec<_>>();
+            assert!(is_local_read_only_git(&args), "{args:?}");
+        }
+
+        for args in [
+            vec!["commit", "-m", "message"],
+            vec!["push"],
+            vec!["fetch"],
+            vec!["submodule", "update"],
+            vec!["branch", "new-branch"],
+            vec!["branch", "--delete", "old-branch"],
+            vec!["unknown-command"],
+            vec!["-c", "alias.st=status", "st"],
+        ] {
+            let args = args.into_iter().map(String::from).collect::<Vec<_>>();
+            assert!(!is_local_read_only_git(&args), "{args:?}");
+        }
     }
 
     #[test]
