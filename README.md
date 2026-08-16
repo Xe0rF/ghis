@@ -166,7 +166,7 @@ fingerprint = "SHA256:example"
 
 `forwarded-agent` 只使用当前会话的 `SSH_AUTH_SOCK`，要求显式 public key 或 fingerprint 精确匹配；它不会查找本地 1Password socket、写入 `IdentityAgent`、覆盖 socket、自动开启 `ForwardAgent` 或把本机 `op-ssh-sign` 路径写到远端。ghis 不传输、导出或同步私钥，也不绕过 1Password 的本地批准。未显式配置 `program` 时使用远端 Git/OpenSSH 默认 SSH signer；只有显式配置的签名程序不可执行时，签名操作才会停止。
 
-`local-agent` 是旧配置的默认 transport，继续使用本机 Agent/1Password 的现有发现行为。远程 forwarding、VS Code Remote、多跳 SSH 和容器的安全边界与排障步骤见 [Wiki](../../wiki) 的 [Remote Development and Agent Forwarding](../../wiki/Remote-Development-and-Agent-Forwarding)。
+`local-agent` 是旧配置的默认 transport，继续使用本机 Agent/1Password 的现有发现行为。managed/one-password signing 会使用 `ssh -F /dev/null`，明确隔离用户 `~/.ssh/config`；因此该模式不会应用 `ProxyJump`、`ProxyCommand` 或 `Host` 别名，也不会静默把它们转换成另一条连接。需要多跳 SSH 时，应使用 external SSH transport 并由用户配置跳板与 `ForwardAgent`；managed signing 模式目前不提供多跳连接能力。远程 forwarding、VS Code Remote、多跳 SSH 和容器的安全边界与排障步骤见 [Wiki](../../wiki) 的 [Remote Development and Agent Forwarding](../../wiki/Remote-Development-and-Agent-Forwarding)。
 
 ### 多 remote 与 push URL
 
