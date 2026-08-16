@@ -76,6 +76,16 @@ Host jump
   UserKnownHostsFile /dev/null
   LogLevel ERROR
 
+Host jump2
+  HostName jump2
+  User test
+  ProxyJump jump
+  IdentityFile $work/login
+  IdentitiesOnly yes
+  StrictHostKeyChecking no
+  UserKnownHostsFile /dev/null
+  LogLevel ERROR
+
 Host target target-no-agent
   HostName target
   User test
@@ -100,6 +110,7 @@ for _ in $(seq 1 30); do
     sleep 1
 done
 ssh -F "$work/ssh_config" jump true
+ssh -F "$work/ssh_config" jump2 true
 ssh -F "$work/ssh_config" target-no-agent true
 
 eval "$(ssh-agent -s)" >/dev/null
@@ -161,16 +172,16 @@ managed_env=(
 )
 env "${managed_env[@]}" "$project_dir/target/release/ghis" \
     --config "$work/managed.toml" use managed --repo "$work/managed-repo"
-env "${managed_env[@]}" "$project_dir/target/release/ghis" \
-    --config "$work/managed.toml" git -- push origin HEAD:refs/heads/main
+(cd "$work/managed-repo" && env "${managed_env[@]}" "$project_dir/target/release/ghis" \
+    --config "$work/managed.toml" git -- push origin HEAD:refs/heads/main)
 docker exec "$target" git --git-dir=/home/test/managed.git rev-parse --verify refs/heads/main >/dev/null
 
 ssh-add "$work/login" >/dev/null
 docker cp "$work/login.pub" "$jump:/home/test/.ssh/authorized_keys"
 docker exec "$jump" chown test:test /home/test/.ssh/authorized_keys
 docker exec "$jump" chmod 600 /home/test/.ssh/authorized_keys
-if env "${managed_env[@]}" "$project_dir/target/release/ghis" \
-    --config "$work/managed.toml" git -- push origin HEAD:refs/heads/unselected-jump-key; then
+if (cd "$work/managed-repo" && env "${managed_env[@]}" "$project_dir/target/release/ghis" \
+    --config "$work/managed.toml" git -- push origin HEAD:refs/heads/unselected-jump-key); then
     echo "managed ProxyJump used an Agent key not selected by the Profile" >&2
     exit 95
 fi

@@ -366,9 +366,13 @@ fn write_managed_ssh_config_unlocked(
     };
 
     let temporary = path.with_extension(format!("sshconfig.{}.tmp", std::process::id()));
+    let user_known_hosts = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .map(|home| home.join(".ssh").join("known_hosts"));
     fs::write(
         &temporary,
-        signing::render_managed_ssh_config(&socket, &public_key),
+        signing::render_managed_ssh_config(&socket, &public_key, user_known_hosts.as_deref()),
     )?;
     #[cfg(unix)]
     {

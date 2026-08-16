@@ -544,12 +544,22 @@ pub fn signing_program_available(program: &SigningProgram) -> bool {
 /// Git executes this value through the user's shell, therefore every path is
 /// POSIX-quoted here. User SSH config and connection sharing are disabled so
 /// another configured identity or an existing multiplexed session cannot win.
-pub fn render_managed_ssh_config(socket: &Path, public_key: &Path) -> String {
-    format!(
+pub fn render_managed_ssh_config(
+    socket: &Path,
+    public_key: &Path,
+    user_known_hosts: Option<&Path>,
+) -> String {
+    let mut config = format!(
         "Host *\n  BatchMode yes\n  ControlMaster no\n  ControlPath none\n  IdentitiesOnly yes\n  IdentityAgent {}\n  IdentityFile {}\n  ForwardAgent no\n",
         ssh_config_quote_path(&expand_user(socket)),
         ssh_config_quote_path(&expand_user(public_key)),
-    )
+    );
+    if let Some(path) = user_known_hosts {
+        config.push_str("  UserKnownHostsFile ");
+        config.push_str(&ssh_config_quote_path(path));
+        config.push('\n');
+    }
+    config
 }
 
 pub fn render_ssh_command(ssh_config: &Path, proxy_jump: &[String], forward_agent: bool) -> String {
@@ -782,6 +792,7 @@ mod tests {
         let config = render_managed_ssh_config(
             Path::new("/tmp/a path/agent%.sock"),
             Path::new("/tmp/key\"s.pub"),
+            Some(Path::new("/tmp/home/.ssh/known hosts")),
         );
         assert!(config.contains("BatchMode yes"));
         assert!(config.contains("ControlMaster no"));
@@ -790,6 +801,7 @@ mod tests {
         assert!(config.contains("ForwardAgent no"));
         assert!(config.contains("agent%%.sock"));
         assert!(config.contains("key\\\"s.pub"));
+        assert!(config.contains("UserKnownHostsFile \"/tmp/home/.ssh/known hosts\""));
 
         let command = render_ssh_command(Path::new("/tmp/a config/managed's.conf"), &[], false);
         assert!(command.contains("-F '/tmp/a config/managed'\\''s.conf'"));
