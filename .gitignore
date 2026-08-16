@@ -5,7 +5,3 @@
 /src/ghis-v*.tar.gz
 /ghis-*.pkg.tar.*
 /ghis-v*.tar.gz
-/packaging/arch/pkg/
-/packaging/arch/src/
-/packaging/arch/ghis-*.pkg.tar.*
-/packaging/arch/ghis-v*.tar.gz

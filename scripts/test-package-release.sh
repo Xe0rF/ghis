@@ -8,10 +8,8 @@ trap 'rm -r -- "$tmpdir"' EXIT HUP INT TERM
 project_dir="$tmpdir/project"
 tool_dir="$tmpdir/tools"
 release_version=0.3.0
-release_sha256=1545b2bc52a646491cbab6879c955e896deb57902d93b15d46e9d3accfc574b7
-mkdir -p "$project_dir/scripts" "$project_dir/packaging/arch" "$tool_dir"
+mkdir -p "$project_dir/scripts" "$tool_dir"
 cp "$script_dir/package-release.sh" "$project_dir/scripts/package-release.sh"
-cp "$script_dir/../packaging/arch/PKGBUILD" "$project_dir/packaging/arch/PKGBUILD"
 [ "$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$script_dir/../Cargo.toml" | head -n 1)" = "$release_version" ]
 printf '%s\n' '[package]' 'name = "ghis"' "version = \"$release_version\"" > "$project_dir/Cargo.toml"
 printf '%s\n' 'Test release notes.' > "$project_dir/README.md"
@@ -112,63 +110,6 @@ if checksum != f"{sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n":
 PY
 }
 
-assert_arch_pkgbuild() {
-  archive=$1
-  srcdir="$tmpdir/arch-src"
-  pkgdir="$tmpdir/arch-pkg"
-  mkdir -p "$srcdir" "$pkgdir"
-  tar -xzf "$archive" -C "$srcdir"
-
-  bash -s -- "$project_dir/packaging/arch" "$srcdir" "$pkgdir" "$archive" "$release_version" "$release_sha256" <<'BASH'
-set -eu
-
-startdir=$1
-srcdir=$2
-pkgdir=$3
-archive=$4
-expected_version=$5
-expected_sha256=$6
-. "$startdir/PKGBUILD"
-
-[ "$pkgname" = ghis ]
-[ "$pkgver" = "$expected_version" ]
-[ "${#arch[@]}" -eq 1 ]
-[ "${arch[0]}" = x86_64 ]
-[ "${#source[@]}" -eq 1 ]
-expected_source="file://${startdir}/../../dist/ghis-v${pkgver}-x86_64-unknown-linux-gnu.tar.gz"
-[ "${source[0]}" = "$expected_source" ]
-[ "${#sha256sums[@]}" -eq 1 ]
-[ "${sha256sums[0]}" = "$expected_sha256" ]
-[ "$(readlink -f "${source[0]#file://}")" = "$(readlink -f "$archive")" ]
-
-package
-for path in \
-  usr/bin/ghis \
-  usr/share/zsh/site-functions/_ghis \
-  usr/share/doc/ghis/README.md \
-  usr/share/licenses/ghis/LICENSE; do
-  [ -f "$pkgdir/$path" ]
-done
-[ -x "$pkgdir/usr/bin/ghis" ]
-# The Arch package declares zsh as its supported completion integration. The
-# release archive carries all renderers, but PKGBUILD must not accidentally
-# install an unowned Bash, Fish, or PowerShell completion.
-for path in \
-  usr/share/bash-completion/completions/ghis \
-  usr/share/fish/vendor_completions.d/ghis.fish \
-  usr/share/powershell/Modules/ghis/ghis.ps1; do
-  [ ! -e "$pkgdir/$path" ]
-done
-cmp "$srcdir/ghis-v${pkgver}-x86_64-unknown-linux-gnu/ghis" "$pkgdir/usr/bin/ghis"
-cmp "$srcdir/ghis-v${pkgver}-x86_64-unknown-linux-gnu/completions/_ghis" \
-  "$pkgdir/usr/share/zsh/site-functions/_ghis"
-cmp "$srcdir/ghis-v${pkgver}-x86_64-unknown-linux-gnu/README.md" \
-  "$pkgdir/usr/share/doc/ghis/README.md"
-cmp "$srcdir/ghis-v${pkgver}-x86_64-unknown-linux-gnu/LICENSE" \
-  "$pkgdir/usr/share/licenses/ghis/LICENSE"
-BASH
-}
-
 for windows_target in aarch64-pc-windows-msvc x86_64-pc-windows-gnu; do
   windows_archive="$project_dir/dist/ghis-v0.3.0-$windows_target.zip"
   if [ "$windows_target" = x86_64-pc-windows-gnu ]; then
@@ -224,10 +165,5 @@ checksum = archive.with_suffix(archive.suffix + ".sha256").read_text(encoding="a
 if checksum != f"{sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n":
     raise SystemExit("tar checksum does not match")
 PY
-if [ "$(uname -s)" = Linux ]; then
-  assert_arch_pkgbuild "$unix_archive"
-else
-  printf '%s\n' 'skipping Arch PKGBUILD install test outside Linux' >&2
-fi
 
 printf '%s\n' 'package release smoke tests passed'

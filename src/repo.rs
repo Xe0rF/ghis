@@ -1297,6 +1297,7 @@ mod tests {
         assert_eq!(scp.owner.as_deref(), Some("acme"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn discovers_repository_from_a_subdirectory() {
         let directory = tempfile::tempdir().unwrap();

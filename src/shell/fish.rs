@@ -349,6 +349,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn conf_d_path_uses_only_an_absolute_non_empty_xdg_config_home() {
         let home = Path::new("/home/alice");

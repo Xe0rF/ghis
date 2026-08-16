@@ -1805,7 +1805,8 @@ struct DoctorReport {
     schema_version: u32,
     git: ToolStatus,
     gh: ToolStatus,
-    zsh: ToolStatus,
+    shell: ToolStatus,
+    shell_kind: String,
     shell_integration: DoctorShellIntegration,
     accounts: Vec<DoctorAccount>,
     repository: Option<String>,
@@ -2108,24 +2109,27 @@ fn doctor(
     );
     let git_status = tool_status("git", &["--version"]);
     let gh_status = tool_status("gh", &["--version"]);
-    let zsh_status = tool_status("zsh", &["--version"]);
+    let shell_kind = resolve_shell(None)?;
+    let shell_kind_name = shell_kind.to_string();
+    let shell_status = shell_tool_status(shell_kind);
     let checks = build_doctor_checks(
         &ctx,
         &shell_integration,
         &git_status,
         &gh_status,
-        &zsh_status,
+        &shell_status,
+        &shell_kind_name,
         credential_available,
         ssh_agent.as_ref(),
         &git_config,
     );
     let repairs = collect_repairs(&checks, &git_config);
-
     let report = DoctorReport {
         schema_version: ghis::SCHEMA_VERSION,
         git: git_status,
         gh: gh_status,
-        zsh: zsh_status,
+        shell: shell_status,
+        shell_kind: shell_kind_name,
         shell_integration,
         accounts: discovery
             .as_ref()
@@ -2160,7 +2164,7 @@ fn doctor(
     } else {
         println!("Git: {}", tool_text(&report.git));
         println!("gh: {}", tool_text(&report.gh));
-        println!("zsh: {}", tool_text(&report.zsh));
+        println!("{}: {}", report.shell_kind, tool_text(&report.shell));
         println!(
             "Shell wrapper: {}",
             doctor_shell_integration_text(report.shell_integration.state)
@@ -2271,18 +2275,19 @@ fn build_doctor_checks(
     shell: &DoctorShellIntegration,
     git: &ToolStatus,
     gh: &ToolStatus,
-    zsh: &ToolStatus,
+    shell_tool: &ToolStatus,
+    shell_kind: &str,
     credential_available: Option<bool>,
     ssh_agent: Option<&DoctorAgent>,
     git_config: &diagnostics::GitConfigReport,
 ) -> Vec<diagnostics::DiagnosticCheck> {
     use diagnostics::{DiagnosticCheck, DiagnosticCode, RepairAction, Severity};
     let mut checks = Vec::new();
-    for (name, status) in [("git", git), ("gh", gh), ("zsh", zsh)] {
+    for (name, status) in [("git", git), ("gh", gh), (shell_kind, shell_tool)] {
         checks.push(DiagnosticCheck::new(
             match name {
                 "gh" => DiagnosticCode::GhAuth,
-                "zsh" => DiagnosticCode::ShellIntegration,
+                _ if name == shell_kind => DiagnosticCode::ShellIntegration,
                 _ => DiagnosticCode::GlobalGitConfig,
             },
             if status.available {
@@ -2408,12 +2413,15 @@ fn check(path: Option<&Path>, explicit: Option<&str>, args: CheckArgs) -> app::R
         ctx.identities.as_ref(),
     )?;
     let shell = doctor_shell_integration(&ctx)?;
+    let shell_kind = resolve_shell(None)?;
+    let shell_kind_name = shell_kind.to_string();
     let checks = build_doctor_checks(
         &ctx,
         &shell,
         &tool_status("git", &["--version"]),
         &tool_status("gh", &["--version"]),
-        &tool_status("zsh", &["--version"]),
+        &shell_tool_status(shell_kind),
+        &shell_kind_name,
         None,
         None,
         &git_config,
@@ -2803,6 +2811,26 @@ fn profile_public_key_for_doctor(profile: &Profile) -> std::result::Result<Optio
         .map_err(|error| format!("无法读取签名公钥 {}：{error}", path.display()))
 }
 
+fn shell_tool_status(kind: shell::ShellKind) -> ToolStatus {
+    match kind {
+        shell::ShellKind::PowerShell => {
+            let status = tool_status("pwsh", &["--version"]);
+            if status.available {
+                status
+            } else {
+                tool_status("powershell", &["--version"])
+            }
+        }
+        shell::ShellKind::Zsh => tool_status("zsh", &["--version"]),
+        shell::ShellKind::Bash => tool_status("bash", &["--version"]),
+        shell::ShellKind::Fish => tool_status("fish", &["--version"]),
+        _ => ToolStatus {
+            available: false,
+            version: None,
+        },
+    }
+}
+
 fn tool_status(program: &str, args: &[&str]) -> ToolStatus {
     match std::process::Command::new(program).args(args).output() {
         Ok(output) => ToolStatus {
@@ -2830,11 +2858,13 @@ fn tool_text(status: &ToolStatus) -> String {
     }
 }
 
-/// Preserve the established zsh CLI default. Environment detection remains a
-/// public shell-layer capability for future shell-aware callers, but setup-like
-/// commands must not reinterpret a user's login shell as an install target.
+/// Preserve the established Unix zsh default while using native PowerShell on Windows.
 fn resolve_shell(explicit: Option<shell::ShellKind>) -> app::Result<shell::ShellKind> {
-    Ok(explicit.unwrap_or(shell::ShellKind::Zsh))
+    #[cfg(windows)]
+    let default = shell::ShellKind::PowerShell;
+    #[cfg(not(windows))]
+    let default = shell::ShellKind::Zsh;
+    Ok(explicit.unwrap_or(default))
 }
 
 /// Resolve a shell startup-file root without falling back to the current
@@ -3155,13 +3185,10 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     #[test]
-    fn shell_commands_keep_zsh_as_the_implicit_default() {
-        assert_eq!(resolve_shell(None).unwrap(), shell::ShellKind::Zsh);
-        assert_eq!(
-            resolve_shell(Some(shell::ShellKind::PowerShell)).unwrap(),
-            shell::ShellKind::PowerShell
-        );
+    fn shell_commands_use_powershell_as_the_implicit_default() {
+        assert_eq!(resolve_shell(None).unwrap(), shell::ShellKind::PowerShell);
     }
 
     #[test]

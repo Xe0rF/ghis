@@ -1,13 +1,13 @@
 # GitHub Identity Switcher (`ghis`)
 
-`ghis` 是面向 Linux 和 macOS（ARM64）并使用 zsh 的本地 GitHub 提交身份切换器。它按仓库或 worktree 选择 Profile，让普通的 `git commit`、`git push` 和 `gh` 命令使用对应的提交姓名、邮箱与 GitHub 账号，并在敏感操作前显示实际身份。
+`ghis` 是跨平台的本地 GitHub 提交身份切换器，支持 Linux、macOS 和 Windows。它按仓库或 worktree 选择 Profile，让普通的 `git commit`、`git push` 和 `gh` 命令使用对应的提交姓名、邮箱与 GitHub 账号，并在敏感操作前显示实际身份。shell 集成支持 zsh、bash、fish 和 PowerShell；Windows 原生环境默认使用 PowerShell。
 
 默认使用 HTTPS，不要求配置 SSH Authentication Key。ghis 不调用 `gh auth switch`，不保存 GitHub token，不改写 remote，也不会修改全局 `user.name` 或 `user.email`。
 
 ## 核心能力
 
 - 按仓库绑定身份，也可用规则、工作目录、remote owner 或默认值自动选择。
-- 提供完整 CLI 和透明的 zsh wrapper。
+- 提供完整 CLI 和 zsh、bash、fish、PowerShell 集成。
 - 自动发现 `gh` 已保存的账号，并为 HTTPS 操作精确选择对应凭据。
 - 可选集成 1Password SSH Agent 和 `op-ssh-sign`，为不同 Profile 使用不同的 SSH commit signing key。
 - 提供身份预览、结构化执行检查和带安全快速修复的 `doctor`；已选身份不可用时不会静默换成另一个账号。
@@ -15,7 +15,7 @@
 
 ## 安装
 
-需要 Linux（x86_64 或 ARM64）或 macOS（ARM64）、Rust 1.97+、Git、GitHub CLI（`gh`）和 zsh。创建本地发布归档还需要 Python 3；当前安装来源是源码构建、本地 Arch 归档或 GitHub Release 提供的预编译归档。
+Linux、macOS 和 Windows 原生运行需要 Rust 1.97+、Git 与 GitHub CLI（`gh`）；shell 集成按平台使用 zsh、bash、fish 或 PowerShell。创建本地发布归档还需要 Python 3；当前安装来源是源码构建、本地 Arch 归档或 GitHub Release 提供的预编译归档。Windows 上的 SSH signing、1Password socket 发现和 Unix shell（zsh/bash/fish）属于单独的兼容边界，默认使用 HTTPS 与 PowerShell。
 
 ```sh
 cargo install --locked --path .
@@ -25,11 +25,10 @@ cargo install --locked --path .
 目标平台和 debug/release 模式。设置 `SOURCE_DATE_EPOCH` 后，构建时间使用该 Unix
 时间戳，以便生成可复现的发布产物。
 
-Arch Linux 可以从当前源码生成本地归档并交给 pacman 安装：
+发布归档可以在本地生成：
 
 ```sh
 scripts/package-release.sh
-(cd packaging/arch && makepkg -si)
 ```
 
 ## 快速开始
@@ -46,7 +45,7 @@ ghis onboard --repo ~/src/project
 
 设置 `NO_COLOR=1` 可禁用颜色；`TERM=dumb` 或 `GHIS_ONBOARD_LINE_MODE=1` 会使用不含光标控制的中文兼容模式。最终确认前不会修改主配置、仓库或 shell 文件；失败时会尝试恢复原状态并给出检查命令。
 
-也可以继续使用独立命令手工完成相同配置。先确认需要使用的账号都已经由 `gh` 登录，然后创建 Profile、绑定当前仓库并安装 zsh wrapper。下面的账号、姓名、邮箱、路径均为示例，需要替换成自己的值：
+也可以继续使用独立命令手工完成相同配置。先确认需要使用的账号都已经由 `gh` 登录，然后创建 Profile、绑定当前仓库并安装 shell 集成。下面的账号、姓名、邮箱、路径均为示例，需要替换成自己的值：
 
 ```sh
 ghis discover
@@ -61,8 +60,9 @@ ghis use personal
 ghis status
 
 ghis setup
-exec zsh
 ```
+
+Windows PowerShell 使用 `ghis setup`（也可以显式运行 `ghis setup powershell`）；Unix 环境可显式选择 `zsh`、`bash` 或 `fish`。
 
 之后照常使用原命令：
 

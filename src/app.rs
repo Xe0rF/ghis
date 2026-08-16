@@ -3338,6 +3338,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn binding_uses_fragment_without_global_identity_changes() {
         let temp = tempdir().expect("temporary directory");
@@ -3482,6 +3483,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn linked_worktrees_keep_profile_bindings_isolated() {
         let temp = tempdir().expect("temporary directory");

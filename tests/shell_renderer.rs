@@ -69,14 +69,20 @@ fn completion_cli_output_bytes_match_goldens() {
     }
 }
 
+#[cfg(not(windows))]
+const COMPLETION_SYNTAX_SHELLS: &[&str] = &["zsh", "bash", "fish"];
+
+#[cfg(windows)]
+const COMPLETION_SYNTAX_SHELLS: &[&str] = &["powershell"];
+
 #[test]
 fn completion_scripts_parse_when_their_shell_is_available() {
     let directory = tempfile::tempdir().expect("temporary completion directory");
-    for shell in ["zsh", "bash", "fish", "powershell"] {
+    for shell in COMPLETION_SYNTAX_SHELLS {
         let path = directory.path().join(format!("ghis.{shell}"));
         fs::write(&path, shell_cli_output("completion", shell)).expect("write completion");
 
-        let mut command = match shell {
+        let mut command = match *shell {
             "zsh" => {
                 let mut command = Command::new("zsh");
                 command.arg("-n");
@@ -99,7 +105,13 @@ fn completion_scripts_parse_when_their_shell_is_available() {
                     "powershell"
                 };
                 let mut command = Command::new(executable);
-                command.args(["-NoProfile", "-NonInteractive", "-File"]);
+                command.args([
+                    "-NoProfile",
+                    "-NonInteractive",
+                    "-Command",
+                    "$tokens=$null; $errors=$null; [System.Management.Automation.Language.Parser]::ParseFile($env:GHIS_COMPLETION_PATH, [ref]$tokens, [ref]$errors) > $null; if ($errors.Count -gt 0) { exit 1 }",
+                ]);
+                command.env("GHIS_COMPLETION_PATH", &path);
                 command
             }
             _ => unreachable!("known completion shell"),

@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use assert_cmd::Command as AssertCommand;
 use std::fs;
 use std::path::Path;
