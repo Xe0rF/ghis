@@ -250,6 +250,12 @@ pub struct SshProfile {
     pub public_key: Option<PathBuf>,
     pub fingerprint: Option<String>,
     pub agent_socket: Option<PathBuf>,
+    /// Explicit jump hosts used only by managed SSH transport.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub proxy_jump: Vec<String>,
+    /// Explicitly forward the selected agent through managed SSH transport.
+    #[serde(skip_serializing_if = "bool_is_false")]
+    pub forward_agent: bool,
 }
 
 impl Default for SshProfile {
@@ -259,8 +265,24 @@ impl Default for SshProfile {
             public_key: None,
             fingerprint: None,
             agent_socket: None,
+            proxy_jump: Vec::new(),
+            forward_agent: false,
         }
     }
+}
+
+fn bool_is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn managed_proxy_jump_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && value.len() <= 255
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'-' | b'_' | b'@' | b':' | b'[' | b']')
+        })
 }
 
 /// How a profile's SSH connection is supplied.
@@ -507,6 +529,25 @@ impl Config {
                 return Err(ConfigError::Validation(format!(
                     "profile `{id}` with managed SSH needs public_key"
                 )));
+            }
+            if let Some(ssh) = profile.ssh.as_ref() {
+                if matches!(ssh.mode, SshMode::External)
+                    && (!ssh.proxy_jump.is_empty() || ssh.forward_agent)
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "profile `{id}` can use proxy_jump/forward_agent only with managed or one-password SSH"
+                    )));
+                }
+                if ssh.proxy_jump.len() > 8
+                    || ssh
+                        .proxy_jump
+                        .iter()
+                        .any(|jump| !managed_proxy_jump_is_valid(jump))
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "profile `{id}` has an invalid managed SSH proxy_jump"
+                    )));
+                }
             }
             if profile
                 .signing
@@ -793,7 +834,14 @@ fn merge_profile(destination: &mut Item, source: &Item) {
         merge_known_table(
             destination,
             source,
-            &["mode", "public_key", "fingerprint", "agent_socket"],
+            &[
+                "mode",
+                "public_key",
+                "fingerprint",
+                "agent_socket",
+                "proxy_jump",
+                "forward_agent",
+            ],
         );
     }
     if let (Some(destination), Some(source)) =
@@ -1461,6 +1509,8 @@ mode = "one-password"
 public_key = "/tmp/alice.pub"
 fingerprint = "SHA256:old"
 agent_socket = "/tmp/agent.sock"
+proxy_jump = ["bastion.example"]
+forward_agent = true
 future_ssh = "keep"
 
 [profiles.personal.signing]
@@ -1481,6 +1531,8 @@ future_signing = "keep"
         ssh.public_key = None;
         ssh.fingerprint = None;
         ssh.agent_socket = None;
+        ssh.proxy_jump.clear();
+        ssh.forward_agent = false;
         personal.signing.signing_key = None;
         personal.signing.program = None;
         config.save(&path).unwrap();
@@ -1491,6 +1543,8 @@ future_signing = "keep"
         assert!(!saved.contains("public_key"));
         assert!(!saved.contains("fingerprint"));
         assert!(!saved.contains("agent_socket"));
+        assert!(!saved.contains("proxy_jump"));
+        assert!(!saved.contains("forward_agent"));
         assert!(!saved.contains("signing_key"));
         assert!(!saved.contains("program ="));
         assert!(saved.contains("future_root = \"keep\""));
@@ -1629,5 +1683,41 @@ priority = 1
             .unwrap();
         assert_eq!(paths.cache_dir, base_cache);
         assert_eq!(paths.state_dir, base_state);
+    }
+
+    #[test]
+    fn managed_ssh_accepts_explicit_safe_proxy_jump_chain() {
+        let mut config = Config::default();
+        let mut profile = profile();
+        profile.ssh = Some(SshProfile {
+            mode: SshMode::Managed,
+            public_key: Some("/keys/work.pub".into()),
+            proxy_jump: vec!["deploy@bastion.example:2222".into(), "inner.example".into()],
+            forward_agent: true,
+            ..SshProfile::default()
+        });
+        config.profiles.insert("work".into(), profile);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn managed_ssh_rejects_unsafe_or_external_proxy_jump() {
+        let mut config = Config::default();
+        let mut profile = profile();
+        profile.ssh = Some(SshProfile {
+            mode: SshMode::Managed,
+            public_key: Some("/keys/work.pub".into()),
+            proxy_jump: vec!["-F/etc/ssh/evil.conf".into()],
+            ..SshProfile::default()
+        });
+        config.profiles.insert("work".into(), profile);
+        assert!(config.validate().is_err());
+
+        config.profiles.get_mut("work").unwrap().ssh = Some(SshProfile {
+            mode: SshMode::External,
+            proxy_jump: vec!["bastion.example".into()],
+            ..SshProfile::default()
+        });
+        assert!(config.validate().is_err());
     }
 }

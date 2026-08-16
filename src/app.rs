@@ -293,6 +293,10 @@ pub fn profile_fragment_path(paths: &ConfigPaths, profile_id: &str) -> PathBuf {
     paths.fragments_dir.join(format!("{safe}.gitconfig"))
 }
 
+fn managed_ssh_config_path(paths: &ConfigPaths, profile_id: &str) -> PathBuf {
+    profile_fragment_path(paths, profile_id).with_extension("sshconfig")
+}
+
 pub fn write_profile_fragment(paths: &ConfigPaths, id: &str, profile: &Profile) -> Result<PathBuf> {
     with_fragment_write_lock(paths, || {
         let authoritative = authoritative_config(paths, None)?;
@@ -322,7 +326,8 @@ fn write_profile_fragment_unlocked(
     profile: &Profile,
 ) -> Result<PathBuf> {
     let path = profile_fragment_path(paths, id);
-    let content = profile_fragment_content(profile);
+    let ssh_config = write_managed_ssh_config_unlocked(paths, id, profile)?;
+    let content = profile_fragment_content(profile, ssh_config.as_deref());
     let temporary = path.with_extension(format!("gitconfig.{}.tmp", std::process::id()));
     fs::write(&temporary, content)?;
     #[cfg(unix)]
@@ -332,6 +337,56 @@ fn write_profile_fragment_unlocked(
     }
     fs::rename(&temporary, &path)?;
     Ok(path)
+}
+
+fn write_managed_ssh_config_unlocked(
+    paths: &ConfigPaths,
+    id: &str,
+    profile: &Profile,
+) -> Result<Option<PathBuf>> {
+    let path = managed_ssh_config_path(paths, id);
+    let managed = profile.ssh.as_ref().filter(|ssh| {
+        matches!(
+            ssh.mode,
+            config::SshMode::OnePassword | config::SshMode::Managed
+        )
+    });
+    let material = managed.and_then(|ssh| {
+        let socket = signing::discover_agent_socket(ssh.agent_socket.as_deref())?;
+        let public_key = ssh.public_key.as_deref().map(signing::expand_user)?;
+        Some((socket, public_key))
+    });
+    let Some((socket, public_key)) = material else {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        return Ok(None);
+    };
+
+    let temporary = path.with_extension(format!("sshconfig.{}.tmp", std::process::id()));
+    fs::write(
+        &temporary,
+        signing::render_managed_ssh_config(&socket, &public_key),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+    }
+    fs::rename(&temporary, &path)?;
+    Ok(Some(path))
+}
+
+fn write_managed_ssh_config(
+    paths: &ConfigPaths,
+    id: &str,
+    profile: &Profile,
+) -> Result<Option<PathBuf>> {
+    with_fragment_write_lock(paths, || {
+        write_managed_ssh_config_unlocked(paths, id, profile)
+    })
 }
 
 fn with_fragment_write_lock<T>(
@@ -368,7 +423,7 @@ fn authoritative_config(paths: &ConfigPaths, fallback: Option<&Config>) -> Resul
     }
 }
 
-fn profile_fragment_content(profile: &Profile) -> String {
+fn profile_fragment_content(profile: &Profile, ssh_config_path: Option<&Path>) -> String {
     let signing = &profile.signing;
     // The command may target a non-primary remote or an `insteadOf` rewrite,
     // so install the managed SSH restriction independently of `ctx.remote`.
@@ -378,8 +433,6 @@ fn profile_fragment_content(profile: &Profile) -> String {
             config::SshMode::OnePassword | config::SshMode::Managed
         )
     });
-    let agent_socket =
-        managed_ssh.and_then(|ssh| signing::discover_agent_socket(ssh.agent_socket.as_deref()));
     let signing_key = signing
         .enabled
         .then(|| {
@@ -417,11 +470,9 @@ fn profile_fragment_content(profile: &Profile) -> String {
         name: profile.git_name.clone(),
         email: profile.git_email.clone(),
         credential_helper: None,
-        ssh_command: managed_ssh.and_then(|ssh| {
-            let public_key = ssh.public_key.as_deref()?;
-            Some(match agent_socket.as_deref() {
-                Some(socket) => signing::render_ssh_command(socket, public_key),
-                None => ssh_guard_command(),
+        ssh_command: managed_ssh.map(|ssh| {
+            ssh_config_path.map_or_else(ssh_guard_command, |config_path| {
+                signing::render_ssh_command(config_path, &ssh.proxy_jump, ssh.forward_agent)
             })
         }),
         signing_key,
@@ -1143,7 +1194,11 @@ struct ManagedSshMaterial {
     command: String,
 }
 
-fn managed_ssh_material(profile: &Profile) -> Result<Option<ManagedSshMaterial>> {
+fn managed_ssh_material(
+    paths: &ConfigPaths,
+    profile_id: &str,
+    profile: &Profile,
+) -> Result<Option<ManagedSshMaterial>> {
     let Some(ssh) = profile.ssh.as_ref().filter(|ssh| {
         matches!(
             ssh.mode,
@@ -1158,10 +1213,14 @@ fn managed_ssh_material(profile: &Profile) -> Result<Option<ManagedSshMaterial>>
         .map(signing::expand_user)
         .ok_or_else(|| AppError::Message("当前 Profile 已纳管 SSH，但未配置公钥文件".into()))?;
     let socket = signing::discover_agent_socket(ssh.agent_socket.as_deref());
-    let command = socket
-        .as_deref()
-        .map(|socket| signing::render_ssh_command(socket, &public_key_path))
-        .unwrap_or_else(ssh_guard_command);
+    let command = match socket.as_deref() {
+        Some(_) => {
+            let config_path = write_managed_ssh_config(paths, profile_id, profile)?
+                .ok_or_else(|| AppError::Message("无法生成 managed SSH 配置".into()))?;
+            signing::render_ssh_command(&config_path, &ssh.proxy_jump, ssh.forward_agent)
+        }
+        None => ssh_guard_command(),
+    };
     Ok(Some(ManagedSshMaterial {
         socket,
         public_key_path,
@@ -1236,7 +1295,10 @@ fn validate_profile_operation(
     }
 
     let may_use_remote = operation.may_contact_remote();
-    let managed_material = managed_ssh_material(profile)?;
+    let profile_id = ctx
+        .profile_id()
+        .ok_or_else(|| AppError::Message("未解析 Profile，无法准备 managed SSH".into()))?;
+    let managed_material = managed_ssh_material(&ctx.paths, profile_id, profile)?;
     policy.ssh_command = managed_ssh_environment_command(profile, managed_material.as_ref())
         .or_else(|| {
             (ctx.config.behavior.ssh_unmanaged == config::SshUnmanagedPolicy::Fail)
@@ -1452,7 +1514,10 @@ where
             .and_then(repo::GhRemoteContext::remote)
             .and_then(|remote| remote.host.as_deref()),
     )?;
-    let ssh_command = managed_ssh_material(profile)?
+    let profile_id = ctx
+        .profile_id()
+        .ok_or_else(|| AppError::Message("未解析 Profile，无法准备 managed SSH".into()))?;
+    let ssh_command = managed_ssh_material(&ctx.paths, profile_id, profile)?
         .as_ref()
         .and_then(|material| managed_ssh_environment_command(profile, Some(material)))
         .or_else(|| {
@@ -2567,7 +2632,9 @@ fn repository_binding_needs_repair(ctx: &AppContext) -> Result<bool> {
         return Ok(true);
     }
     let fragment = profile_fragment_path(&ctx.paths, profile_id);
-    let expected_fragment = profile_fragment_content(profile);
+    let ssh_config = managed_ssh_config_path(&ctx.paths, profile_id);
+    let expected_fragment =
+        profile_fragment_content(profile, ssh_config.exists().then_some(ssh_config.as_path()));
     if fs::read_to_string(&fragment).ok().as_deref() != Some(expected_fragment.as_str()) {
         return Ok(true);
     }
@@ -3456,6 +3523,7 @@ mod tests {
             public_key: Some(PathBuf::from("/keys/authentication.pub")),
             fingerprint: Some("SHA256:authentication".into()),
             agent_socket: Some(PathBuf::from("/tmp/agent.sock")),
+            ..config::SshProfile::default()
         });
         profile.signing.enabled = true;
 

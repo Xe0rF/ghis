@@ -359,6 +359,12 @@ struct ProfileArgs {
     fingerprint: Option<String>,
     #[arg(long)]
     agent_socket: Option<PathBuf>,
+    /// Explicit managed SSH jump hosts, in traversal order.
+    #[arg(long = "proxy-jump", value_delimiter = ',')]
+    proxy_jump: Vec<String>,
+    /// Forward the selected Agent through managed SSH hops.
+    #[arg(long)]
+    forward_agent: bool,
     #[arg(long)]
     sign: bool,
     #[arg(long)]
@@ -406,6 +412,24 @@ struct ProfileEditArgs {
     fingerprint: Option<String>,
     #[arg(long)]
     agent_socket: Option<PathBuf>,
+    /// Replace the explicit managed SSH jump-host chain.
+    #[arg(
+        long = "proxy-jump",
+        value_delimiter = ',',
+        conflicts_with = "clear_proxy_jump"
+    )]
+    proxy_jump: Option<Vec<String>>,
+    /// Clear the explicit managed SSH jump-host chain.
+    #[arg(long, conflicts_with = "proxy_jump")]
+    clear_proxy_jump: bool,
+    /// Enable or disable Agent forwarding for managed SSH hops.
+    #[arg(
+        long,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    forward_agent: Option<bool>,
     /// 开启签名；使用 `--sign=false` 可关闭
     #[arg(
         long,
@@ -1467,6 +1491,8 @@ fn profile_from_args(args: ProfileArgs, git_email: String) -> Profile {
             public_key: args.public_key,
             fingerprint: args.fingerprint,
             agent_socket: args.agent_socket,
+            proxy_jump: args.proxy_jump,
+            forward_agent: args.forward_agent,
         }),
         signing: SigningProfile {
             enabled: args.sign,
@@ -1503,6 +1529,9 @@ fn update_profile_from_args(profile: &mut Profile, args: ProfileEditArgs) {
         || args.public_key.is_some()
         || args.fingerprint.is_some()
         || args.agent_socket.is_some()
+        || args.proxy_jump.is_some()
+        || args.clear_proxy_jump
+        || args.forward_agent.is_some()
     {
         let ssh = profile.ssh.get_or_insert_with(SshProfile::default);
         if let Some(mode) = args.ssh {
@@ -1520,6 +1549,14 @@ fn update_profile_from_args(profile: &mut Profile, args: ProfileEditArgs) {
         }
         if let Some(agent_socket) = args.agent_socket {
             ssh.agent_socket = Some(agent_socket);
+        }
+        if args.clear_proxy_jump {
+            ssh.proxy_jump.clear();
+        } else if let Some(proxy_jump) = args.proxy_jump {
+            ssh.proxy_jump = proxy_jump;
+        }
+        if let Some(forward_agent) = args.forward_agent {
+            ssh.forward_agent = forward_agent;
         }
     }
 

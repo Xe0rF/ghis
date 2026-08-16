@@ -544,16 +544,33 @@ pub fn signing_program_available(program: &SigningProgram) -> bool {
 /// Git executes this value through the user's shell, therefore every path is
 /// POSIX-quoted here. User SSH config and connection sharing are disabled so
 /// another configured identity or an existing multiplexed session cannot win.
-pub fn render_ssh_command(socket: &Path, public_key: &Path) -> String {
-    let mut command = format!(
-        "ssh -F /dev/null -o BatchMode=yes -o ControlMaster=no \
-         -o ControlPath=none -o IdentitiesOnly=yes -o IdentityAgent={} ",
-        shell_quote(&expand_user(socket).to_string_lossy())
-    );
-    command.push_str("-i ");
-    command.push_str(&shell_quote(&expand_user(public_key).to_string_lossy()));
-    command.push(' ');
-    command.trim_end().to_owned()
+pub fn render_managed_ssh_config(socket: &Path, public_key: &Path) -> String {
+    format!(
+        "Host *\n  BatchMode yes\n  ControlMaster no\n  ControlPath none\n  IdentitiesOnly yes\n  IdentityAgent {}\n  IdentityFile {}\n  ForwardAgent no\n",
+        ssh_config_quote_path(&expand_user(socket)),
+        ssh_config_quote_path(&expand_user(public_key)),
+    )
+}
+
+pub fn render_ssh_command(ssh_config: &Path, proxy_jump: &[String], forward_agent: bool) -> String {
+    let mut command = format!("ssh -F {}", shell_quote(&ssh_config.to_string_lossy()),);
+    if !proxy_jump.is_empty() {
+        command.push_str(" -J ");
+        command.push_str(&shell_quote(&proxy_jump.join(",")));
+    }
+    if forward_agent {
+        command.push_str(" -o ForwardAgent=yes");
+    }
+    command
+}
+
+fn ssh_config_quote_path(path: &Path) -> String {
+    let escaped = path
+        .to_string_lossy()
+        .replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('%', "%%");
+    format!("\"{escaped}\"")
 }
 
 pub fn expand_user(path: &Path) -> PathBuf {
@@ -761,15 +778,39 @@ mod tests {
     }
 
     #[test]
-    fn ssh_command_quotes_paths_and_restricts_identities() {
-        let command = render_ssh_command(
-            Path::new("/tmp/a path/agent.sock"),
-            Path::new("/tmp/key's.pub"),
+    fn managed_ssh_config_quotes_paths_and_restricts_identities() {
+        let config = render_managed_ssh_config(
+            Path::new("/tmp/a path/agent%.sock"),
+            Path::new("/tmp/key\"s.pub"),
         );
-        assert!(command.contains("-F /dev/null"));
-        assert!(command.contains("ControlMaster=no"));
-        assert!(command.contains("ControlPath=none"));
-        assert!(command.contains("IdentitiesOnly=yes"));
-        assert!(command.contains("'\\''"));
+        assert!(config.contains("BatchMode yes"));
+        assert!(config.contains("ControlMaster no"));
+        assert!(config.contains("ControlPath none"));
+        assert!(config.contains("IdentitiesOnly yes"));
+        assert!(config.contains("ForwardAgent no"));
+        assert!(config.contains("agent%%.sock"));
+        assert!(config.contains("key\\\"s.pub"));
+
+        let command = render_ssh_command(Path::new("/tmp/a config/managed's.conf"), &[], false);
+        assert!(command.contains("-F '/tmp/a config/managed'\\''s.conf'"));
+    }
+
+    #[test]
+    fn ssh_command_renders_explicit_proxy_jump_and_forwarding() {
+        let command = render_ssh_command(
+            Path::new("/tmp/managed.conf"),
+            &["deploy@bastion.example:2222".into(), "inner.example".into()],
+            true,
+        );
+        assert!(command.starts_with("ssh -F '/tmp/managed.conf'"));
+        assert!(command.contains("-J 'deploy@bastion.example:2222,inner.example'"));
+        assert!(command.contains("-o ForwardAgent=yes"));
+        assert!(
+            Command::new("sh")
+                .args(["-n", "-c", &format!("{command} target.example")])
+                .status()
+                .expect("check rendered shell syntax")
+                .success()
+        );
     }
 }

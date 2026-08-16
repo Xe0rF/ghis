@@ -195,6 +195,8 @@ mode = "one-password"
 public_key = {public_key:?}
 fingerprint = "SHA256:work"
 agent_socket = {agent_socket:?}
+proxy_jump = ["deploy@bastion.example:2222", "inner.example"]
+forward_agent = true
 "#,
         ),
     )
@@ -245,32 +247,70 @@ agent_socket = {agent_socket:?}
     );
     let trace = fs::read_to_string(&ssh_trace).expect("read ssh trace");
     assert!(trace.lines().any(|line| line == "variant=ssh"), "{trace}");
-    assert!(
-        trace.lines().any(|line| line == "arg=IdentitiesOnly=yes"),
-        "{trace}"
+    let trace_lines = trace.lines().collect::<Vec<_>>();
+    let config_path = trace_lines
+        .windows(2)
+        .find_map(|pair| {
+            (pair[0] == "arg=-F")
+                .then(|| pair[1].strip_prefix("arg="))
+                .flatten()
+        })
+        .expect("managed SSH config path");
+    let ssh_config = fs::read_to_string(config_path).expect("read managed SSH config");
+    assert_eq!(
+        fs::metadata(config_path)
+            .expect("managed SSH config metadata")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
     );
     for expected in [
-        "arg=-F",
-        "arg=/dev/null",
-        "arg=BatchMode=yes",
-        "arg=ControlMaster=no",
-        "arg=ControlPath=none",
+        "BatchMode yes",
+        "ControlMaster no",
+        "ControlPath none",
+        "IdentitiesOnly yes",
+        "ForwardAgent no",
+        "IdentityAgent ",
+        "IdentityFile ",
+    ] {
+        assert!(
+            ssh_config
+                .lines()
+                .any(|line| line.trim() == expected || line.trim().starts_with(expected)),
+            "{ssh_config}"
+        );
+    }
+    for expected in [
+        "arg=-J",
+        "arg=deploy@bastion.example:2222,inner.example",
+        "arg=ForwardAgent=yes",
     ] {
         assert!(trace.lines().any(|line| line == expected), "{trace}");
     }
-    assert!(
-        trace
-            .lines()
-            .any(|line| line == format!("arg=IdentityAgent={}", agent_socket.display())),
-        "{trace}"
-    );
-    assert!(
-        trace
-            .lines()
-            .any(|line| line == format!("arg={}", public_key.display())),
-        "{trace}"
-    );
     assert!(!trace.contains("wrong-identity"), "{trace}");
+
+    fs::remove_file(&ssh_trace).expect("clear push trace");
+    let direct_git = Command::new("git")
+        .args(["push", "backup", "HEAD:refs/heads/direct"])
+        .current_dir(&repository)
+        .env("PATH", &path)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("SSH_TRACE", &ssh_trace)
+        .status()
+        .expect("run direct Git push through fragment");
+    assert!(!direct_git.success());
+    let direct_trace = fs::read_to_string(&ssh_trace).expect("read direct Git SSH trace");
+    assert!(
+        direct_trace.lines().any(|line| line == "arg=-F"),
+        "{direct_trace}"
+    );
+    assert!(
+        direct_trace
+            .lines()
+            .any(|line| line == format!("arg={config_path}")),
+        "{direct_trace}"
+    );
 
     fs::remove_file(&ssh_trace).expect("clear push trace");
     let mut gh_clone = AssertCommand::cargo_bin("ghis").expect("ghis binary");
@@ -305,8 +345,11 @@ agent_socket = {agent_socket:?}
     );
     let trace = fs::read_to_string(&ssh_trace).expect("read gh SSH trace");
     assert!(trace.lines().any(|line| line == "variant=ssh"), "{trace}");
+    assert!(trace.lines().any(|line| line == "arg=-F"), "{trace}");
     assert!(
-        trace.lines().any(|line| line == "arg=IdentitiesOnly=yes"),
+        trace
+            .lines()
+            .any(|line| line == format!("arg={config_path}")),
         "{trace}"
     );
 

@@ -3435,6 +3435,8 @@ mode = "one-password"
 public_key = "/keys/work.pub"
 fingerprint = "SHA256:work"
 agent_socket = "/run/user/1000/op-agent.sock"
+proxy_jump = ["deploy@bastion.example:2222", "inner.example"]
+forward_agent = true
 
 [profiles.work.signing]
 enabled = true
@@ -3465,6 +3467,11 @@ program = "/opt/1Password/op-ssh-sign"
         ssh.agent_socket.as_deref(),
         Some(Path::new("/run/user/1000/op-agent.sock"))
     );
+    assert_eq!(
+        ssh.proxy_jump,
+        ["deploy@bastion.example:2222", "inner.example"]
+    );
+    assert!(ssh.forward_agent);
     assert!(profile.signing.enabled);
     assert_eq!(
         profile.signing.signing_key.as_deref(),
@@ -3474,6 +3481,62 @@ program = "/opt/1Password/op-ssh-sign"
         profile.signing.program.as_deref(),
         Some(Path::new("/opt/1Password/op-ssh-sign"))
     );
+}
+
+#[test]
+fn profile_cli_configures_and_clears_managed_proxy_jump() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let config_file = temp.path().join("config/ghis/config.toml");
+
+    let mut add = isolated_ghis_command();
+    add.args([
+        "profile",
+        "add",
+        "work",
+        "--login",
+        "worker",
+        "--name",
+        "Work Identity",
+        "--email",
+        "work@example.test",
+        "--ssh",
+        "managed",
+        "--public-key",
+        "/keys/work.pub",
+        "--proxy-jump",
+        "deploy@bastion.example:2222,inner.example",
+        "--forward-agent",
+    ]);
+    for (key, value) in xdg_environment(&temp) {
+        add.env(key, value);
+    }
+    add.assert().success();
+
+    let config = Config::load(&config_file).expect("load managed proxy config");
+    let ssh = config.profiles["work"].ssh.as_ref().expect("SSH profile");
+    assert_eq!(
+        ssh.proxy_jump,
+        ["deploy@bastion.example:2222", "inner.example"]
+    );
+    assert!(ssh.forward_agent);
+
+    let mut clear = isolated_ghis_command();
+    clear.args([
+        "profile",
+        "edit",
+        "work",
+        "--clear-proxy-jump",
+        "--forward-agent=false",
+    ]);
+    for (key, value) in xdg_environment(&temp) {
+        clear.env(key, value);
+    }
+    clear.assert().success();
+
+    let config = Config::load(&config_file).expect("load cleared proxy config");
+    let ssh = config.profiles["work"].ssh.as_ref().expect("SSH profile");
+    assert!(ssh.proxy_jump.is_empty());
+    assert!(!ssh.forward_agent);
 }
 
 #[test]

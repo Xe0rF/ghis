@@ -166,7 +166,31 @@ fingerprint = "SHA256:example"
 
 `forwarded-agent` 只使用当前会话的 `SSH_AUTH_SOCK`，要求显式 public key 或 fingerprint 精确匹配；它不会查找本地 1Password socket、写入 `IdentityAgent`、覆盖 socket、自动开启 `ForwardAgent` 或把本机 `op-ssh-sign` 路径写到远端。ghis 不传输、导出或同步私钥，也不绕过 1Password 的本地批准。未显式配置 `program` 时使用远端 Git/OpenSSH 默认 SSH signer；只有显式配置的签名程序不可执行时，签名操作才会停止。
 
-`local-agent` 是旧配置的默认 transport，继续使用本机 Agent/1Password 的现有发现行为。managed/one-password signing 会使用 `ssh -F /dev/null`，明确隔离用户 `~/.ssh/config`；因此该模式不会应用 `ProxyJump`、`ProxyCommand` 或 `Host` 别名，也不会静默把它们转换成另一条连接。需要多跳 SSH 时，应使用 external SSH transport 并由用户配置跳板与 `ForwardAgent`；managed signing 模式目前不提供多跳连接能力。远程 forwarding、VS Code Remote、多跳 SSH 和容器的安全边界与排障步骤见 [Wiki](../../wiki) 的 [Remote Development and Agent Forwarding](../../wiki/Remote-Development-and-Agent-Forwarding)。
+`local-agent` 是旧配置的默认 transport，继续使用本机 Agent/1Password 的现有发现行为。managed/one-password SSH 会生成权限受限的专用 OpenSSH 配置，而不读取用户 `~/.ssh/config`；该配置把同一个 `IdentityAgent`、`IdentityFile`、`IdentitiesOnly yes` 和连接复用禁用策略应用到最终目标及每个 ProxyJump 子连接：
+
+```toml
+[profiles.work.ssh]
+mode = "managed"
+public_key = "/home/user/.ssh/work.pub"
+agent_socket = "/run/user/1000/ssh-agent.sock"
+proxy_jump = ["deploy@bastion.example:2222", "inner.example"]
+forward_agent = true
+```
+
+`proxy_jump` 按数组顺序渲染为一个受 shell quoting 保护的 `ssh -J` 参数，只接受主机、用户、端口和 IPv6 bracket 所需字符、拒绝以 `-` 开头的值，最多八跳；每个跳板都读取上述专用配置，因此不能改用 Agent 中未被 Profile 选中的 key。它不会重新启用任意 `Host`、`Match`、`ProxyCommand` 或其他用户 SSH 设置。
+
+CLI 中 `--proxy-jump` 使用逗号分隔的有序链；`profile edit` 会整体替换现有链，清空和关闭 forwarding 分别使用 `--clear-proxy-jump` 与 `--forward-agent=false`：
+
+```sh
+ghis profile add work --host github.com --login worker \
+  --name "Work Identity" --email work@example.test \
+  --ssh managed --public-key ~/.ssh/work.pub \
+  --proxy-jump deploy@bastion.example:2222,inner.example --forward-agent
+ghis profile edit work --proxy-jump replacement.example --forward-agent
+ghis profile edit work --clear-proxy-jump --forward-agent=false
+```
+
+`forward_agent = true` 只对最终目标启用 Agent forwarding，跳板本身保持 `ForwardAgent no`。最终目标可以借助转发 socket 请求 Agent 签名，因此仅应对受信任目标启用。若多跳需要 `Match`、证书、复杂 `ProxyCommand` 等完整 OpenSSH 能力，仍应使用 external SSH transport。远程 forwarding、VS Code Remote、多跳 SSH 和容器的安全边界与排障步骤见 [Wiki](../../wiki) 的 [Remote Development and Agent Forwarding](../../wiki/Remote-Development-and-Agent-Forwarding)。
 
 ### 多 remote 与 push URL
 

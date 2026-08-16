@@ -5,6 +5,7 @@ project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 work=$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/ghis-ssh-proxyjump.XXXXXX")
 network="ghis-ssh-$RANDOM-$$"
 jump="ghis-jump-$RANDOM-$$"
+jump2="ghis-jump2-$RANDOM-$$"
 target="ghis-target-$RANDOM-$$"
 agent_pid=
 
@@ -13,7 +14,7 @@ cleanup() {
     if [ -n "$agent_pid" ]; then
         SSH_AGENT_PID=$agent_pid ssh-agent -k >/dev/null 2>&1 || true
     fi
-    docker rm -f "$jump" "$target" >/dev/null 2>&1 || true
+    docker rm -f "$jump" "$jump2" "$target" >/dev/null 2>&1 || true
     docker network rm "$network" >/dev/null 2>&1 || true
     rm -rf -- "$work"
     exit "$status"
@@ -44,13 +45,16 @@ docker build --quiet --tag ghis-ssh-smoke:local "$work" >/dev/null
 docker network create "$network" >/dev/null
 docker run --detach --name "$jump" --network "$network" \
     --network-alias jump -p 127.0.0.1::22 ghis-ssh-smoke:local >/dev/null
+docker run --detach --name "$jump2" --network "$network" \
+    --network-alias jump2 ghis-ssh-smoke:local >/dev/null
 docker run --detach --name "$target" --network "$network" \
     --network-alias target ghis-ssh-smoke:local >/dev/null
 
 ssh-keygen -q -t ed25519 -N '' -f "$work/login"
 ssh-keygen -q -t ed25519 -N '' -f "$work/signing"
-for container in "$jump" "$target"; do
-    docker cp "$work/login.pub" "$container:/home/test/.ssh/authorized_keys"
+cat "$work/login.pub" "$work/signing.pub" > "$work/authorized_keys"
+for container in "$jump" "$jump2" "$target"; do
+    docker cp "$work/authorized_keys" "$container:/home/test/.ssh/authorized_keys"
     docker exec "$container" chown test:test /home/test/.ssh/authorized_keys
     docker exec "$container" chmod 600 /home/test/.ssh/authorized_keys
 done
@@ -102,6 +106,77 @@ eval "$(ssh-agent -s)" >/dev/null
 agent_pid=$SSH_AGENT_PID
 ssh-add "$work/signing" >/dev/null
 fingerprint=$(ssh-keygen -lf "$work/signing.pub" -E sha256 | awk '{print $2}')
+
+mkdir -p "$work/home/.ssh" "$work/config" "$work/cache" "$work/state"
+chmod 700 "$work/home/.ssh"
+ssh-keyscan -p "$jump_port" 127.0.0.1 > "$work/home/.ssh/known_hosts" 2>/dev/null
+docker exec "$jump2" sh -c "awk '{ print \"jump2 \" \$1 \" \" \$2 }' /etc/ssh/ssh_host_ed25519_key.pub" \
+    >> "$work/home/.ssh/known_hosts"
+docker exec "$target" sh -c "awk '{ print \"target \" \$1 \" \" \$2 }' /etc/ssh/ssh_host_ed25519_key.pub" \
+    >> "$work/home/.ssh/known_hosts"
+chmod 600 "$work/home/.ssh/known_hosts"
+
+docker exec "$target" sh -c '
+    rm -rf /home/test/managed.git
+    git init -q --bare /home/test/managed.git
+    cat > /home/test/managed.git/hooks/pre-receive <<"HOOK"
+#!/bin/sh
+set -eu
+test -n "${SSH_AUTH_SOCK:-}"
+key=$(cut -d" " -f2 /home/test/signing.pub)
+ssh-add -L | grep -Fq "$key"
+HOOK
+    chmod 755 /home/test/managed.git/hooks/pre-receive
+    chown -R test:test /home/test/managed.git
+'
+mkdir -p "$work/managed-repo"
+git -C "$work/managed-repo" init -q
+git -C "$work/managed-repo" -c user.name=Setup -c user.email=setup@example.test \
+    commit --allow-empty -m initial >/dev/null
+git -C "$work/managed-repo" remote add origin test@target:/home/test/managed.git
+cat > "$work/managed.toml" <<EOF
+version = 1
+
+[profiles.managed]
+host = "target"
+login = "test"
+git_name = "Managed Identity"
+git_email = "managed@example.test"
+
+[profiles.managed.ssh]
+mode = "managed"
+public_key = "$work/signing.pub"
+fingerprint = "$fingerprint"
+agent_socket = "$SSH_AUTH_SOCK"
+proxy_jump = ["test@127.0.0.1:$jump_port", "test@jump2"]
+forward_agent = true
+EOF
+
+managed_env=(
+    "HOME=$work/home"
+    "XDG_CONFIG_HOME=$work/config"
+    "XDG_CACHE_HOME=$work/cache"
+    "XDG_STATE_HOME=$work/state"
+    "GIT_CONFIG_GLOBAL=/dev/null"
+)
+env "${managed_env[@]}" "$project_dir/target/release/ghis" \
+    --config "$work/managed.toml" use managed --repo "$work/managed-repo"
+env "${managed_env[@]}" "$project_dir/target/release/ghis" \
+    --config "$work/managed.toml" git -- push origin HEAD:refs/heads/main
+docker exec "$target" git --git-dir=/home/test/managed.git rev-parse --verify refs/heads/main >/dev/null
+
+ssh-add "$work/login" >/dev/null
+docker cp "$work/login.pub" "$jump:/home/test/.ssh/authorized_keys"
+docker exec "$jump" chown test:test /home/test/.ssh/authorized_keys
+docker exec "$jump" chmod 600 /home/test/.ssh/authorized_keys
+if env "${managed_env[@]}" "$project_dir/target/release/ghis" \
+    --config "$work/managed.toml" git -- push origin HEAD:refs/heads/unselected-jump-key; then
+    echo "managed ProxyJump used an Agent key not selected by the Profile" >&2
+    exit 95
+fi
+docker cp "$work/authorized_keys" "$jump:/home/test/.ssh/authorized_keys"
+docker exec "$jump" chown test:test /home/test/.ssh/authorized_keys
+docker exec "$jump" chmod 600 /home/test/.ssh/authorized_keys
 
 write_config() {
     destination=$1
@@ -172,7 +247,7 @@ ssh -F "$work/ssh_config" target '
     fi
 '
 
-docker exec "$jump" sh -c "printf '%s\n' 'AllowTcpForwarding no' >> /etc/ssh/sshd_config.d/ghis-smoke.conf && kill -HUP 1"
+docker exec "$jump" sh -c "sed -i 's/^AllowTcpForwarding yes$/AllowTcpForwarding no/' /etc/ssh/sshd_config.d/ghis-smoke.conf && kill -HUP 1"
 sleep 1
 if ssh -F "$work/ssh_config" target true 2>/dev/null; then
     echo "ProxyJump succeeded after the jump host disabled TCP forwarding" >&2

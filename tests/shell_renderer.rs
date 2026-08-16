@@ -46,19 +46,19 @@ fn completion_cli_output_bytes_match_goldens() {
     for (shell, expected) in [
         (
             "zsh",
-            "127a594d21b1a4ddf0dfec13476e8cce08d770006f6919716c5dd9a5e590ac8a",
+            "20bc1bd29193cfdb2d8bd68ffec2aa9e11e0639511b4f67eedf24f90033c3be3",
         ),
         (
             "bash",
-            "0f45340072e6b14518108bf9fd2f8e02920b137efd24808703567bcb277672fc",
+            "91421862974eb22e163803518aae97b7bca1e46c97c36fff9f2e2a25e13ec300",
         ),
         (
             "fish",
-            "84eb57b1281ef2edaa817f8362843b507680b69598b67d2f38b63798173c7bfa",
+            "5a904ccaf9b1f7d3f53155a022477d7ac2b3040e3aa9fd9d2fc7c432af672cb9",
         ),
         (
             "powershell",
-            "a0d6deac38dc4afa07354c4d4103f1db9d05b2211a72d5cf02068c0045fa67b1",
+            "a7e9dab6a101e2b6bdd9a6abaec3c9a0b2ac17074939c91ab33f713786bcd338",
         ),
     ] {
         assert_eq!(
