@@ -58,6 +58,10 @@ impl ShellRenderer for ZshRenderer {
         integration_health()
     }
 
+    fn healthy_marker(&self) -> &'static str {
+        HEALTHY_MARKER
+    }
+
     fn inherited_health_marker(&self) -> Option<OsString> {
         std::env::var_os(HEALTH_ENV)
     }

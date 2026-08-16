@@ -157,6 +157,21 @@ fi
     assert_eq!(report["shell_integration"]["wrapper_loaded"], true);
     assert_eq!(report["shell_integration"]["wrapper_healthy"], true);
     assert_eq!(report["shell_integration"]["health_marker"], "zsh-v3");
+
+    let fish_drop_in = config_home.join("fish/conf.d/ghis.fish");
+    ghis::shell::fish::setup(&fish_drop_in, "ghis").expect("install fish drop-in");
+    let output = run(true, Some("1"), Some("fish-v1"));
+    assert!(output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    assert_eq!(report["shell_integration"]["state"], "wrapper_loaded");
+    assert_eq!(report["shell_integration"]["wrapper_loaded"], true);
+    assert_eq!(report["shell_integration"]["wrapper_healthy"], true);
+    assert_eq!(report["shell_integration"]["health_marker"], "fish-v1");
+    assert_eq!(report["shell_integration"]["setup_installed"], true);
+    assert_eq!(
+        report["shell_integration"]["repair_command"],
+        "ghis setup fish"
+    );
 }
 
 #[test]

@@ -162,7 +162,9 @@ impl ShellSpec {
     }
 }
 
-/// zsh implementation module. New shell renderers live alongside it.
+/// Shell-specific renderer implementations.
+pub mod fish;
+pub mod powershell;
 pub mod zsh;
 
 /// Compatibility facade for all established zsh integration names.
@@ -197,6 +199,8 @@ pub trait ShellRenderer: private::Sealed + Sync {
     fn uninstall(&self, startup_file: &Path) -> io::Result<bool>;
     fn integration_is_loaded(&self) -> bool;
     fn integration_health(&self) -> IntegrationHealth;
+    /// The complete generated integration marker used for active-renderer selection.
+    fn healthy_marker(&self) -> &'static str;
     fn inherited_health_marker(&self) -> Option<OsString>;
     fn integration_is_installed(&self, startup_file: &Path, init_file: &Path, binary: &str)
     -> bool;
@@ -267,7 +271,40 @@ pub fn detect_shell_from(
 ///
 /// Adding a shell requires its sibling module plus one entry here; unsupported
 /// recognised shells fail closed without duplicating another renderer match.
-static RENDERERS: [&dyn ShellRenderer; 1] = [&zsh::RENDERER];
+static RENDERERS: [&dyn ShellRenderer; 3] =
+    [&zsh::RENDERER, &fish::RENDERER, &powershell::RENDERER];
+
+/// Renderer selection for diagnostics that inspect the inherited health marker.
+///
+/// A recognised marker selects exactly one renderer. Unknown or absent markers
+/// retain the historical zsh fallback. A marker shared by multiple renderers is
+/// deliberately not attributed to any shell, so diagnostics cannot mistakenly
+/// report a healthy wrapper.
+pub enum ActiveRenderer {
+    Matched(&'static dyn ShellRenderer),
+    Fallback(&'static dyn ShellRenderer),
+    Ambiguous,
+}
+
+/// Select the renderer that emitted the inherited versioned health marker.
+pub fn active_renderer() -> ActiveRenderer {
+    let fallback = RENDERERS[0];
+    let Some(marker) = fallback.inherited_health_marker() else {
+        return ActiveRenderer::Fallback(fallback);
+    };
+    let mut matches = RENDERERS
+        .iter()
+        .copied()
+        .filter(|renderer| marker.as_os_str() == OsStr::new(renderer.healthy_marker()));
+    let Some(renderer) = matches.next() else {
+        return ActiveRenderer::Fallback(fallback);
+    };
+    if matches.next().is_some() {
+        ActiveRenderer::Ambiguous
+    } else {
+        ActiveRenderer::Matched(renderer)
+    }
+}
 
 /// Return the renderer for a shell, refusing known but unimplemented shells.
 pub fn renderer(kind: ShellKind) -> Result<&'static dyn ShellRenderer, ShellError> {
@@ -356,18 +393,22 @@ mod tests {
     }
 
     #[test]
-    fn unknown_shell_and_unimplemented_renderer_fail_closed() {
+    fn exact_renderers_are_registered_and_other_shells_fail_closed() {
         assert!(matches!(
             "nu".parse::<ShellKind>(),
             Err(ShellError::Unknown(_))
         ));
+        assert_eq!(
+            renderer(ShellKind::Fish).expect("fish renderer").spec(),
+            ShellKind::Fish.spec()
+        );
         assert!(matches!(
             renderer(ShellKind::Bash),
             Err(ShellError::Unsupported(ShellKind::Bash))
         ));
         assert_eq!(
             render_init(ShellKind::PowerShell, "ghis"),
-            Err(ShellError::Unsupported(ShellKind::PowerShell))
+            Ok(powershell::powershell_init_script("ghis"))
         );
     }
 

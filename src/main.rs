@@ -5,7 +5,7 @@ use ghis::config::{
     Config, ConfigPaths, CredentialFailurePolicy, DisplayIdentity, Profile, ResolutionSource, Rule,
     SigningProfile, SigningTransport, SshMode, SshProfile, SshUnmanagedPolicy, UnresolvedPolicy,
 };
-use ghis::{credential, diagnostics, github, shell, signing};
+use ghis::{credential, diagnostics, github, platform, shell, signing};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::fs;
@@ -2454,18 +2454,28 @@ fn check(path: Option<&Path>, explicit: Option<&str>, args: CheckArgs) -> app::R
 }
 
 fn doctor_shell_integration(ctx: &AppContext) -> app::Result<DoctorShellIntegration> {
-    let kind = resolve_shell(None)?;
-    let renderer =
-        shell::renderer(kind).map_err(|error| app::AppError::Message(error.to_string()))?;
-    let health = renderer.integration_health();
-    let wrapper_loaded = renderer.integration_is_loaded();
+    let (renderer, health, wrapper_loaded) = match shell::active_renderer() {
+        shell::ActiveRenderer::Matched(renderer) | shell::ActiveRenderer::Fallback(renderer) => {
+            let health = renderer.integration_health();
+            (renderer, health, renderer.integration_is_loaded())
+        }
+        // Two renderers claiming one marker cannot safely describe the active
+        // shell. Keep zsh's established installation fallback, but never trust
+        // the ambiguous marker as evidence that a wrapper is healthy.
+        shell::ActiveRenderer::Ambiguous => {
+            let renderer = shell::renderer(shell::ShellKind::Zsh)
+                .map_err(|error| app::AppError::Message(error.to_string()))?;
+            (renderer, shell::IntegrationHealth::NotLoaded, false)
+        }
+    };
+    let kind = renderer.spec().kind();
     let wrapper_healthy = health == shell::IntegrationHealth::Healthy;
     let health_marker = renderer
         .inherited_health_marker()
         .map(|value| diagnostics::sanitize_display_text(&value.to_string_lossy()));
     let init_file = ctx.paths.config_dir.join(renderer.spec().init_file_name());
-    let setup_installed = std::env::var_os("HOME")
-        .map(PathBuf::from)
+    let setup_installed = platform::user_home()
+        .ok()
         .map(|home| {
             let startup_file = renderer.startup_file(&home);
             renderer.integration_is_installed(&startup_file, &init_file, "ghis")
@@ -2483,7 +2493,7 @@ fn doctor_shell_integration(ctx: &AppContext) -> app::Result<DoctorShellIntegrat
         health_marker,
         setup_installed,
         repository_bound,
-        advice: doctor_shell_integration_advice(state, kind).into(),
+        advice: doctor_shell_integration_advice(state, kind),
         repair_command: renderer.setup_command().into(),
     })
 }
@@ -2574,23 +2584,25 @@ fn doctor_shell_integration_text(state: DoctorShellIntegrationState) -> &'static
 
 fn doctor_shell_integration_advice(
     state: DoctorShellIntegrationState,
-    _kind: shell::ShellKind,
-) -> &'static str {
+    kind: shell::ShellKind,
+) -> String {
     match state {
         DoctorShellIntegrationState::WrapperLoaded => {
             "普通 git/gh 会经过 ghis；command git、绝对路径或 GHIS_BYPASS=1 仍可明确绕过 wrapper"
+                .into()
         }
-        DoctorShellIntegrationState::WrapperIncomplete => {
-            "GHIS marker 存在，但函数依赖不完整；运行 `source ${XDG_CONFIG_HOME:-$HOME/.config}/ghis/init.zsh` 或重新启动 zsh"
-        }
+        DoctorShellIntegrationState::WrapperIncomplete => format!(
+            "GHIS marker 存在，但函数依赖不完整；运行 `ghis setup {kind}` 或重新启动 {kind}"
+        ),
         DoctorShellIntegrationState::InstalledNotLoaded => {
-            "运行 exec zsh 或新开终端后再试；ghis 不会替换当前 shell"
+            format!("运行 `exec {kind}` 或新开终端后再试；ghis 不会替换当前 shell")
         }
         DoctorShellIntegrationState::RepositoryOnly => {
             "普通 Git 仍会读取该仓库已有的 include/helper/hook，但没有 wrapper 的本次解析和注入"
+                .into()
         }
         DoctorShellIntegrationState::NotIntegrated => {
-            "普通 git/gh 不会经过 ghis；需要时先运行 ghis setup 并重新加载 zsh"
+            format!("普通 git/gh 不会经过 ghis；需要时先运行 `ghis setup {kind}` 并重新加载 {kind}")
         }
     }
 }
@@ -2825,6 +2837,14 @@ fn resolve_shell(explicit: Option<shell::ShellKind>) -> app::Result<shell::Shell
     Ok(explicit.unwrap_or(shell::ShellKind::Zsh))
 }
 
+/// Resolve a shell startup-file root without falling back to the current
+/// directory. This keeps PowerShell's Windows profile target independent from
+/// Unix-only `HOME` while retaining the established Unix behavior.
+fn shell_home() -> app::Result<PathBuf> {
+    platform::user_home()
+        .map_err(|error| app::AppError::Message(format!("无法解析用户目录：{error}")))
+}
+
 fn completion(kind: shell::ShellKind) -> app::Result<i32> {
     let renderer =
         shell::renderer(kind).map_err(|error| app::AppError::Message(error.to_string()))?;
@@ -2845,9 +2865,8 @@ fn setup(args: SetupArgs) -> app::Result<i32> {
         print!("{init_script}");
         return Ok(0);
     }
-    let home =
-        std::env::var_os("HOME").ok_or_else(|| app::AppError::Message("HOME 未设置".into()))?;
-    let startup_file = renderer.startup_file(Path::new(&home));
+    let home = shell_home()?;
+    let startup_file = renderer.startup_file(&home);
     if !args.yes {
         if !io::stdin().is_terminal() {
             return Err(app::AppError::Message(format!(
@@ -2866,7 +2885,7 @@ fn setup(args: SetupArgs) -> app::Result<i32> {
     }
     let report = renderer.install(&startup_file, &init, &init_script)?;
     println!(
-        "zsh 集成{}：{}",
+        "{kind} 集成{}：{}",
         if report.changed {
             "已安装"
         } else {
@@ -2877,11 +2896,11 @@ fn setup(args: SetupArgs) -> app::Result<i32> {
     if let Some(backup) = report.backup {
         println!("原文件备份：{}", backup.display());
     }
-    if shell::integration_is_loaded() {
-        println!("当前 shell 已加载 ghis wrapper。");
+    if renderer.integration_is_loaded() {
+        println!("当前 {kind} 已加载 ghis wrapper。");
     } else {
         println!(
-            "当前 shell 尚未加载；运行 `exec zsh` 或新开终端后生效，ghis 不会自动替换 shell。"
+            "当前 {kind} 尚未加载；运行 `exec {kind}` 或新开终端后生效，ghis 不会自动替换 shell。"
         );
     }
     Ok(0)
@@ -2891,18 +2910,20 @@ fn uninstall(args: ShellArgs) -> app::Result<i32> {
     let kind = resolve_shell(args.shell)?;
     let renderer =
         shell::renderer(kind).map_err(|error| app::AppError::Message(error.to_string()))?;
-    let home =
-        std::env::var_os("HOME").ok_or_else(|| app::AppError::Message("HOME 未设置".into()))?;
-    let startup_file = renderer.startup_file(Path::new(&home));
+    let home = shell_home()?;
+    let startup_file = renderer.startup_file(&home);
     let changed = renderer.uninstall(&startup_file)?;
-    println!(
-        "{}",
-        if changed {
-            "已从 .zshrc 移除 ghis 管理块，备份和 init 文件已保留。"
-        } else {
-            "未发现 ghis 管理块。"
-        }
-    );
+    if changed {
+        println!(
+            "已从 {} 移除 ghis 管理的 {kind} 集成。",
+            startup_file.display()
+        );
+    } else {
+        println!(
+            "未在 {} 发现 ghis 管理的 {kind} 集成。",
+            startup_file.display()
+        );
+    }
     Ok(0)
 }
 

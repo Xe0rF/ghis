@@ -23,6 +23,50 @@ pub enum PlatformError {
     InvalidEnvironment { variable: &'static str },
 }
 
+/// Resolve the current user's home directory without consulting the current
+/// directory. Unix retains the historical `HOME` behavior. Windows prefers
+/// `USERPROFILE` and falls back only to the paired `HOMEDRIVE`/`HOMEPATH`
+/// values that PowerShell and the Windows profile conventions use.
+pub fn user_home() -> Result<PathBuf, PlatformError> {
+    user_home_from_environment(|name| env::var_os(name))
+}
+
+fn user_home_from_environment(
+    get: impl Fn(&str) -> Option<OsString>,
+) -> Result<PathBuf, PlatformError> {
+    #[cfg(windows)]
+    {
+        if let Some(profile) = get("USERPROFILE") {
+            return required_windows_directory("USERPROFILE", Some(profile));
+        }
+
+        let drive = get("HOMEDRIVE");
+        let path = get("HOMEPATH");
+        let home = match (drive, path) {
+            (Some(drive), Some(path)) if !drive.is_empty() && !path.is_empty() => {
+                PathBuf::from(drive).join(path)
+            }
+            _ => {
+                return Err(PlatformError::MissingEnvironment {
+                    variable: "USERPROFILE",
+                });
+            }
+        };
+        if home.is_absolute() {
+            Ok(home)
+        } else {
+            Err(PlatformError::InvalidEnvironment {
+                variable: "HOMEDRIVE+HOMEPATH",
+            })
+        }
+    }
+
+    #[cfg(not(windows))]
+    {
+        required_path("HOME", get("HOME"))
+    }
+}
+
 /// Base directories for user configuration, cache, and state.
 ///
 /// The application owns the namespace below these roots.  Keeping the bases
@@ -196,6 +240,19 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn unix_user_home_keeps_the_home_environment_behavior() {
+        assert_eq!(
+            user_home_from_environment(|name| (name == "HOME").then(|| "relative-home".into())),
+            Ok(PathBuf::from("relative-home"))
+        );
+        assert_eq!(
+            user_home_from_environment(|_| None),
+            Err(PlatformError::MissingEnvironment { variable: "HOME" })
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn atomic_write_creates_owner_only_files() {
         use std::os::unix::fs::PermissionsExt;
 
@@ -219,6 +276,46 @@ mod tests {
             "LOCALAPPDATA" => Some(localappdata.clone()),
             _ => None,
         })
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_user_home_prefers_userprofile_and_falls_back_to_drive_and_path() {
+        let userprofile = user_home_from_environment(|name| match name {
+            "USERPROFILE" => Some(r"C:\Users\alice".into()),
+            "HOMEDRIVE" => Some("D:".into()),
+            "HOMEPATH" => Some(r"\ignored".into()),
+            _ => None,
+        })
+        .expect("USERPROFILE wins");
+        assert_eq!(userprofile, PathBuf::from(r"C:\Users\alice"));
+
+        let fallback = user_home_from_environment(|name| match name {
+            "HOMEDRIVE" => Some("C:".into()),
+            "HOMEPATH" => Some(r"\Users\alice".into()),
+            _ => None,
+        })
+        .expect("paired fallback");
+        assert_eq!(fallback, PathBuf::from(r"C:\Users\alice"));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_user_home_rejects_missing_and_invalid_values_without_cwd_fallback() {
+        assert_eq!(
+            user_home_from_environment(|_| None),
+            Err(PlatformError::MissingEnvironment {
+                variable: "USERPROFILE"
+            })
+        );
+        assert_eq!(
+            user_home_from_environment(|name| {
+                (name == "USERPROFILE").then(|| "relative-home".into())
+            }),
+            Err(PlatformError::InvalidEnvironment {
+                variable: "USERPROFILE"
+            })
+        );
     }
 
     #[cfg(windows)]

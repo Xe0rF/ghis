@@ -14,7 +14,7 @@ use std::process::{Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
-const GHIS_CONTROL_ENV: [&str; 10] = [
+const GHIS_CONTROL_ENV: [&str; 12] = [
     "GHIS_CONFIG",
     "GHIS_PROFILE",
     "GHIS_BANNER_SHOWN",
@@ -25,6 +25,8 @@ const GHIS_CONTROL_ENV: [&str; 10] = [
     "GHIS_REPO_PROFILE",
     "GHIS_REPO_PROFILE_DISPLAY",
     "GHIS_REPO_ROOT",
+    "GHIS_SHELL_INTEGRATION",
+    "GHIS_SHELL_INTEGRATION_HEALTH",
 ];
 
 fn write_executable(path: &Path, body: &str) {
@@ -2163,6 +2165,45 @@ fn setup_print_keeps_the_zsh_rendering_without_writing_startup_files() {
         .success()
         .stdout(predicate::str::contains("ghis_dispatch()"));
     assert!(!home.join(".zshrc").exists());
+}
+
+#[test]
+fn fish_setup_and_uninstall_messages_name_the_actual_drop_in() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let home = temp.path().join("home");
+    let config_home = temp.path().join("fish config");
+    fs::create_dir_all(&home).expect("home directory");
+    let drop_in = config_home.join("fish/conf.d/ghis.fish");
+
+    let mut setup = isolated_ghis_command();
+    setup
+        .args(["setup", "fish", "--yes"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home);
+    setup
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "fish 集成已安装：{}",
+            drop_in.display()
+        )))
+        .stdout(predicate::str::contains("exec fish"));
+    assert!(drop_in.is_file());
+    assert!(!home.join(".zshrc").exists());
+
+    let mut uninstall = isolated_ghis_command();
+    uninstall
+        .args(["uninstall", "fish"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home);
+    uninstall
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "已从 {} 移除 ghis 管理的 fish 集成。",
+            drop_in.display()
+        )));
+    assert!(!drop_in.exists());
 }
 
 #[test]
