@@ -1,12 +1,11 @@
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
-use clap_complete::{Shell, generate};
 use ghis::agent_context::{AgentContext, AgentContextFormat};
 use ghis::app::{self, AppContext};
 use ghis::config::{
     Config, ConfigPaths, CredentialFailurePolicy, DisplayIdentity, Profile, ResolutionSource, Rule,
     SigningProfile, SigningTransport, SshMode, SshProfile, SshUnmanagedPolicy, UnresolvedPolicy,
 };
-use ghis::{credential, diagnostics, github, shell, signing};
+use ghis::{credential, diagnostics, github, platform, shell, signing};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::fs;
@@ -35,6 +34,8 @@ struct Cli {
 enum Commands {
     /// 显示当前仓库和有效身份
     Status(StatusArgs),
+    /// 输出供 prompt 和 direnv 使用的最小、无凭据解析状态
+    Prompt(PromptArgs),
     /// 输出供 coding agent 使用的最小、脱敏仓库身份上下文
     Context(ContextArgs),
     /// 从 gh CLI 发现已有账号
@@ -78,18 +79,18 @@ enum Commands {
         #[command(subcommand)]
         command: AgentCommand,
     },
-    /// 安装 zsh 包装器
+    /// 安装 shell 包装器
     Setup(SetupArgs),
-    /// 从 .zshrc 移除 ghis 管理块
-    Uninstall,
+    /// 移除 ghis shell 集成
+    Uninstall(ShellArgs),
     /// 输出 shell 初始化脚本
-    Init { shell: ShellKind },
+    Init(ShellArgs),
     /// 输出 shell 补全脚本
-    Completion { shell: ShellKind },
-    /// 由 zsh wrapper 调用，透明执行真实 git
+    Completion(ShellArgs),
+    /// 由 shell wrapper 调用，透明执行真实 git
     #[command(trailing_var_arg = true)]
     Git(Passthrough),
-    /// 由 zsh wrapper 调用，为真实 gh 注入当前 profile token
+    /// 由 shell wrapper 调用，为真实 gh 注入当前 profile token
     #[command(trailing_var_arg = true)]
     Gh(Passthrough),
     /// Git credential helper 内部命令
@@ -108,9 +109,17 @@ enum Commands {
     },
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum ShellKind {
-    Zsh,
+#[derive(Debug, Args, Default)]
+struct ShellArgs {
+    /// Shell family; when omitted, ghis detects the current shell.
+    #[arg(value_name = "SHELL", value_parser = parse_shell_kind)]
+    shell: Option<shell::ShellKind>,
+}
+
+fn parse_shell_kind(value: &str) -> Result<shell::ShellKind, String> {
+    value
+        .parse()
+        .map_err(|error: shell::ShellError| error.to_string())
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -143,6 +152,9 @@ struct JsonArgs {
 struct StatusArgs {
     #[arg(short = 'j', long)]
     json: bool,
+    /// JSON 中隐藏环境路径、配置来源和程序细节
+    #[arg(long)]
+    redacted: bool,
     /// 供 chpwd hook 使用：不访问网络，也不输出正文
     #[arg(long, hide = true)]
     shell: bool,
@@ -151,9 +163,26 @@ struct StatusArgs {
 }
 
 #[derive(Debug, Args, Default)]
+struct PromptArgs {
+    /// Output format. JSON is the stable default; profile emits only the ID for direnv.
+    #[arg(long, value_enum, default_value_t = PromptFormatArg::Json)]
+    format: PromptFormatArg,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum PromptFormatArg {
+    #[default]
+    Json,
+    Profile,
+}
+
+#[derive(Debug, Args, Default)]
 struct DoctorArgs {
     #[arg(short = 'j', long)]
     json: bool,
+    /// JSON 中隐藏环境路径、配置来源和程序细节
+    #[arg(long)]
+    redacted: bool,
     /// 显式访问 GitHub API，核对当前 Profile 的 SSH signing 公钥
     #[arg(long, visible_alias = "check-github-signing-keys")]
     check_github_signing_key: bool,
@@ -165,6 +194,9 @@ struct CheckArgs {
     operation: CheckOperation,
     #[arg(short = 'j', long)]
     json: bool,
+    /// JSON 中隐藏环境路径、配置来源和程序细节
+    #[arg(long)]
+    redacted: bool,
     #[arg(last = true, allow_hyphen_values = true)]
     args: Vec<String>,
 }
@@ -241,10 +273,12 @@ enum AgentCommand {
 
 #[derive(Debug, Args)]
 struct SetupArgs {
-    /// 只打印将要写入的 zsh 初始化脚本
+    #[command(flatten)]
+    shell: ShellArgs,
+    /// 只打印将要写入的 shell 初始化脚本
     #[arg(long)]
     print: bool,
-    /// 跳过修改 zsh 启动文件前的确认，供脚本安装使用
+    /// 跳过修改 shell 启动文件前的确认，供脚本安装使用
     #[arg(short = 'y', long)]
     yes: bool,
 }
@@ -259,7 +293,7 @@ struct OnboardArgs {
 #[derive(Debug, Args)]
 struct Passthrough {
     #[arg(allow_hyphen_values = true)]
-    args: Vec<String>,
+    args: Vec<std::ffi::OsString>,
 }
 
 #[derive(Debug, Args, Default)]
@@ -325,6 +359,12 @@ struct ProfileArgs {
     fingerprint: Option<String>,
     #[arg(long)]
     agent_socket: Option<PathBuf>,
+    /// Explicit managed SSH jump hosts, in traversal order.
+    #[arg(long = "proxy-jump", value_delimiter = ',')]
+    proxy_jump: Vec<String>,
+    /// Forward the selected Agent through managed SSH hops.
+    #[arg(long)]
+    forward_agent: bool,
     #[arg(long)]
     sign: bool,
     #[arg(long)]
@@ -372,6 +412,24 @@ struct ProfileEditArgs {
     fingerprint: Option<String>,
     #[arg(long)]
     agent_socket: Option<PathBuf>,
+    /// Replace the explicit managed SSH jump-host chain.
+    #[arg(
+        long = "proxy-jump",
+        value_delimiter = ',',
+        conflicts_with = "clear_proxy_jump"
+    )]
+    proxy_jump: Option<Vec<String>>,
+    /// Clear the explicit managed SSH jump-host chain.
+    #[arg(long, conflicts_with = "proxy_jump")]
+    clear_proxy_jump: bool,
+    /// Enable or disable Agent forwarding for managed SSH hops.
+    #[arg(
+        long,
+        action = clap::ArgAction::Set,
+        num_args = 0..=1,
+        default_missing_value = "true"
+    )]
+    forward_agent: Option<bool>,
     /// 开启签名；使用 `--sign=false` 可关闭
     #[arg(
         long,
@@ -460,7 +518,7 @@ enum ConfigCommand {
 }
 
 fn main() {
-    let cli = Cli::parse();
+    let cli = parse_cli();
     match run(cli) {
         Ok(code) => std::process::exit(code),
         Err(error) => {
@@ -470,12 +528,27 @@ fn main() {
     }
 }
 
+fn parse_cli() -> Cli {
+    #[cfg(windows)]
+    if let Some(command) = ghis::agent::windows_native_shim_command() {
+        let mut arguments = Vec::with_capacity(std::env::args_os().len() + 2);
+        arguments.push(std::ffi::OsString::from("ghis"));
+        arguments.push(std::ffi::OsString::from(command));
+        arguments.push(std::ffi::OsString::from("--"));
+        arguments.extend(std::env::args_os().skip(1));
+        return Cli::parse_from(arguments);
+    }
+
+    Cli::parse()
+}
+
 fn run(cli: Cli) -> app::Result<i32> {
     let command = cli
         .command
         .unwrap_or_else(|| Commands::Status(StatusArgs::default()));
     match command {
         Commands::Status(args) => status(cli.config.as_deref(), cli.profile.as_deref(), args),
+        Commands::Prompt(args) => prompt(cli.config.as_deref(), cli.profile.as_deref(), args),
         Commands::Context(args) => {
             agent_context(cli.config.as_deref(), cli.profile.as_deref(), args)
         }
@@ -493,6 +566,7 @@ fn run(cli: Cli) -> app::Result<i32> {
             cli.config.as_deref(),
             cli.profile.as_deref(),
             args.json,
+            args.redacted,
             args.check_github_signing_key,
         ),
         Commands::Check(args) => check(cli.config.as_deref(), cli.profile.as_deref(), args),
@@ -500,24 +574,23 @@ fn run(cli: Cli) -> app::Result<i32> {
             agent_command(cli.config.as_deref(), cli.profile.as_deref(), command)
         }
         Commands::Setup(args) => setup(args),
-        Commands::Uninstall => uninstall(),
-        Commands::Init {
-            shell: ShellKind::Zsh,
-        } => {
-            print!("{}", shell::zsh_init_script("ghis"));
+        Commands::Uninstall(args) => uninstall(args),
+        Commands::Init(args) => {
+            print!(
+                "{}",
+                shell::render_init(resolve_shell(args.shell)?, "ghis")
+                    .map_err(|error| app::AppError::Message(error.to_string()))?
+            );
             Ok(0)
         }
-        Commands::Completion {
-            shell: ShellKind::Zsh,
-        } => {
-            let mut command = Cli::command();
-            let mut completion = Vec::new();
-            generate(Shell::Zsh, &mut command, "ghis", &mut completion);
-            write_stdout(&completion)?;
-            Ok(0)
-        }
+        Commands::Completion(args) => completion(resolve_shell(args.shell)?),
         Commands::Git(args) => {
-            let cwd = git_working_directory(&args.args)?;
+            let argument_view = args
+                .args
+                .iter()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            let cwd = git_working_directory(&argument_view)?;
             app::run_git(
                 &args.args,
                 cli.config.as_deref(),
@@ -553,11 +626,9 @@ fn agent_command(
         AgentCommand::Run { target, cwd, args } => {
             let cwd = cwd.unwrap_or(std::env::current_dir()?);
             let context = AgentContext::from_app(&context(path, explicit, &cwd)?);
-            let paths = ConfigPaths::discover()?;
-            let shim_dir = paths.cache_dir.join("agent-shims");
             let binary = PathBuf::from(agent_binary());
-            ghis::agent::prepare_session_shims(&shim_dir, &binary)?;
-            let session_path = ghis::agent::session_path(&shim_dir)?;
+            let shims = ghis::agent::SessionShims::create(&binary)?;
+            let session_path = ghis::agent::session_path(shims.directory())?;
             let spec = match target {
                 AgentTarget::Claude => {
                     ghis::agent::claude::run_spec(&context, "claude", args, &cwd)
@@ -571,9 +642,10 @@ fn agent_command(
                 ),
             }
             .map_err(|error| app::AppError::Message(error.to_string()))?;
-            let spec = ghis::agent::prepend_path(spec, &shim_dir)?;
-            ghis::agent::launch(&ghis::process::SystemCommandRunner::new(), &spec)
-                .map_err(|error| app::AppError::Message(error.to_string()))
+            let spec = ghis::agent::prepend_path(spec, shims.directory())?;
+            let launched = ghis::agent::launch_session(&spec);
+            drop(shims);
+            launched.map_err(|error| app::AppError::Message(error.to_string()))
         }
         AgentCommand::Hook {
             target: AgentTarget::Claude,
@@ -768,7 +840,9 @@ fn status(path: Option<&Path>, explicit: Option<&str>, args: StatusArgs) -> app:
         return Ok(0);
     }
     let report = app::display_status(&ctx);
-    if args.json {
+    if args.redacted {
+        print_redacted_json(&report)?;
+    } else if args.json {
         print_json(&report)?;
     } else {
         println!("{}", ctx.status_summary());
@@ -777,6 +851,27 @@ fn status(path: Option<&Path>, explicit: Option<&str>, args: StatusArgs) -> app:
         }
     }
     Ok(0)
+}
+
+fn prompt(path: Option<&Path>, explicit: Option<&str>, args: PromptArgs) -> app::Result<i32> {
+    let (paths, config) = load_config(path)?;
+    let ctx =
+        AppContext::from_config_for_prompt(paths, config, std::env::current_dir()?, explicit)?;
+    let report = app::prompt_status(&ctx);
+    match args.format {
+        PromptFormatArg::Json => print_json(&report)?,
+        PromptFormatArg::Profile => {
+            if let Some(profile) = report.profile.as_deref() {
+                if profile.chars().any(char::is_control) {
+                    return Err(app::AppError::Message(
+                        "`prompt --format profile` cannot render a profile id containing control characters; use JSON output instead".into(),
+                    ));
+                }
+                println!("{profile}");
+            }
+        }
+    }
+    Ok(i32::from(!report.is_resolved()))
 }
 
 fn shell_status(path: Option<&Path>) -> app::Result<i32> {
@@ -1091,9 +1186,11 @@ fn apply_onboarding(
         let setup_result = (|| -> app::Result<()> {
             let home = std::env::var_os("HOME")
                 .ok_or_else(|| app::AppError::Message("HOME 未设置".into()))?;
-            let zshrc = shell::zshrc_path(Path::new(&home), std::env::var_os("ZDOTDIR").as_deref());
-            let init = paths.config_dir.join("init.zsh");
-            shell::setup(zshrc, &init, "ghis")?;
+            let renderer = shell::renderer(shell::ShellKind::Zsh)
+                .map_err(|error| app::AppError::Message(error.to_string()))?;
+            let init = paths.config_dir.join(renderer.spec().init_file_name());
+            let startup_file = renderer.startup_file(Path::new(&home));
+            renderer.install(&startup_file, &init, &renderer.render_init("ghis"))?;
             Ok(())
         })();
         if let Err(error) = setup_result {
@@ -1401,6 +1498,8 @@ fn profile_from_args(args: ProfileArgs, git_email: String) -> Profile {
             public_key: args.public_key,
             fingerprint: args.fingerprint,
             agent_socket: args.agent_socket,
+            proxy_jump: args.proxy_jump,
+            forward_agent: args.forward_agent,
         }),
         signing: SigningProfile {
             enabled: args.sign,
@@ -1437,6 +1536,9 @@ fn update_profile_from_args(profile: &mut Profile, args: ProfileEditArgs) {
         || args.public_key.is_some()
         || args.fingerprint.is_some()
         || args.agent_socket.is_some()
+        || args.proxy_jump.is_some()
+        || args.clear_proxy_jump
+        || args.forward_agent.is_some()
     {
         let ssh = profile.ssh.get_or_insert_with(SshProfile::default);
         if let Some(mode) = args.ssh {
@@ -1454,6 +1556,14 @@ fn update_profile_from_args(profile: &mut Profile, args: ProfileEditArgs) {
         }
         if let Some(agent_socket) = args.agent_socket {
             ssh.agent_socket = Some(agent_socket);
+        }
+        if args.clear_proxy_jump {
+            ssh.proxy_jump.clear();
+        } else if let Some(proxy_jump) = args.proxy_jump {
+            ssh.proxy_jump = proxy_jump;
+        }
+        if let Some(forward_agent) = args.forward_agent {
+            ssh.forward_agent = forward_agent;
         }
     }
 
@@ -1770,7 +1880,8 @@ struct DoctorReport {
     schema_version: u32,
     git: ToolStatus,
     gh: ToolStatus,
-    zsh: ToolStatus,
+    shell: ToolStatus,
+    shell_kind: String,
     shell_integration: DoctorShellIntegration,
     accounts: Vec<DoctorAccount>,
     repository: Option<String>,
@@ -1811,6 +1922,7 @@ struct DoctorShellIntegration {
     setup_installed: bool,
     repository_bound: bool,
     advice: String,
+    repair_command: String,
 }
 
 #[derive(Serialize)]
@@ -1866,11 +1978,12 @@ fn doctor(
     path: Option<&Path>,
     explicit: Option<&str>,
     json: bool,
+    redacted: bool,
     check_github_signing_key: bool,
 ) -> app::Result<i32> {
     let ctx = context(path, explicit, std::env::current_dir()?)?;
     let mut warnings = ctx.warnings.clone();
-    let shell_integration = doctor_shell_integration(&ctx);
+    let shell_integration = doctor_shell_integration(&ctx)?;
     let diagnostic_cwd = ctx
         .repository
         .as_ref()
@@ -1969,10 +2082,14 @@ fn doctor(
     let ssh_agent = match socket {
         Some(socket) => match signing::inspect_agent(&socket) {
             Ok(agent) => {
+                let agent_error = agent
+                    .error
+                    .as_deref()
+                    .map(diagnostics::sanitize_external_output);
                 if agent_required && !agent.available {
                     warnings.push(format!(
                         "SSH Agent 不可用：{}",
-                        agent.error.as_deref().unwrap_or("未知错误")
+                        agent_error.as_deref().unwrap_or("未知错误")
                     ));
                 }
                 let selected_key = selector
@@ -1995,10 +2112,11 @@ fn doctor(
                     available: agent.available,
                     key_count: agent.keys.len(),
                     selected_key_fingerprint: selected_key.and_then(|key| key.fingerprint),
-                    error: agent.error,
+                    error: agent_error,
                 })
             }
             Err(error) => {
+                let error = diagnostics::sanitize_external_output(&error.to_string());
                 if agent_required {
                     warnings.push(format!("SSH Agent 检查失败：{error}"));
                 }
@@ -2014,7 +2132,7 @@ fn doctor(
                     available: false,
                     key_count: 0,
                     selected_key_fingerprint: None,
-                    error: Some(error.to_string()),
+                    error: Some(error),
                 })
             }
         },
@@ -2072,24 +2190,27 @@ fn doctor(
     );
     let git_status = tool_status("git", &["--version"]);
     let gh_status = tool_status("gh", &["--version"]);
-    let zsh_status = tool_status("zsh", &["--version"]);
+    let shell_kind = resolve_shell(None)?;
+    let shell_kind_name = shell_kind.to_string();
+    let shell_status = shell_tool_status(shell_kind);
     let checks = build_doctor_checks(
         &ctx,
         &shell_integration,
         &git_status,
         &gh_status,
-        &zsh_status,
+        &shell_status,
+        &shell_kind_name,
         credential_available,
         ssh_agent.as_ref(),
         &git_config,
     );
     let repairs = collect_repairs(&checks, &git_config);
-
     let report = DoctorReport {
         schema_version: ghis::SCHEMA_VERSION,
         git: git_status,
         gh: gh_status,
-        zsh: zsh_status,
+        shell: shell_status,
+        shell_kind: shell_kind_name,
         shell_integration,
         accounts: discovery
             .as_ref()
@@ -2119,12 +2240,14 @@ fn doctor(
         repairs,
         warnings,
     };
-    if json {
+    if redacted {
+        print_redacted_json(&report)?;
+    } else if json {
         print_json(&report)?;
     } else {
         println!("Git: {}", tool_text(&report.git));
         println!("gh: {}", tool_text(&report.gh));
-        println!("zsh: {}", tool_text(&report.zsh));
+        println!("{}: {}", report.shell_kind, tool_text(&report.shell));
         println!(
             "Shell wrapper: {}",
             doctor_shell_integration_text(report.shell_integration.state)
@@ -2235,18 +2358,19 @@ fn build_doctor_checks(
     shell: &DoctorShellIntegration,
     git: &ToolStatus,
     gh: &ToolStatus,
-    zsh: &ToolStatus,
+    shell_tool: &ToolStatus,
+    shell_kind: &str,
     credential_available: Option<bool>,
     ssh_agent: Option<&DoctorAgent>,
     git_config: &diagnostics::GitConfigReport,
 ) -> Vec<diagnostics::DiagnosticCheck> {
     use diagnostics::{DiagnosticCheck, DiagnosticCode, RepairAction, Severity};
     let mut checks = Vec::new();
-    for (name, status) in [("git", git), ("gh", gh), ("zsh", zsh)] {
+    for (name, status) in [("git", git), ("gh", gh), (shell_kind, shell_tool)] {
         checks.push(DiagnosticCheck::new(
             match name {
                 "gh" => DiagnosticCode::GhAuth,
-                "zsh" => DiagnosticCode::ShellIntegration,
+                _ if name == shell_kind => DiagnosticCode::ShellIntegration,
                 _ => DiagnosticCode::GlobalGitConfig,
             },
             if status.available {
@@ -2273,7 +2397,7 @@ fn build_doctor_checks(
             Severity::Warning
         },
         shell.advice.clone(),
-        (!shell.wrapper_loaded).then(|| RepairAction::confirmation("ghis setup")),
+        (!shell.wrapper_loaded).then(|| RepairAction::confirmation(shell.repair_command.clone())),
     ));
     if credential_available == Some(false) {
         let command = ctx.profile.as_ref().map_or_else(
@@ -2349,10 +2473,50 @@ fn collect_repairs(
         .collect()
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct CheckOperationSummary {
+    target: String,
+    command: String,
+    argument_count: usize,
+    sensitive_arguments_redacted: bool,
+}
+
+fn summarize_check_operation(operation: CheckOperation, args: &[String]) -> CheckOperationSummary {
+    let command = args
+        .iter()
+        .find(|arg| !arg.starts_with('-'))
+        .map(|arg| match arg.as_str() {
+            "status" | "diff" | "log" | "show" | "fetch" | "pull" | "push" | "commit"
+            | "branch" | "remote" | "config" | "auth" | "api" | "repo" => arg.clone(),
+            _ => "unrecognized".to_owned(),
+        })
+        .unwrap_or_else(|| "default".to_owned());
+    let sensitive_arguments_redacted = args.iter().any(|arg| {
+        let lower = arg.to_ascii_lowercase();
+        lower.contains("token")
+            || lower.contains("authorization")
+            || lower.contains("password")
+            || lower.contains("://")
+            || lower.contains('@')
+            || lower.starts_with("-") && (lower.contains("body") || lower.contains("message"))
+    });
+    CheckOperationSummary {
+        target: match operation {
+            CheckOperation::Git => "git".to_owned(),
+            CheckOperation::Gh => "gh".to_owned(),
+        },
+        command,
+        argument_count: args.len(),
+        sensitive_arguments_redacted,
+    }
+}
+
 #[derive(Serialize)]
 struct CheckReport {
     schema_version: u32,
     operation: CheckOperation,
+    operation_summary: CheckOperationSummary,
+    git_config: diagnostics::GitConfigReport,
     checks: Vec<diagnostics::DiagnosticCheck>,
     repairs: Vec<diagnostics::RepairAction>,
 }
@@ -2371,13 +2535,16 @@ fn check(path: Option<&Path>, explicit: Option<&str>, args: CheckArgs) -> app::R
         ctx.remote.as_ref(),
         ctx.identities.as_ref(),
     )?;
-    let shell = doctor_shell_integration(&ctx);
+    let shell = doctor_shell_integration(&ctx)?;
+    let shell_kind = resolve_shell(None)?;
+    let shell_kind_name = shell_kind.to_string();
     let checks = build_doctor_checks(
         &ctx,
         &shell,
         &tool_status("git", &["--version"]),
         &tool_status("gh", &["--version"]),
-        &tool_status("zsh", &["--version"]),
+        &shell_tool_status(shell_kind),
+        &shell_kind_name,
         None,
         None,
         &git_config,
@@ -2386,12 +2553,27 @@ fn check(path: Option<&Path>, explicit: Option<&str>, args: CheckArgs) -> app::R
     let report = CheckReport {
         schema_version: ghis::SCHEMA_VERSION,
         operation: args.operation,
+        operation_summary: summarize_check_operation(args.operation, &args.args),
+        git_config,
         checks,
         repairs,
     };
-    if args.json {
+    if args.redacted {
+        print_redacted_json(&report)?;
+    } else if args.json {
         print_json(&report)?;
     } else {
+        println!(
+            "操作\t{} {}\t参数 {} 个{}",
+            report.operation_summary.target,
+            report.operation_summary.command,
+            report.operation_summary.argument_count,
+            if report.operation_summary.sensitive_arguments_redacted {
+                "（敏感参数已隐藏）"
+            } else {
+                ""
+            }
+        );
         for check in &report.checks {
             println!(
                 "{}\t{:?}\t{}",
@@ -2417,18 +2599,32 @@ fn check(path: Option<&Path>, explicit: Option<&str>, args: CheckArgs) -> app::R
     )
 }
 
-fn doctor_shell_integration(ctx: &AppContext) -> DoctorShellIntegration {
-    let health = shell::integration_health();
-    let wrapper_loaded = shell::integration_is_loaded();
+fn doctor_shell_integration(ctx: &AppContext) -> app::Result<DoctorShellIntegration> {
+    let (renderer, health, wrapper_loaded) = match shell::active_renderer() {
+        shell::ActiveRenderer::Matched(renderer) | shell::ActiveRenderer::Fallback(renderer) => {
+            let health = renderer.integration_health();
+            (renderer, health, renderer.integration_is_loaded())
+        }
+        // Two renderers claiming one marker cannot safely describe the active
+        // shell. Keep zsh's established installation fallback, but never trust
+        // the ambiguous marker as evidence that a wrapper is healthy.
+        shell::ActiveRenderer::Ambiguous => {
+            let renderer = shell::renderer(shell::ShellKind::Zsh)
+                .map_err(|error| app::AppError::Message(error.to_string()))?;
+            (renderer, shell::IntegrationHealth::NotLoaded, false)
+        }
+    };
+    let kind = renderer.spec().kind();
     let wrapper_healthy = health == shell::IntegrationHealth::Healthy;
-    let health_marker = std::env::var_os(shell::HEALTH_ENV)
+    let health_marker = renderer
+        .inherited_health_marker()
         .map(|value| diagnostics::sanitize_display_text(&value.to_string_lossy()));
-    let init_file = ctx.paths.config_dir.join("init.zsh");
-    let setup_installed = std::env::var_os("HOME")
-        .map(PathBuf::from)
+    let init_file = ctx.paths.config_dir.join(renderer.spec().init_file_name());
+    let setup_installed = platform::user_home()
+        .ok()
         .map(|home| {
-            let zshrc = shell::zshrc_path(&home, std::env::var_os("ZDOTDIR").as_deref());
-            shell::integration_is_installed(&zshrc, &init_file, "ghis")
+            let startup_file = renderer.startup_file(&home);
+            renderer.integration_is_installed(&startup_file, &init_file, "ghis")
         })
         .unwrap_or(false);
     let repository_bound = ctx
@@ -2436,15 +2632,16 @@ fn doctor_shell_integration(ctx: &AppContext) -> DoctorShellIntegration {
         .as_ref()
         .is_some_and(repository_has_ghis_persistence);
     let state = classify_shell_integration(health, setup_installed, repository_bound);
-    DoctorShellIntegration {
+    Ok(DoctorShellIntegration {
         state,
         wrapper_loaded,
         wrapper_healthy,
         health_marker,
         setup_installed,
         repository_bound,
-        advice: doctor_shell_integration_advice(state).into(),
-    }
+        advice: doctor_shell_integration_advice(state, kind),
+        repair_command: renderer.setup_command().into(),
+    })
 }
 
 fn repository_has_ghis_persistence(repository: &ghis::repo::Repository) -> bool {
@@ -2517,6 +2714,7 @@ fn classify_shell_integration(
             DoctorShellIntegrationState::RepositoryOnly
         }
         shell::IntegrationHealth::NotLoaded => DoctorShellIntegrationState::NotIntegrated,
+        _ => DoctorShellIntegrationState::NotIntegrated,
     }
 }
 
@@ -2530,22 +2728,27 @@ fn doctor_shell_integration_text(state: DoctorShellIntegrationState) -> &'static
     }
 }
 
-fn doctor_shell_integration_advice(state: DoctorShellIntegrationState) -> &'static str {
+fn doctor_shell_integration_advice(
+    state: DoctorShellIntegrationState,
+    kind: shell::ShellKind,
+) -> String {
     match state {
         DoctorShellIntegrationState::WrapperLoaded => {
             "普通 git/gh 会经过 ghis；command git、绝对路径或 GHIS_BYPASS=1 仍可明确绕过 wrapper"
+                .into()
         }
-        DoctorShellIntegrationState::WrapperIncomplete => {
-            "GHIS marker 存在，但函数依赖不完整；运行 `source ${XDG_CONFIG_HOME:-$HOME/.config}/ghis/init.zsh` 或重新启动 zsh"
-        }
+        DoctorShellIntegrationState::WrapperIncomplete => format!(
+            "GHIS marker 存在，但函数依赖不完整；运行 `ghis setup {kind}` 或重新启动 {kind}"
+        ),
         DoctorShellIntegrationState::InstalledNotLoaded => {
-            "运行 exec zsh 或新开终端后再试；ghis 不会替换当前 shell"
+            format!("运行 `exec {kind}` 或新开终端后再试；ghis 不会替换当前 shell")
         }
         DoctorShellIntegrationState::RepositoryOnly => {
             "普通 Git 仍会读取该仓库已有的 include/helper/hook，但没有 wrapper 的本次解析和注入"
+                .into()
         }
         DoctorShellIntegrationState::NotIntegrated => {
-            "普通 git/gh 不会经过 ghis；需要时先运行 ghis setup 并重新加载 zsh"
+            format!("普通 git/gh 不会经过 ghis；需要时先运行 `ghis setup {kind}` 并重新加载 {kind}")
         }
     }
 }
@@ -2746,6 +2949,26 @@ fn profile_public_key_for_doctor(profile: &Profile) -> std::result::Result<Optio
         .map_err(|error| format!("无法读取签名公钥 {}：{error}", path.display()))
 }
 
+fn shell_tool_status(kind: shell::ShellKind) -> ToolStatus {
+    match kind {
+        shell::ShellKind::PowerShell => {
+            let status = tool_status("pwsh", &["--version"]);
+            if status.available {
+                status
+            } else {
+                tool_status("powershell", &["--version"])
+            }
+        }
+        shell::ShellKind::Zsh => tool_status("zsh", &["--version"]),
+        shell::ShellKind::Bash => tool_status("bash", &["--version"]),
+        shell::ShellKind::Fish => tool_status("fish", &["--version"]),
+        _ => ToolStatus {
+            available: false,
+            version: None,
+        },
+    }
+}
+
 fn tool_status(program: &str, args: &[&str]) -> ToolStatus {
     match std::process::Command::new(program).args(args).output() {
         Ok(output) => ToolStatus {
@@ -2773,24 +2996,53 @@ fn tool_text(status: &ToolStatus) -> String {
     }
 }
 
+/// Preserve the established Unix zsh default while using native PowerShell on Windows.
+fn resolve_shell(explicit: Option<shell::ShellKind>) -> app::Result<shell::ShellKind> {
+    #[cfg(windows)]
+    let default = shell::ShellKind::PowerShell;
+    #[cfg(not(windows))]
+    let default = shell::ShellKind::Zsh;
+    Ok(explicit.unwrap_or(default))
+}
+
+/// Resolve a shell startup-file root without falling back to the current
+/// directory. This keeps PowerShell's Windows profile target independent from
+/// Unix-only `HOME` while retaining the established Unix behavior.
+fn shell_home() -> app::Result<PathBuf> {
+    platform::user_home()
+        .map_err(|error| app::AppError::Message(format!("无法解析用户目录：{error}")))
+}
+
+fn completion(kind: shell::ShellKind) -> app::Result<i32> {
+    let renderer =
+        shell::renderer(kind).map_err(|error| app::AppError::Message(error.to_string()))?;
+    let mut command = Cli::command();
+    let output = renderer.render_completion(&mut command, "ghis");
+    write_stdout(&output)?;
+    Ok(0)
+}
+
 fn setup(args: SetupArgs) -> app::Result<i32> {
+    let kind = resolve_shell(args.shell.shell)?;
+    let renderer =
+        shell::renderer(kind).map_err(|error| app::AppError::Message(error.to_string()))?;
+    let init_script = renderer.render_init("ghis");
     let paths = ConfigPaths::discover()?;
-    let init = paths.config_dir.join("init.zsh");
+    let init = paths.config_dir.join(renderer.spec().init_file_name());
     if args.print {
-        print!("{}", shell::zsh_init_script("ghis"));
+        print!("{init_script}");
         return Ok(0);
     }
-    let home =
-        std::env::var_os("HOME").ok_or_else(|| app::AppError::Message("HOME 未设置".into()))?;
-    let zshrc = shell::zshrc_path(Path::new(&home), std::env::var_os("ZDOTDIR").as_deref());
+    let home = shell_home()?;
+    let startup_file = renderer.startup_file(&home);
     if !args.yes {
         if !io::stdin().is_terminal() {
             return Err(app::AppError::Message(format!(
                 "非交互环境不会自动修改 {}；确认目标后重新运行 `ghis setup --yes`",
-                zshrc.display()
+                startup_file.display()
             )));
         }
-        eprint!("将备份并更新 {}，继续吗？[y/N] ", zshrc.display());
+        eprint!("将备份并更新 {}，继续吗？[y/N] ", startup_file.display());
         io::stderr().flush()?;
         let mut answer = String::new();
         io::stdin().read_line(&mut answer)?;
@@ -2799,9 +3051,9 @@ fn setup(args: SetupArgs) -> app::Result<i32> {
             return Ok(0);
         }
     }
-    let report = shell::setup(zshrc, &init, "ghis")?;
+    let report = renderer.install(&startup_file, &init, &init_script)?;
     println!(
-        "zsh 集成{}：{}",
+        "{kind} 集成{}：{}",
         if report.changed {
             "已安装"
         } else {
@@ -2812,29 +3064,34 @@ fn setup(args: SetupArgs) -> app::Result<i32> {
     if let Some(backup) = report.backup {
         println!("原文件备份：{}", backup.display());
     }
-    if shell::integration_is_loaded() {
-        println!("当前 shell 已加载 ghis wrapper。");
+    if renderer.integration_is_loaded() {
+        println!("当前 {kind} 已加载 ghis wrapper。");
     } else {
         println!(
-            "当前 shell 尚未加载；运行 `exec zsh` 或新开终端后生效，ghis 不会自动替换 shell。"
+            "当前 {kind} 尚未加载；运行 `exec {kind}` 或新开终端后生效，ghis 不会自动替换 shell。"
         );
     }
     Ok(0)
 }
 
-fn uninstall() -> app::Result<i32> {
-    let home =
-        std::env::var_os("HOME").ok_or_else(|| app::AppError::Message("HOME 未设置".into()))?;
-    let zshrc = shell::zshrc_path(Path::new(&home), std::env::var_os("ZDOTDIR").as_deref());
-    let changed = shell::uninstall(&zshrc)?;
-    println!(
-        "{}",
-        if changed {
-            "已从 .zshrc 移除 ghis 管理块，备份和 init 文件已保留。"
-        } else {
-            "未发现 ghis 管理块。"
-        }
-    );
+fn uninstall(args: ShellArgs) -> app::Result<i32> {
+    let kind = resolve_shell(args.shell)?;
+    let renderer =
+        shell::renderer(kind).map_err(|error| app::AppError::Message(error.to_string()))?;
+    let home = shell_home()?;
+    let startup_file = renderer.startup_file(&home);
+    let changed = renderer.uninstall(&startup_file)?;
+    if changed {
+        println!(
+            "已从 {} 移除 ghis 管理的 {kind} 集成。",
+            startup_file.display()
+        );
+    } else {
+        println!(
+            "未在 {} 发现 ghis 管理的 {kind} 集成。",
+            startup_file.display()
+        );
+    }
     Ok(0)
 }
 
@@ -3019,6 +3276,13 @@ fn join_git_c_directory(base: &Path, next: &Path) -> PathBuf {
     }
 }
 
+fn print_redacted_json<T: Serialize>(value: &T) -> app::Result<()> {
+    let mut value =
+        serde_json::to_value(value).map_err(|error| app::AppError::Message(error.to_string()))?;
+    diagnostics::redact_json_value(&mut value);
+    print_json(&value)
+}
+
 fn print_json<T: Serialize>(value: &T) -> app::Result<()> {
     serde_json::to_writer_pretty(io::stdout(), value)
         .map_err(|error| app::AppError::Message(error.to_string()))?;
@@ -3041,6 +3305,43 @@ mod tests {
     #[test]
     fn cli_short_options_are_conflict_free() {
         Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn shell_commands_share_optional_shell_arguments() {
+        for command in ["setup", "uninstall", "init", "completion"] {
+            let parsed = Cli::try_parse_from(["ghis", command, "zsh"])
+                .unwrap_or_else(|error| panic!("{command} should accept zsh: {error}"));
+            assert!(matches!(
+                parsed.command,
+                Some(Commands::Setup(SetupArgs {
+                    shell: ShellArgs {
+                        shell: Some(shell::ShellKind::Zsh)
+                    },
+                    ..
+                })) | Some(Commands::Uninstall(ShellArgs {
+                    shell: Some(shell::ShellKind::Zsh)
+                })) | Some(Commands::Init(ShellArgs {
+                    shell: Some(shell::ShellKind::Zsh)
+                })) | Some(Commands::Completion(ShellArgs {
+                    shell: Some(shell::ShellKind::Zsh)
+                }))
+            ));
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shell_commands_use_powershell_as_the_implicit_default() {
+        assert_eq!(resolve_shell(None).unwrap(), shell::ShellKind::PowerShell);
+    }
+
+    #[test]
+    fn unknown_shell_is_rejected_during_cli_parsing() {
+        let error =
+            Cli::try_parse_from(["ghis", "init", "nu"]).expect_err("unknown shell must not parse");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
+        assert!(error.to_string().contains("未知 shell `nu`"));
     }
 
     #[test]
@@ -3168,6 +3469,33 @@ mod tests {
             settings.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
             KNOWN_BEHAVIOR_KEYS
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn native_shim_parser_preserves_arbitrary_windows_os_arguments() {
+        use std::os::windows::ffi::OsStringExt;
+
+        let non_unicode = std::ffi::OsString::from_wide(&[b'a' as u16, 0xd800, b'b' as u16]);
+        let expected = vec![
+            std::ffi::OsString::new(),
+            std::ffi::OsString::from("space quote \" & | ^ % trailing\\"),
+            non_unicode,
+        ];
+        let cli = Cli::try_parse_from(
+            [
+                std::ffi::OsString::from("ghis"),
+                std::ffi::OsString::from("git"),
+                std::ffi::OsString::from("--"),
+            ]
+            .into_iter()
+            .chain(expected.iter().cloned()),
+        )
+        .unwrap();
+        let Commands::Git(parsed) = cli.command.unwrap() else {
+            panic!("expected native git shim dispatch");
+        };
+        assert_eq!(parsed.args, expected);
     }
 
     #[test]

@@ -67,6 +67,7 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 mkdir -p "$root/bin" "$root/home" "$root/config" "$root/cache" "$root/state" "$root/repo"
+chmod 700 "$root" "$root/bin" "$root/home" "$root/config" "$root/cache" "$root/state" "$root/repo"
 cat >"$root/bin/gh" <<'EOF'
 #!/bin/sh
 set -eu
@@ -94,6 +95,7 @@ chmod +x "$root/bin/gh"
 # 仅使用 sandbox 内的 Git 配置，避免宿主设置影响测试或被测试写入。
 GIT_CONFIG_GLOBAL="$root/gitconfig"
 : >"$GIT_CONFIG_GLOBAL"
+chmod 600 "$GIT_CONFIG_GLOBAL"
 export GIT_CONFIG_GLOBAL
 export GIT_CONFIG_SYSTEM=/dev/null
 
@@ -112,7 +114,7 @@ export GHIS_SANDBOX_REPO="$root/repo"
 export NO_COLOR="${NO_COLOR:-1}"
 unset GHIS_CONFIG GHIS_PROFILE GHIS_BANNER_SHOWN GHIS_WRAPPER_ACTIVE GHIS_BYPASS
 unset GHIS_DISABLE_CHPWD GHIS_CHPWD_ENABLED GHIS_REPO_PROFILE GHIS_REPO_PROFILE_DISPLAY GHIS_REPO_ROOT
-unset GH_TOKEN GITHUB_TOKEN GH_HOST SSH_AUTH_SOCK
+unset GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN GITHUB_ENTERPRISE_TOKEN GH_HOST SSH_AUTH_SOCK
 if [ "$line_mode" -eq 1 ]; then
     export GHIS_ONBOARD_LINE_MODE=1
 else

@@ -16,6 +16,29 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use zeroize::Zeroizing;
 
+/// Return an explicitly supplied PATH from before an agent shim was installed.
+pub(crate) fn configured_agent_real_path() -> Option<OsString> {
+    std::env::var_os("GHIS_AGENT_REAL_PATH").filter(|path| !path.is_empty())
+}
+
+/// Return the PATH from before an agent shim was installed.
+///
+/// This falls back to the current PATH for commands outside an agent session.
+/// Agent session setup additionally removes recognized stale shim directories
+/// from that fallback before recording it for a nested session.
+pub(crate) fn agent_real_path() -> Option<OsString> {
+    configured_agent_real_path().or_else(|| std::env::var_os("PATH"))
+}
+
+/// Construct Git while bypassing an active agent shim when possible.
+pub fn git_command() -> Command {
+    let mut command = Command::new("git");
+    if let Some(path) = agent_real_path() {
+        command.env("PATH", path);
+    }
+    command
+}
+
 /// A command that is ready to run without an intervening shell.
 #[derive(Clone)]
 pub struct CommandSpec {
@@ -53,6 +76,24 @@ impl CommandSpec {
             current_dir: None,
             secrets: Vec::new(),
         }
+    }
+
+    /// Start the real Git executable, bypassing an active agent shim.
+    pub fn git() -> Self {
+        let mut command = Self::new("git");
+        if let Some(path) = agent_real_path() {
+            command.environment.insert(OsString::from("PATH"), path);
+        }
+        command
+    }
+
+    /// Start the real GitHub CLI, bypassing an active agent shim.
+    pub fn gh() -> Self {
+        let mut command = Self::new("gh");
+        if let Some(path) = agent_real_path() {
+            command.environment.insert(OsString::from("PATH"), path);
+        }
+        command
     }
 
     /// Add one argument, preserving it as an independent argv element.

@@ -4,11 +4,14 @@ use assert_cmd::Command as AssertCommand;
 use ghis::config::{Config, SshMode};
 use predicates::prelude::*;
 use std::fs;
-use std::os::fd::OwnedFd;
+use std::io;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Command, ExitStatus, Stdio};
+use std::time::{Duration, Instant};
 use tempfile::TempDir;
 
 const GHIS_CONTROL_ENV: [&str; 14] = [
@@ -76,12 +79,110 @@ fn isolated_git_command() -> AssertCommand {
 }
 
 fn xdg_environment(temp: &TempDir) -> [(String, PathBuf); 4] {
+    let root = fs::canonicalize(temp.path()).unwrap_or_else(|_| temp.path().to_owned());
     [
-        ("HOME".into(), temp.path().join("home")),
-        ("XDG_CONFIG_HOME".into(), temp.path().join("config")),
-        ("XDG_CACHE_HOME".into(), temp.path().join("cache")),
-        ("XDG_STATE_HOME".into(), temp.path().join("state")),
+        ("HOME".into(), root.join("home")),
+        ("XDG_CONFIG_HOME".into(), root.join("config")),
+        ("XDG_CACHE_HOME".into(), root.join("cache")),
+        ("XDG_STATE_HOME".into(), root.join("state")),
     ]
+}
+
+fn run_in_pseudo_terminal(command: &mut Command) -> io::Result<ExitStatus> {
+    let mut master = -1;
+    let mut slave = -1;
+    if unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let master = unsafe { OwnedFd::from_raw_fd(master) };
+    let slave = unsafe { OwnedFd::from_raw_fd(slave) };
+    for descriptor in [&master, &slave] {
+        if unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    let flags = unsafe { libc::fcntl(master.as_raw_fd(), libc::F_GETFL) };
+    if flags == -1
+        || unsafe { libc::fcntl(master.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+
+    command
+        .stdin(Stdio::from(slave.try_clone()?))
+        .stdout(Stdio::from(slave.try_clone()?))
+        .stderr(Stdio::from(slave.try_clone()?));
+    unsafe {
+        command.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            #[cfg(target_os = "macos")]
+            let tiocsctty = u64::from(libc::TIOCSCTTY);
+            #[cfg(not(target_os = "macos"))]
+            let tiocsctty = libc::TIOCSCTTY;
+            if libc::ioctl(libc::STDIN_FILENO, tiocsctty, 0) == -1 {
+                return Err(io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn()?;
+    drop(slave);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut buffer = [0; 4096];
+    loop {
+        loop {
+            match unsafe {
+                libc::read(master.as_raw_fd(), buffer.as_mut_ptr().cast(), buffer.len())
+            } {
+                count if count > 0 => {}
+                0 => break,
+                _ => {
+                    let error = io::Error::last_os_error();
+                    if matches!(error.raw_os_error(), Some(libc::EAGAIN) | Some(libc::EIO)) {
+                        break;
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if Instant::now() >= deadline {
+            child.kill()?;
+            let _ = child.wait();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "pseudo-terminal command timed out",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+fn pseudo_terminal_shell(command: &str) -> Command {
+    let mut pseudo_terminal = Command::new("script");
+    #[cfg(target_os = "macos")]
+    pseudo_terminal
+        .args(["-q", "-e", "/dev/null", "/bin/sh", "-c"])
+        .arg(command);
+    #[cfg(not(target_os = "macos"))]
+    pseudo_terminal
+        .args(["-q", "-e", "-c"])
+        .arg(command)
+        .arg("/dev/null");
+    pseudo_terminal
 }
 
 fn write_default_profile(temp: &TempDir) {
@@ -102,6 +203,40 @@ git_email = "alice@example.test"
 "#,
     )
     .expect("config");
+}
+
+fn assert_same_json_shape(default: &serde_json::Value, redacted: &serde_json::Value) {
+    match (default, redacted) {
+        (serde_json::Value::Object(left), serde_json::Value::Object(right)) => {
+            assert_eq!(
+                left.keys().collect::<Vec<_>>(),
+                right.keys().collect::<Vec<_>>()
+            );
+            for (key, value) in left {
+                assert_same_json_shape(value, &right[key]);
+            }
+        }
+        (serde_json::Value::Array(left), serde_json::Value::Array(right)) => {
+            assert_eq!(left.len(), right.len());
+            for (left, right) in left.iter().zip(right) {
+                assert_same_json_shape(left, right);
+            }
+        }
+        (serde_json::Value::Null, serde_json::Value::Null)
+        | (serde_json::Value::Bool(_), serde_json::Value::Bool(_))
+        | (serde_json::Value::Number(_), serde_json::Value::Number(_))
+        | (serde_json::Value::String(_), serde_json::Value::String(_)) => {}
+        pair => panic!("JSON shape changed: {pair:?}"),
+    }
+}
+
+fn assert_share_safe_json(output: &[u8], forbidden_path: &Path) -> serde_json::Value {
+    let rendered = String::from_utf8_lossy(output);
+    assert!(!rendered.contains(&forbidden_path.display().to_string()));
+    assert!(!rendered.contains('\u{1b}'));
+    assert!(!rendered.contains('\u{7}'));
+    assert!(!rendered.contains("AAAA_SHARE_SAFE_KEY_MATERIAL"));
+    serde_json::from_slice(output).expect("share-safe JSON")
 }
 
 #[test]
@@ -238,6 +373,515 @@ fn status_shows_only_profile_and_description() {
         .stdout(predicate::str::contains(temp.path().display().to_string()).not())
         .stdout(predicate::str::contains("Alice").not())
         .stdout(predicate::str::contains("alice@example.test").not());
+}
+
+#[test]
+fn status_json_redacts_inline_signing_material_and_key_paths() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let directory = temp.path().join("config/ghis");
+    fs::create_dir_all(&directory).expect("config directory");
+    let config = directory.join("config.toml");
+    let inline_key = "key::ssh-ed25519 AAAASTATUSSECRET private status comment";
+    fs::write(
+        &config,
+        format!(
+            r#"version = 1
+
+[behavior]
+default_profile = "work"
+
+[profiles.work]
+host = "github.com"
+login = "worker"
+git_name = "Work"
+git_email = "work@example.test"
+
+[profiles.work.signing]
+enabled = true
+signing_key = {inline_key:?}
+"#
+        ),
+    )
+    .expect("config");
+
+    let run = || {
+        let mut command = isolated_ghis_command();
+        command.current_dir(temp.path()).args(["status", "--json"]);
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.output().expect("run status JSON")
+    };
+
+    let output = run();
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("status JSON");
+    assert_eq!(report["signing"]["key"], "inline:ssh-ed25519");
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(!rendered.contains("AAAASTATUSSECRET"));
+    assert!(!rendered.contains("private status comment"));
+    assert!(!rendered.contains("key::"));
+
+    let sensitive_path = "/home/private/account/secrets/signing-key.pub";
+    let contents = fs::read_to_string(&config).expect("read config");
+    fs::write(&config, contents.replace(inline_key, sensitive_path)).expect("replace signing key");
+    let output = run();
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("status JSON");
+    assert_eq!(report["signing"]["key"], "<签名公钥路径已隐藏>");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(sensitive_path));
+}
+
+#[test]
+fn status_redacted_json_preserves_shape_and_identity_but_hides_paths_and_controls() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+    let repository = temp.path().join("repo-\u{1b}[31m-status-\u{7}");
+    fs::create_dir_all(&repository).expect("repository");
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repository)
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let run = |args: &[&str]| {
+        let mut command = isolated_ghis_command();
+        command.current_dir(&repository).args(args);
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.output().expect("run status")
+    };
+    let default = run(&["status", "--json"]);
+    let redacted = run(&["status", "--redacted"]);
+    assert!(default.status.success() && redacted.status.success());
+    let default: serde_json::Value = serde_json::from_slice(&default.stdout).unwrap();
+    let redacted_value = assert_share_safe_json(&redacted.stdout, temp.path());
+    assert_same_json_shape(&default, &redacted_value);
+    assert_eq!(redacted_value["schema_version"], default["schema_version"]);
+    assert_eq!(redacted_value["profile"], "personal");
+    assert_eq!(redacted_value["github"]["host"], "github.com");
+    assert_eq!(redacted_value["github"]["login"], "alice");
+    assert_eq!(redacted_value["repository"], "<路径已隐藏>");
+}
+
+#[test]
+fn doctor_redacted_json_preserves_statuses_and_fingerprints_but_hides_environment_details() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+    let repository = temp.path().join("repo-doctor");
+    fs::create_dir_all(&repository).expect("repository");
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repository)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let socket = temp.path().join("agent-\u{1b}[2J-\u{7}.sock");
+
+    let run = |args: &[&str]| {
+        let mut command = isolated_ghis_command();
+        command
+            .current_dir(&repository)
+            .args(args)
+            .env("SSH_AUTH_SOCK", &socket);
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.output().expect("run doctor")
+    };
+    let default = run(&["doctor", "--json"]);
+    let redacted = run(&["doctor", "--redacted"]);
+    assert!(default.status.success() && redacted.status.success());
+    let default: serde_json::Value = serde_json::from_slice(&default.stdout).unwrap();
+    let redacted_value = assert_share_safe_json(&redacted.stdout, temp.path());
+    assert_same_json_shape(&default, &redacted_value);
+    assert_eq!(redacted_value["schema_version"], default["schema_version"]);
+    assert_eq!(redacted_value["profile"], "personal");
+    assert_eq!(redacted_value["repository"], "<路径已隐藏>");
+    assert!(
+        redacted_value["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|check| { check.get("code").is_some() && check.get("severity").is_some() })
+    );
+    assert!(
+        redacted_value["repairs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|repair| { repair.get("kind").is_some() })
+    );
+}
+
+#[test]
+fn check_redacted_json_preserves_operation_summary_and_repairs_but_hides_config_origins() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+    let repository = temp.path().join("repo-\u{1b}[3J-check-\u{7}");
+    fs::create_dir_all(&repository).expect("repository");
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repository)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .current_dir(&repository)
+            .args(["config", "--local", "user.email", "wrong@example.test"])
+            .status()
+            .unwrap()
+            .success()
+    );
+
+    let run = |args: &[&str]| {
+        let mut command = isolated_ghis_command();
+        command.current_dir(&repository).args(args);
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.output().expect("run check")
+    };
+    let default = run(&["check", "--operation", "git", "--json", "--", "commit"]);
+    let redacted = run(&["check", "--operation", "git", "--redacted", "--", "commit"]);
+    assert!(matches!(default.status.code(), Some(0 | 1)));
+    assert_eq!(default.status.code(), redacted.status.code());
+    let default: serde_json::Value = serde_json::from_slice(&default.stdout).unwrap();
+    let redacted_value = assert_share_safe_json(&redacted.stdout, temp.path());
+    assert_same_json_shape(&default, &redacted_value);
+    assert_eq!(redacted_value["schema_version"], default["schema_version"]);
+    assert_eq!(
+        redacted_value["operation_summary"],
+        default["operation_summary"]
+    );
+    assert!(
+        redacted_value["git_config"]["diagnostics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|diagnostic| diagnostic["origin"] == "<路径已隐藏>"
+                && diagnostic.get("code").is_some()
+                && diagnostic.get("severity").is_some())
+    );
+    assert!(
+        redacted_value["repairs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|repair| { repair.get("kind").is_some() })
+    );
+}
+
+#[test]
+fn prompt_is_compact_read_only_and_preserves_resolution_precedence() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let repository = temp.path().join("repository");
+    let rule_directory = temp.path().join("prompt-rule-cwd");
+    fs::create_dir_all(&rule_directory).expect("rule directory");
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repository)
+            .status()
+            .expect("git init")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["config", "--local", "ghis.profile", "bound"])
+            .current_dir(&repository)
+            .status()
+            .expect("set repository binding")
+            .success()
+    );
+
+    let config_directory = temp.path().join("config/ghis");
+    fs::create_dir_all(&config_directory).expect("config directory");
+    let config = config_directory.join("config.toml");
+    fs::write(
+        &config,
+        r#"version = 1
+
+[behavior]
+default_profile = "default"
+
+[profiles.default]
+host = "github.com"
+login = "default"
+git_name = "Default"
+git_email = "default@example.test"
+
+[profiles.bound]
+host = "github.com"
+login = "bound"
+git_name = "Bound"
+git_email = "bound@example.test"
+
+[profiles.rule]
+host = "github.com"
+login = "rule"
+git_name = "Rule"
+git_email = "rule@example.test"
+
+[[rules]]
+id = "low-priority"
+profile = "default"
+priority = 10
+cwd = "*prompt-rule-cwd*"
+
+[[rules]]
+id = "high-priority"
+profile = "rule"
+priority = 20
+cwd = "*prompt-rule-cwd*"
+"#,
+    )
+    .expect("config");
+    let repository_config_before =
+        fs::read(repository.join(".git/config")).expect("repository config");
+    let before = fs::read(&config).expect("read config before prompt");
+
+    let run_prompt = |cwd: &Path, args: &[&str], environment_profile: Option<&str>| {
+        let mut command = isolated_ghis_command();
+        command
+            .current_dir(cwd)
+            .args(args)
+            .env("CI", "true")
+            .env("GH_TOKEN", "CANARY_DIR_ENV_TOKEN");
+        if let Some(profile) = environment_profile {
+            command.env("GHIS_PROFILE", profile);
+        }
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.output().expect("run prompt")
+    };
+    let assert_prompt = |output: std::process::Output, profile: Option<&str>, source: &str| {
+        assert_eq!(
+            output.status.code(),
+            Some(if profile.is_some() { 0 } else { 1 })
+        );
+        let rendered = String::from_utf8_lossy(&output.stdout);
+        assert!(!rendered.contains("CANARY_DIR_ENV_TOKEN"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("CANARY_DIR_ENV_TOKEN"));
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("prompt JSON");
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["profile"], profile.unwrap_or_default());
+        assert_eq!(value["resolution_source"], source);
+    };
+
+    assert_prompt(
+        run_prompt(&repository, &["prompt"], None),
+        Some("bound"),
+        "repository-binding",
+    );
+    let profile_only = run_prompt(&repository, &["prompt", "--format", "profile"], None);
+    assert_eq!(profile_only.status.code(), Some(0));
+    assert_eq!(profile_only.stdout, b"bound\n");
+    assert!(profile_only.stderr.is_empty());
+    assert_prompt(
+        run_prompt(&rule_directory, &["prompt"], None),
+        Some("rule"),
+        "rule",
+    );
+    assert_prompt(
+        run_prompt(temp.path(), &["prompt"], None),
+        Some("default"),
+        "default",
+    );
+    assert_prompt(
+        run_prompt(&repository, &["--profile", "default", "prompt"], None),
+        Some("default"),
+        "explicit",
+    );
+    assert_prompt(
+        run_prompt(
+            &repository,
+            &["--profile", "bound", "prompt"],
+            Some("default"),
+        ),
+        Some("bound"),
+        "explicit",
+    );
+    assert_prompt(
+        run_prompt(&repository, &["prompt"], Some("default")),
+        Some("default"),
+        "explicit",
+    );
+    assert_prompt(
+        run_prompt(&rule_directory, &["prompt"], Some("default")),
+        Some("default"),
+        "explicit",
+    );
+
+    let unresolved = run_prompt(
+        &repository,
+        &["--profile", "missing", "prompt", "--format", "profile"],
+        None,
+    );
+    assert_eq!(unresolved.status.code(), Some(1));
+    assert!(
+        unresolved.stdout.is_empty(),
+        "unresolved profile output must be empty"
+    );
+    assert!(
+        unresolved.stderr.is_empty(),
+        "prompt must not print resolution warnings"
+    );
+    assert_eq!(fs::read(&config).expect("read config after prompt"), before);
+    assert_eq!(
+        fs::read(repository.join(".git/config")).expect("repository config after prompt"),
+        repository_config_before
+    );
+    assert!(
+        !temp.path().join("cache").exists(),
+        "prompt created cache state"
+    );
+    assert!(
+        !temp.path().join("state").exists(),
+        "prompt created state files"
+    );
+}
+
+#[test]
+fn diagnostic_json_uses_shared_schema_version() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+
+    let run = |args: &[&str]| {
+        let mut command = isolated_ghis_command();
+        command.current_dir(temp.path()).args(args);
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.output().expect("run ghis")
+    };
+
+    let status = run(&["status", "--json"]);
+    assert!(status.status.success());
+    let status_report: serde_json::Value =
+        serde_json::from_slice(&status.stdout).expect("status JSON");
+    assert_eq!(
+        status_report["schema_version"],
+        serde_json::Value::from(ghis::SCHEMA_VERSION)
+    );
+
+    let check = run(&["check", "--operation", "git", "--json", "--", "status"]);
+    assert!(matches!(check.status.code(), Some(0 | 1)));
+    let check_report: serde_json::Value =
+        serde_json::from_slice(&check.stdout).expect("check JSON");
+    assert_eq!(
+        check_report["schema_version"],
+        serde_json::Value::from(ghis::SCHEMA_VERSION)
+    );
+
+    let cases = [
+        ("git", "status", "status"),
+        ("git", "commit", "commit"),
+        ("git", "push", "push"),
+        ("gh", "repo", "repo"),
+    ];
+    let mut summaries = Vec::new();
+    for (operation, arg, expected_command) in cases {
+        let output = run(&[
+            "check",
+            "--operation",
+            operation,
+            "--json",
+            "--",
+            arg,
+            "--message",
+            "super-secret-token",
+            "https://user:password@example.test/private",
+        ]);
+        assert!(matches!(output.status.code(), Some(0 | 1)));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("check JSON");
+        assert_eq!(report["operation_summary"]["target"], operation);
+        assert_eq!(report["operation_summary"]["command"], expected_command);
+        assert!(report["operation_summary"]["sensitive_arguments_redacted"] == true);
+        let json = String::from_utf8_lossy(&output.stdout);
+        assert!(!json.contains("super-secret-token"));
+        assert!(!json.contains("user:password@example.test"));
+        summaries.push(report["operation_summary"].clone());
+    }
+    assert!(summaries.windows(2).all(|pair| pair[0] != pair[1]));
+}
+
+#[test]
+fn prompt_profile_format_rejects_control_characters_but_json_escapes_them() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let config_directory = temp.path().join("config/ghis");
+    fs::create_dir_all(&config_directory).expect("config directory");
+    let safe = "safe profile 日本語";
+    let newline = format!("line{}break", char::from(10));
+    let escape = format!("escape{}sequence", char::from(27));
+    let tab = format!("tab{}separated", char::from(9));
+    let profile = |login: &str| ghis::config::Profile {
+        host: "github.com".into(),
+        login: login.into(),
+        git_name: "Prompt Test".into(),
+        git_email: "prompt@example.test".into(),
+        ..ghis::config::Profile::default()
+    };
+    let mut config = Config::default();
+    for (id, login) in [
+        (safe, "safe"),
+        (newline.as_str(), "newline"),
+        (escape.as_str(), "escape"),
+        (tab.as_str(), "tab"),
+    ] {
+        config.profiles.insert(id.into(), profile(login));
+    }
+    config
+        .save(config_directory.join("config.toml"))
+        .expect("config");
+
+    let run_prompt = |profile: &str, profile_only: bool| {
+        let mut command = isolated_ghis_command();
+        command
+            .current_dir(temp.path())
+            .args(["--profile", profile, "prompt"]);
+        if profile_only {
+            command.args(["--format", "profile"]);
+        }
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.output().expect("run prompt")
+    };
+
+    let safe_output = run_prompt(safe, true);
+    assert_eq!(safe_output.status.code(), Some(0));
+    assert_eq!(safe_output.stdout, format!("{safe}\n").as_bytes());
+    assert!(safe_output.stderr.is_empty());
+
+    for profile in ["line\nbreak", "escape\u{1b}sequence", "tab\tseparated"] {
+        let profile_output = run_prompt(profile, true);
+        assert_eq!(profile_output.status.code(), Some(2));
+        assert!(
+            profile_output.stdout.is_empty(),
+            "profile format wrote an unsafe id: {profile:?}"
+        );
+        assert!(String::from_utf8_lossy(&profile_output.stderr).contains("control characters"));
+
+        let json_output = run_prompt(profile, false);
+        assert_eq!(json_output.status.code(), Some(0));
+        assert!(!json_output.stdout.contains(&0x1b));
+        assert!(!json_output.stdout.contains(&b'\t'));
+        let json: serde_json::Value =
+            serde_json::from_slice(&json_output.stdout).expect("safe prompt JSON");
+        assert_eq!(json["profile"], profile);
+        assert_eq!(json["resolution_source"], "explicit");
+    }
 }
 
 #[test]
@@ -1442,6 +2086,7 @@ printf '%s\n' "$@" > "$CODEX_TRACE"
 #[test]
 fn zsh_wrapper_preserves_tty_and_sigint_status() {
     let temp = tempfile::tempdir().expect("temporary directory");
+    let tty_trace = temp.path().join("tty-trace");
     let fake_bin = temp.path().join("fake-bin");
     fs::create_dir_all(&fake_bin).expect("fake bin");
     write_executable(
@@ -1449,9 +2094,9 @@ fn zsh_wrapper_preserves_tty_and_sigint_status() {
         r#"#!/bin/sh
 if [ "${1:-}" = tty-probe ]; then
   if [ -t 0 ] && [ -t 1 ]; then
-    printf 'tty-ok\n'
+    printf 'tty-ok\n' > "$GHIS_TTY_TRACE"
   else
-    printf 'tty-lost\n'
+    printf 'tty-lost\n' > "$GHIS_TTY_TRACE"
     exit 72
   fi
   kill -INT "$$"
@@ -1466,15 +2111,11 @@ exec "$GHIS_REAL_GIT" "$@"
     fs::write(
         &probe,
         format!(
-            "#!/usr/bin/zsh -f\nsource {}\ngit tty-probe\n",
+            "source {}\ngit tty-probe\n",
             ghis::shell::shell_quote(&init.to_string_lossy())
         ),
     )
     .expect("probe");
-    let mut probe_permissions = fs::metadata(&probe).unwrap().permissions();
-    probe_permissions.set_mode(0o755);
-    fs::set_permissions(&probe, probe_permissions).unwrap();
-
     let ghis_bin = assert_cmd::cargo::cargo_bin!("ghis");
     let binary_dir = ghis_bin.parent().unwrap();
     let inherited = std::env::var_os("PATH").unwrap_or_default();
@@ -1492,24 +2133,92 @@ exec "$GHIS_REAL_GIT" "$@"
             .expect("real git in PATH")
             .into_os_string()
     });
-    let mut command = Command::new("script");
+    let mut command = Command::new("zsh");
+    command.arg("-f").arg(&probe);
     command
-        .args(["-q", "-e", "-c"])
-        .arg(&probe)
-        .arg("/dev/null")
         .current_dir(temp.path())
         .env("PATH", path)
         .env("GHIS_REAL_GIT", real_git)
+        .env("GHIS_TTY_TRACE", &tty_trace)
         .env("HOME", temp.path().join("home"))
         .env("XDG_CONFIG_HOME", temp.path().join("config"))
         .env("XDG_CACHE_HOME", temp.path().join("cache"))
         .env("XDG_STATE_HOME", temp.path().join("state"));
     clear_ghis_environment(&mut command);
-    let output = command.output().expect("run wrapper in a pseudo-terminal");
+    let status = run_in_pseudo_terminal(&mut command).expect("run wrapper in a pseudo-terminal");
 
-    assert_eq!(output.status.code(), Some(130));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("tty-ok"));
-    assert!(!String::from_utf8_lossy(&output.stdout).contains("tty-lost"));
+    assert_eq!(status.code(), Some(130));
+    assert_eq!(
+        fs::read_to_string(tty_trace).expect("TTY trace"),
+        "tty-ok\n"
+    );
+}
+
+#[test]
+fn bash_wrapper_preserves_tty_and_sigint_status() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let tty_trace = temp.path().join("tty-trace");
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir_all(&fake_bin).expect("fake bin");
+    write_executable(
+        &fake_bin.join("git"),
+        r#"#!/bin/sh
+if [ "${1:-}" = tty-probe ]; then
+  if [ -t 0 ] && [ -t 1 ]; then
+    printf 'tty-ok\n' > "$GHIS_TTY_TRACE"
+  else
+    printf 'tty-lost\n' > "$GHIS_TTY_TRACE"
+    exit 72
+  fi
+  kill -INT "$$"
+  exit 99
+fi
+exec "$GHIS_REAL_GIT" "$@"
+"#,
+    );
+    let init = temp.path().join("init.bash");
+    fs::write(&init, ghis::shell::bash::bash_init_script("ghis")).expect("init");
+    let ghis_bin = assert_cmd::cargo::cargo_bin!("ghis");
+    let binary_dir = ghis_bin.parent().unwrap();
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        [fake_bin.as_path(), binary_dir]
+            .into_iter()
+            .map(Path::to_path_buf)
+            .chain(std::env::split_paths(&inherited)),
+    )
+    .unwrap();
+    let real_git = std::env::var_os("GHIS_TEST_REAL_GIT").unwrap_or_else(|| {
+        std::env::split_paths(&inherited)
+            .map(|directory| directory.join("git"))
+            .find(|candidate| candidate.is_file())
+            .expect("real git in PATH")
+            .into_os_string()
+    });
+    let probe = temp.path().join("probe.bash");
+    fs::write(&probe, "source \"$1\"\ngit tty-probe\n").expect("probe");
+    let mut command = Command::new("bash");
+    command
+        .args(["--noprofile", "--norc", "-i"])
+        .arg(&probe)
+        .arg(&init)
+        .current_dir(temp.path())
+        .env("PATH", path)
+        .env("GHIS_REAL_GIT", real_git)
+        .env("GHIS_TTY_TRACE", &tty_trace)
+        .env("HOME", temp.path().join("home"))
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
+        .env("XDG_CACHE_HOME", temp.path().join("cache"))
+        .env("XDG_STATE_HOME", temp.path().join("state"));
+    clear_ghis_environment(&mut command);
+    let status =
+        run_in_pseudo_terminal(&mut command).expect("run Bash wrapper in a pseudo-terminal");
+
+    assert_eq!(status.code(), Some(130));
+    assert_eq!(
+        fs::read_to_string(tty_trace).expect("TTY trace"),
+        "tty-ok\n"
+    );
 }
 
 #[test]
@@ -1523,11 +2232,8 @@ fn agent_setup_claude_requires_confirmation_before_writing_settings() {
         ghis::shell::shell_quote(&ghis_bin.to_string_lossy()),
         ghis::shell::shell_quote(&project.to_string_lossy())
     );
-    let mut command = Command::new("script");
+    let mut command = pseudo_terminal_shell(&invocation);
     command
-        .args(["-q", "-e", "-c"])
-        .arg(invocation)
-        .arg("/dev/null")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -1619,11 +2325,8 @@ esac
         ghis::shell::shell_quote(&binary.to_string_lossy()),
         ghis::shell::shell_quote(&repository.to_string_lossy())
     );
-    let mut command = Command::new("script");
+    let mut command = pseudo_terminal_shell(&child_command);
     command
-        .args(["-q", "-e", "-c"])
-        .arg(child_command)
-        .arg("/dev/null")
         .env("PATH", prepend_path(&fake_bin))
         .env("NO_COLOR", "1")
         .env("COLUMNS", "80")
@@ -1772,19 +2475,35 @@ fn concurrent_profile_add_commands_keep_every_identity() {
 
 #[test]
 fn completion_treats_a_closed_stdout_as_success() {
-    let (closed_reader, writer) = UnixStream::pair().expect("unix stream pair");
-    drop(closed_reader);
-    let writer: OwnedFd = writer.into();
+    for shell in ["zsh", "bash", "fish", "powershell"] {
+        let (closed_reader, writer) = UnixStream::pair().expect("unix stream pair");
+        drop(closed_reader);
+        let writer: OwnedFd = writer.into();
 
-    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("ghis"));
-    clear_ghis_environment(&mut command);
-    let status = command
-        .args(["completion", "zsh"])
-        .stdout(Stdio::from(writer))
-        .status()
-        .expect("run completion with closed stdout");
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin!("ghis"));
+        clear_ghis_environment(&mut command);
+        let status = command
+            .args(["completion", shell])
+            .stdout(Stdio::from(writer))
+            .status()
+            .expect("run completion with closed stdout");
 
-    assert!(status.success());
+        assert!(
+            status.success(),
+            "completion {shell} must ignore broken pipe"
+        );
+    }
+}
+
+#[test]
+fn completion_rejects_unknown_shell_without_output() {
+    let mut command = isolated_ghis_command();
+    command.args(["completion", "nu"]);
+    command
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("未知 shell `nu`"));
 }
 
 #[test]
@@ -1801,6 +2520,174 @@ fn init_output_is_valid_when_piped_directly_to_zsh() {
     let status = command.status().expect("pipe init into zsh");
 
     assert!(status.success());
+}
+
+#[test]
+fn shell_commands_support_bash_and_reject_unknown_shells() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).expect("home directory");
+
+    let configure = |command: &mut AssertCommand| {
+        command
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", temp.path().join("config"))
+            .env("SHELL", "/usr/bin/zsh");
+    };
+
+    let mut setup = isolated_ghis_command();
+    setup.args(["setup", "bash", "--yes"]);
+    configure(&mut setup);
+    setup.assert().success();
+    let bashrc = home.join(".bashrc");
+    assert!(
+        fs::read_to_string(&bashrc)
+            .expect("bashrc")
+            .contains(ghis::shell::bash::START_MARKER)
+    );
+
+    let mut second = isolated_ghis_command();
+    second.args(["setup", "bash", "--yes"]);
+    configure(&mut second);
+    second
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("无需更新"));
+
+    let mut uninstall = isolated_ghis_command();
+    uninstall.args(["uninstall", "bash"]);
+    configure(&mut uninstall);
+    uninstall.assert().success();
+    assert!(
+        !fs::read_to_string(&bashrc)
+            .expect("bashrc")
+            .contains(ghis::shell::bash::START_MARKER)
+    );
+
+    let mut unknown = isolated_ghis_command();
+    unknown.arg("init").arg("nu");
+    unknown
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("未知 shell `nu`"));
+}
+
+#[test]
+fn setup_print_keeps_the_zsh_rendering_without_writing_startup_files() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).expect("home directory");
+
+    let mut command = isolated_ghis_command();
+    command
+        .args(["setup", "zsh", "--print"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", temp.path().join("config"));
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ghis_dispatch()"));
+    assert!(!home.join(".zshrc").exists());
+}
+
+#[test]
+fn fish_setup_and_uninstall_messages_name_the_actual_drop_in() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let home = temp.path().join("home");
+    let config_home = temp.path().join("fish config");
+    fs::create_dir_all(&home).expect("home directory");
+    let drop_in = config_home.join("fish/conf.d/ghis.fish");
+
+    let mut setup = isolated_ghis_command();
+    setup
+        .args(["setup", "fish", "--yes"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home);
+    setup
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "fish 集成已安装：{}",
+            drop_in.display()
+        )))
+        .stdout(predicate::str::contains("exec fish"));
+    assert!(drop_in.is_file());
+    assert!(!home.join(".zshrc").exists());
+
+    let mut uninstall = isolated_ghis_command();
+    uninstall
+        .args(["uninstall", "fish"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home);
+    uninstall
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(format!(
+            "已从 {} 移除 ghis 管理的 fish 集成。",
+            drop_in.display()
+        )));
+    assert!(!drop_in.exists());
+}
+
+#[test]
+fn implicit_setup_and_uninstall_keep_zsh_without_environment_hints() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let home = temp.path().join("home");
+    fs::create_dir_all(&home).expect("home directory");
+
+    let configure = |command: &mut AssertCommand| {
+        command
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", temp.path().join("config"))
+            .env_remove("SHELL")
+            .env_remove("ZDOTDIR")
+            .env_remove("PSModulePath");
+    };
+
+    let mut setup = isolated_ghis_command();
+    setup.args(["setup", "--yes"]);
+    configure(&mut setup);
+    setup
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("zsh 集成"));
+    let zshrc = home.join(".zshrc");
+    assert!(
+        fs::read_to_string(&zshrc)
+            .expect("zshrc")
+            .contains(ghis::shell::START_MARKER)
+    );
+
+    let mut uninstall = isolated_ghis_command();
+    uninstall.arg("uninstall");
+    configure(&mut uninstall);
+    uninstall.assert().success();
+    assert!(
+        !fs::read_to_string(&zshrc)
+            .expect("zshrc")
+            .contains(ghis::shell::START_MARKER)
+    );
+}
+
+#[test]
+fn zsh_environment_hint_beats_a_bash_login_shell_for_implicit_print() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let home = temp.path().join("home");
+    let zdotdir = temp.path().join("zsh");
+    fs::create_dir_all(&home).expect("home directory");
+    fs::create_dir_all(&zdotdir).expect("zsh directory");
+
+    let mut command = isolated_ghis_command();
+    command
+        .args(["setup", "--print"])
+        .env("HOME", &home)
+        .env("ZDOTDIR", &zdotdir)
+        .env("SHELL", "/bin/bash")
+        .env("XDG_CONFIG_HOME", temp.path().join("config"));
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ghis_dispatch()"));
 }
 
 #[test]
@@ -2079,7 +2966,7 @@ exit 42
         }
         hook.assert()
             .success()
-            .stderr(predicate::str::contains("profile=work"))
+            .stderr(predicate::str::contains("GHIS Profile: work"))
             .stderr(predicate::str::contains("Work Identity").not())
             .stderr(predicate::str::contains("Alice").not());
     }
@@ -2288,7 +3175,7 @@ git_email = "work@example.test"
     commit
         .assert()
         .success()
-        .stderr(predicate::str::contains("profile=work"))
+        .stderr(predicate::str::contains("GHIS Profile: work"))
         .stderr(predicate::str::contains("Work Identity").not())
         .stderr(predicate::str::contains("work@example.test").not());
 
@@ -2481,6 +3368,7 @@ fn direct_hook_banner_reports_git_resolved_author_and_committer() {
     }
     hook.assert()
         .success()
+        .stderr(predicate::str::contains("ghis: 警告："))
         .stderr(predicate::str::contains(
             "实际作者=Actual Author <actual-author@example.test>",
         ))
@@ -2559,6 +3447,8 @@ mode = "one-password"
 public_key = "/keys/work.pub"
 fingerprint = "SHA256:work"
 agent_socket = "/run/user/1000/op-agent.sock"
+proxy_jump = ["deploy@bastion.example:2222", "inner.example"]
+forward_agent = true
 
 [profiles.work.signing]
 enabled = true
@@ -2589,6 +3479,11 @@ program = "/opt/1Password/op-ssh-sign"
         ssh.agent_socket.as_deref(),
         Some(Path::new("/run/user/1000/op-agent.sock"))
     );
+    assert_eq!(
+        ssh.proxy_jump,
+        ["deploy@bastion.example:2222", "inner.example"]
+    );
+    assert!(ssh.forward_agent);
     assert!(profile.signing.enabled);
     assert_eq!(
         profile.signing.signing_key.as_deref(),
@@ -2598,6 +3493,62 @@ program = "/opt/1Password/op-ssh-sign"
         profile.signing.program.as_deref(),
         Some(Path::new("/opt/1Password/op-ssh-sign"))
     );
+}
+
+#[test]
+fn profile_cli_configures_and_clears_managed_proxy_jump() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let config_file = temp.path().join("config/ghis/config.toml");
+
+    let mut add = isolated_ghis_command();
+    add.args([
+        "profile",
+        "add",
+        "work",
+        "--login",
+        "worker",
+        "--name",
+        "Work Identity",
+        "--email",
+        "work@example.test",
+        "--ssh",
+        "managed",
+        "--public-key",
+        "/keys/work.pub",
+        "--proxy-jump",
+        "deploy@bastion.example:2222,inner.example",
+        "--forward-agent",
+    ]);
+    for (key, value) in xdg_environment(&temp) {
+        add.env(key, value);
+    }
+    add.assert().success();
+
+    let config = Config::load(&config_file).expect("load managed proxy config");
+    let ssh = config.profiles["work"].ssh.as_ref().expect("SSH profile");
+    assert_eq!(
+        ssh.proxy_jump,
+        ["deploy@bastion.example:2222", "inner.example"]
+    );
+    assert!(ssh.forward_agent);
+
+    let mut clear = isolated_ghis_command();
+    clear.args([
+        "profile",
+        "edit",
+        "work",
+        "--clear-proxy-jump",
+        "--forward-agent=false",
+    ]);
+    for (key, value) in xdg_environment(&temp) {
+        clear.env(key, value);
+    }
+    clear.assert().success();
+
+    let config = Config::load(&config_file).expect("load cleared proxy config");
+    let ssh = config.profiles["work"].ssh.as_ref().expect("SSH profile");
+    assert!(ssh.proxy_jump.is_empty());
+    assert!(!ssh.forward_agent);
 }
 
 #[test]

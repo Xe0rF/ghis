@@ -6,6 +6,7 @@ use crate::git::{self, ConfigEntry, EffectiveIdentities};
 use crate::repo::Remote;
 use crate::signing;
 use serde::Serialize;
+use serde_json::Value;
 use std::path::Path;
 
 /// Diagnostic severity shared by CLI JSON and text output.
@@ -765,6 +766,257 @@ fn bounded(value: &str) -> String {
     }
 }
 
+/// Sanitize untrusted output captured from an external diagnostic probe.
+///
+/// Probe output can contain credentials as well as terminal sequences crafted
+/// to make a JSON consumer display misleading diagnostics. Keep useful text
+/// such as exit statuses, but hide common credential/header forms, public-key
+/// material and comments, remove ANSI sequences, escape remaining controls,
+/// and cap the resulting field.
+pub fn sanitize_external_output(value: &str) -> String {
+    let without_ansi = strip_ansi_sequences(value);
+    let mut redacted = Vec::new();
+    for line in without_ansi.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        redacted.push(redact_external_line(trimmed));
+    }
+    bounded(&redacted.join("\\n"))
+}
+
+fn redact_external_line(line: &str) -> String {
+    let words = line.split_whitespace().collect::<Vec<_>>();
+    if let Some(index) = words.iter().enumerate().position(|(index, word)| {
+        let word = word.trim_matches(|character: char| {
+            matches!(character, '"' | '\'' | '(' | '[' | '{' | ':' | ',')
+        });
+        is_public_key_algorithm(word)
+            && words.get(index + 1).is_some_and(|material| {
+                !material.starts_with('-')
+                    && material.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'=')
+                    })
+            })
+    }) {
+        let prefix = words[..index].join(" ");
+        return if prefix.is_empty() {
+            "<SSH 公钥内容已隐藏>".into()
+        } else {
+            format!("{prefix} <SSH 公钥内容已隐藏>")
+        };
+    }
+
+    let lower = line.to_ascii_lowercase();
+    for header in ["authorization:", "proxy-authorization:"] {
+        if let Some(index) = lower.find(header) {
+            return format!(
+                "{}{} <已隐藏>",
+                &line[..index],
+                &line[index..index + header.len()]
+            );
+        }
+    }
+
+    let mut output = Vec::with_capacity(words.len());
+    let mut hide_next = false;
+    for word in words {
+        if hide_next {
+            output.push("<已隐藏>".to_owned());
+            hide_next = false;
+            continue;
+        }
+        let lower = word.to_ascii_lowercase();
+        if lower == "bearer" {
+            output.push(word.to_owned());
+            hide_next = true;
+            continue;
+        }
+        let separator = word.find(['=', ':']);
+        if let Some(index) = separator {
+            let name = lower[..index].trim_matches(|character: char| {
+                !character.is_ascii_alphanumeric() && character != '_' && character != '-'
+            });
+            if is_sensitive_external_name(name) {
+                output.push(format!("{}<已隐藏>", &word[..=index]));
+                continue;
+            }
+        }
+        if is_sensitive_external_name(lower.trim_matches(|character: char| {
+            !character.is_ascii_alphanumeric() && character != '_' && character != '-'
+        })) {
+            output.push(word.to_owned());
+            hide_next = true;
+            continue;
+        }
+        output.push(word.to_owned());
+    }
+    output.join(" ")
+}
+
+fn is_public_key_algorithm(value: &str) -> bool {
+    value.starts_with("ssh-ed25519")
+        || value.starts_with("ssh-rsa")
+        || value.starts_with("ecdsa-sha2-")
+        || value.starts_with("sk-ssh-")
+        || value.starts_with("sk-ecdsa-")
+        || value.starts_with("rsa-sha2-")
+}
+
+fn is_sensitive_external_name(name: &str) -> bool {
+    matches!(
+        name,
+        "token"
+            | "access_token"
+            | "auth_token"
+            | "github_token"
+            | "gh_token"
+            | "api_key"
+            | "apikey"
+            | "secret"
+    )
+}
+
+fn strip_ansi_sequences(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut chars = value.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\u{1b}' {
+            output.push(character);
+            continue;
+        }
+        match chars.peek().copied() {
+            Some('[') => {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+            }
+            Some(']') => {
+                chars.next();
+                let mut previous_escape = false;
+                for next in chars.by_ref() {
+                    if next == '\u{7}' || previous_escape && next == '\\' {
+                        break;
+                    }
+                    previous_escape = next == '\u{1b}';
+                }
+            }
+            Some(_) => {
+                chars.next();
+            }
+            None => {}
+        }
+    }
+    output
+}
+
+/// Build the explicitly requested share-safe JSON view without changing the
+/// long-standing default JSON schema. Structural fields remain present, while
+/// environment-specific paths, external tool details, identity data and
+/// executable repair commands are replaced in-place.
+pub fn redact_json_value(value: &mut Value) {
+    redact_json_node(None, value);
+}
+
+fn redact_json_node(key: Option<&str>, value: &mut Value) {
+    match value {
+        Value::Object(object) => {
+            for (field, child) in object {
+                if redacted_json_field(key, field) {
+                    if !child.is_null() {
+                        *child = Value::String(redacted_json_placeholder(field).into());
+                    }
+                } else {
+                    redact_json_node(Some(field), child);
+                }
+            }
+        }
+        Value::Array(items) => {
+            for item in items {
+                redact_json_node(key, item);
+            }
+        }
+        Value::String(text) => {
+            let sanitized = sanitize_display_text(text);
+            if contains_sensitive_text(&sanitized) || contains_absolute_path(&sanitized) {
+                *text = "<已隐藏>".into();
+            } else {
+                *text = sanitized;
+            }
+        }
+        _ => {}
+    }
+}
+
+fn redacted_json_field(parent: Option<&str>, field: &str) -> bool {
+    if parent == Some("operation_summary") {
+        return false;
+    }
+    matches!(
+        field,
+        "repository"
+            | "origin"
+            | "socket"
+            | "path"
+            | "key"
+            | "version"
+            | "shell_kind"
+            | "name"
+            | "email"
+            | "command"
+            | "health_marker"
+    ) || {
+        let lower = field.to_ascii_lowercase();
+        matches!(
+            lower.as_str(),
+            "token" | "access_token" | "secret" | "password" | "authorization"
+        )
+    }
+}
+
+fn redacted_json_placeholder(field: &str) -> &'static str {
+    match field {
+        "repository" | "origin" | "socket" | "path" => "<路径已隐藏>",
+        "command" => "<命令已隐藏>",
+        "key" => "<密钥已隐藏>",
+        "version" | "shell_kind" => "<工具信息已隐藏>",
+        "name" | "email" => "<身份信息已隐藏>",
+        _ => "<已隐藏>",
+    }
+}
+
+fn contains_sensitive_text(value: &str) -> bool {
+    let lower = value.to_ascii_lowercase();
+    lower.contains("key::")
+        || lower.contains("authorization:")
+        || lower.contains("password=")
+        || lower.contains("token=")
+        || lower.contains("secret=")
+}
+
+fn contains_absolute_path(value: &str) -> bool {
+    if value.starts_with('/') || value.contains("file:/") {
+        return true;
+    }
+    value.split_whitespace().any(|word| {
+        let word = word.trim_matches(|character: char| {
+            matches!(
+                character,
+                '`' | '\'' | '"' | '(' | ')' | '[' | ']' | ',' | ';'
+            )
+        });
+        word.starts_with('/')
+            || word.starts_with("~/")
+            || (word.len() >= 3
+                && word.as_bytes()[1] == b':'
+                && matches!(word.as_bytes()[2], b'/' | b'\\'))
+    })
+}
+
 /// Escape terminal control characters before a value is rendered in text.
 /// JSON would escape controls, but the text doctor output consumes these
 /// fields directly.
@@ -1321,5 +1573,27 @@ mod tests {
         assert!(!rendered.contains("Alice\nwarning"));
         assert!(rendered.contains("Alice\\nwarning\\r\\t\\u{0007}"));
         assert!(rendered.contains("file:/tmp/evil\\u{001B}[2J"));
+    }
+
+    #[test]
+    fn sanitizes_external_probe_credentials_keys_controls_and_length() {
+        let long = "x".repeat(400);
+        let raw = format!(
+            "\u{1b}[31mAuthorization: Bearer header-secret\u{1b}[0m\nGH_TOKEN=token-secret\nssh-ed25519 AAAAKEY raw-key-comment\nexit 73: {long}\r\u{7}"
+        );
+        let sanitized = sanitize_external_output(&raw);
+        assert!(sanitized.contains("exit 73"));
+        for secret in [
+            "header-secret",
+            "token-secret",
+            "AAAAKEY",
+            "raw-key-comment",
+        ] {
+            assert!(!sanitized.contains(secret));
+        }
+        assert!(!sanitized.contains('\u{1b}'));
+        assert!(!sanitized.contains('\r'));
+        assert!(!sanitized.contains('\u{7}'));
+        assert!(sanitized.chars().count() <= 163);
     }
 }

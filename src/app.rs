@@ -70,7 +70,21 @@ impl AppContext {
         cwd: impl AsRef<Path>,
         explicit: Option<&str>,
     ) -> Result<Self> {
-        Self::from_config_with_target(paths, config, cwd, explicit, None)
+        Self::from_config_with_target(paths, config, cwd, explicit, None, true)
+    }
+
+    /// Resolve the minimal prompt state without inspecting Git identities.
+    ///
+    /// This deliberately shares the normal resolution chain while avoiding the
+    /// extra `git var` subprocess that is useful for detailed status reporting
+    /// but unnecessary for a prompt or direnv integration.
+    pub fn from_config_for_prompt(
+        paths: ConfigPaths,
+        config: Config,
+        cwd: impl AsRef<Path>,
+        explicit: Option<&str>,
+    ) -> Result<Self> {
+        Self::from_config_with_target(paths, config, cwd, explicit, None, false)
     }
 
     fn from_config_for_gh(
@@ -80,7 +94,7 @@ impl AppContext {
         explicit: Option<&str>,
         target: Option<&GhProfileTarget>,
     ) -> Result<Self> {
-        Self::from_config_with_target(paths, config, cwd, explicit, target)
+        Self::from_config_with_target(paths, config, cwd, explicit, target, true)
     }
 
     fn from_config_with_target(
@@ -89,6 +103,7 @@ impl AppContext {
         cwd: impl AsRef<Path>,
         explicit: Option<&str>,
         target: Option<&GhProfileTarget>,
+        inspect_identities: bool,
     ) -> Result<Self> {
         let cwd = std::path::absolute(cwd.as_ref())?;
         let mut warnings = Vec::new();
@@ -96,7 +111,9 @@ impl AppContext {
             Ok(repository) => {
                 let remote = repo::primary_remote(&repository)?;
                 let binding = repo::local_config(&repository, PROFILE_CONFIG_KEY)?;
-                let identities = git::effective_identities(&repository).ok();
+                let identities = inspect_identities
+                    .then(|| git::effective_identities(&repository).ok())
+                    .flatten();
                 (Some(repository), remote, binding, identities)
             }
             Err(RepoError::NotRepository { .. }) => (None, None, None, None),
@@ -196,8 +213,8 @@ impl AppContext {
     /// available through `ghis status` and should not accompany every command.
     pub fn operation_banner(&self) -> String {
         match self.profile_id() {
-            Some(id) => format!("ghis: profile={id}"),
-            None => "ghis: profile=未解析".into(),
+            Some(id) => format!("GHIS Profile: {id}"),
+            None => "GHIS Profile: 未解析".into(),
         }
     }
 
@@ -276,6 +293,10 @@ pub fn profile_fragment_path(paths: &ConfigPaths, profile_id: &str) -> PathBuf {
     paths.fragments_dir.join(format!("{safe}.gitconfig"))
 }
 
+fn managed_ssh_config_path(paths: &ConfigPaths, profile_id: &str) -> PathBuf {
+    profile_fragment_path(paths, profile_id).with_extension("sshconfig")
+}
+
 pub fn write_profile_fragment(paths: &ConfigPaths, id: &str, profile: &Profile) -> Result<PathBuf> {
     with_fragment_write_lock(paths, || {
         let authoritative = authoritative_config(paths, None)?;
@@ -305,7 +326,8 @@ fn write_profile_fragment_unlocked(
     profile: &Profile,
 ) -> Result<PathBuf> {
     let path = profile_fragment_path(paths, id);
-    let content = profile_fragment_content(profile);
+    let ssh_config = write_managed_ssh_config_unlocked(paths, id, profile)?;
+    let content = profile_fragment_content(profile, ssh_config.as_deref());
     let temporary = path.with_extension(format!("gitconfig.{}.tmp", std::process::id()));
     fs::write(&temporary, content)?;
     #[cfg(unix)]
@@ -315,6 +337,60 @@ fn write_profile_fragment_unlocked(
     }
     fs::rename(&temporary, &path)?;
     Ok(path)
+}
+
+fn write_managed_ssh_config_unlocked(
+    paths: &ConfigPaths,
+    id: &str,
+    profile: &Profile,
+) -> Result<Option<PathBuf>> {
+    let path = managed_ssh_config_path(paths, id);
+    let managed = profile.ssh.as_ref().filter(|ssh| {
+        matches!(
+            ssh.mode,
+            config::SshMode::OnePassword | config::SshMode::Managed
+        )
+    });
+    let material = managed.and_then(|ssh| {
+        let socket = signing::discover_agent_socket(ssh.agent_socket.as_deref())?;
+        let public_key = ssh.public_key.as_deref().map(signing::expand_user)?;
+        Some((socket, public_key))
+    });
+    let Some((socket, public_key)) = material else {
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        return Ok(None);
+    };
+
+    let temporary = path.with_extension(format!("sshconfig.{}.tmp", std::process::id()));
+    let user_known_hosts = std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+        .map(|home| home.join(".ssh").join("known_hosts"));
+    fs::write(
+        &temporary,
+        signing::render_managed_ssh_config(&socket, &public_key, user_known_hosts.as_deref()),
+    )?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o600))?;
+    }
+    fs::rename(&temporary, &path)?;
+    Ok(Some(path))
+}
+
+fn write_managed_ssh_config(
+    paths: &ConfigPaths,
+    id: &str,
+    profile: &Profile,
+) -> Result<Option<PathBuf>> {
+    with_fragment_write_lock(paths, || {
+        write_managed_ssh_config_unlocked(paths, id, profile)
+    })
 }
 
 fn with_fragment_write_lock<T>(
@@ -328,6 +404,11 @@ fn with_fragment_write_lock<T>(
         .read(true)
         .write(true)
         .open(paths.fragments_dir.join(".lock"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        lock_file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
     let mut lock = RwLock::new(lock_file);
     let _guard = lock.write()?;
     operation()
@@ -346,7 +427,7 @@ fn authoritative_config(paths: &ConfigPaths, fallback: Option<&Config>) -> Resul
     }
 }
 
-fn profile_fragment_content(profile: &Profile) -> String {
+fn profile_fragment_content(profile: &Profile, ssh_config_path: Option<&Path>) -> String {
     let signing = &profile.signing;
     // The command may target a non-primary remote or an `insteadOf` rewrite,
     // so install the managed SSH restriction independently of `ctx.remote`.
@@ -356,8 +437,6 @@ fn profile_fragment_content(profile: &Profile) -> String {
             config::SshMode::OnePassword | config::SshMode::Managed
         )
     });
-    let agent_socket =
-        managed_ssh.and_then(|ssh| signing::discover_agent_socket(ssh.agent_socket.as_deref()));
     let signing_key = signing
         .enabled
         .then(|| {
@@ -395,11 +474,9 @@ fn profile_fragment_content(profile: &Profile) -> String {
         name: profile.git_name.clone(),
         email: profile.git_email.clone(),
         credential_helper: None,
-        ssh_command: managed_ssh.and_then(|ssh| {
-            let public_key = ssh.public_key.as_deref()?;
-            Some(match agent_socket.as_deref() {
-                Some(socket) => signing::render_ssh_command(socket, public_key),
-                None => ssh_guard_command(),
+        ssh_command: managed_ssh.map(|ssh| {
+            ssh_config_path.map_or_else(ssh_guard_command, |config_path| {
+                signing::render_ssh_command(config_path, &ssh.proxy_jump, ssh.forward_agent)
             })
         }),
         signing_key,
@@ -423,13 +500,13 @@ pub fn bind_repository(ctx: &AppContext, id: &str) -> Result<()> {
     let fragment = write_profile_fragment(&ctx.paths, id, profile)?;
     remove_managed_credential_helpers(repository)?;
     git::set_git_config(repository, PROFILE_CONFIG_KEY, id)?;
-    let include_keys = profile_include_keys(repository);
-    for old_key in &include_keys {
-        unset_profile_include(repository, old_key)?;
+    let include_key = profile_include_key(repository);
+    for old_key in profile_include_cleanup_keys(repository) {
+        unset_profile_include(repository, &old_key)?;
     }
     repo::add_local_config(
         repository,
-        &include_keys[0],
+        &include_key,
         fragment.to_string_lossy().as_ref(),
     )?;
     let helper = credential_helper_command(&ctx.paths);
@@ -448,7 +525,7 @@ pub fn unbind_repository(ctx: &AppContext) -> Result<()> {
         .as_ref()
         .ok_or_else(|| AppError::Message("当前目录不是 Git 仓库".into()))?;
     git::unset_git_config(repository, PROFILE_CONFIG_KEY)?;
-    for include_key in profile_include_keys(repository) {
+    for include_key in profile_include_cleanup_keys(repository) {
         unset_profile_include(repository, &include_key)?;
     }
     remove_managed_credential_helpers(repository)?;
@@ -521,14 +598,26 @@ fn unset_profile_include(repository: &Repository, key: &str) -> Result<()> {
     Ok(())
 }
 
-fn profile_include_keys(repository: &Repository) -> [String; 2] {
+fn profile_include_key(repository: &Repository) -> String {
+    let gitdir = fs::canonicalize(&repository.git_dir)
+        .unwrap_or_else(|_| repository.git_dir.clone())
+        .to_string_lossy()
+        .replace('\\', "/");
+    format!("includeIf.gitdir:{gitdir}.path")
+}
+
+fn profile_include_cleanup_keys(repository: &Repository) -> Vec<String> {
     let gitdir = repository.git_dir.to_string_lossy().replace('\\', "/");
-    // Git's dotted key syntax is `includeIf.<condition>.path`; keep the legacy
-    // key as the second entry so upgrades and unbind both remove it.
-    [
+    let mut keys = vec![profile_include_key(repository)];
+    for key in [
         format!("includeIf.gitdir:{gitdir}.path"),
         format!("includeIf.gitdir:{gitdir}/.path"),
-    ]
+    ] {
+        if !keys.contains(&key) {
+            keys.push(key);
+        }
+    }
+    keys
 }
 
 pub fn sync_fragments(paths: &ConfigPaths, config: &Config) -> Result<Vec<PathBuf>> {
@@ -689,6 +778,36 @@ pub fn display_status(ctx: &AppContext) -> StatusReport {
     StatusReport::from_context(ctx)
 }
 
+/// Versioned, credential-free resolution state for prompts and direnv.
+///
+/// This intentionally exposes only the active profile and why it was chosen.
+/// It is safe to consume from a non-interactive shell without loading a
+/// wrapper, inspecting credentials, or creating ghis state.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptStatusReport {
+    pub schema_version: u32,
+    pub profile: Option<String>,
+    pub resolution_source: String,
+}
+
+impl PromptStatusReport {
+    pub fn from_context(ctx: &AppContext) -> Self {
+        Self {
+            schema_version: 1,
+            profile: ctx.profile_id().map(str::to_owned),
+            resolution_source: resolution_source_name(&ctx.resolution.source),
+        }
+    }
+
+    pub fn is_resolved(&self) -> bool {
+        self.profile.is_some()
+    }
+}
+
+pub fn prompt_status(ctx: &AppContext) -> PromptStatusReport {
+    PromptStatusReport::from_context(ctx)
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct StatusReport {
     pub schema_version: u32,
@@ -758,7 +877,7 @@ impl StatusReport {
                 config::SigningTransport::ForwardedAgent => "forwarded-agent",
             }
             .into(),
-            key: profile.signing.signing_key.clone(),
+            key: status_signing_key_selector(profile),
         });
         Self {
             schema_version: crate::SCHEMA_VERSION,
@@ -778,6 +897,22 @@ impl StatusReport {
     }
 }
 
+fn status_signing_key_selector(profile: &Profile) -> Option<String> {
+    if let Some(fingerprint) = profile.signing.fingerprint.as_deref() {
+        return Some(format!(
+            "fingerprint:{}",
+            crate::diagnostics::sanitize_display_text(fingerprint.trim())
+        ));
+    }
+    let key = profile.signing.signing_key.as_deref()?;
+    let inline = key.trim_start().strip_prefix("key::").unwrap_or(key);
+    if signing::is_public_key_line(inline) {
+        let key_type = inline.split_whitespace().next().unwrap_or("unknown");
+        return Some(format!("inline:{key_type}"));
+    }
+    Some("<签名公钥路径已隐藏>".into())
+}
+
 fn resolution_source_name(source: &ResolutionSource) -> String {
     match source {
         ResolutionSource::Explicit => "explicit",
@@ -794,17 +929,41 @@ fn resolution_source_name(source: &ResolutionSource) -> String {
 }
 
 /// 执行一次经过身份解析的 git 命令。
-pub fn run_git(
-    args: &[String],
+pub fn run_git<A>(
+    args: &[A],
     config_path: Option<&Path>,
     explicit: Option<&str>,
     cwd: &Path,
-) -> Result<i32> {
+) -> Result<i32>
+where
+    A: AsRef<std::ffi::OsStr>,
+{
+    let forwarded_args = args
+        .iter()
+        .map(|arg| arg.as_ref().to_os_string())
+        .collect::<Vec<_>>();
     // The CLI wrapper invokes this command as `ghis git -- "$@"` so Clap can
     // preserve arbitrary Git options. Remove that transport separator before
     // handing arguments to Git; otherwise `ghis git -- --version` turns the
     // version flag into a subcommand and Git reports a misleading `-c` error.
-    let args = args.strip_prefix(&["--".to_string()]).unwrap_or(args);
+    let forwarded_args = forwarded_args
+        .strip_prefix(&[std::ffi::OsString::from("--")])
+        .unwrap_or(&forwarded_args);
+    let argument_view = forwarded_args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let args = argument_view.as_slice();
+    // A small, closed whitelist lets ordinary local inspection keep Git's own
+    // argv, cwd and stdio untouched. Keep this before ConfigPaths::discover:
+    // the wrapper must not create any ghis config/cache/state artifacts for a
+    // command that can be proven not to need profile resolution.
+    if is_local_read_only_git(args) {
+        let command = CommandSpec::git().args(forwarded_args.iter().cloned());
+        let status = SystemCommandRunner::new().run_passthrough(&command)?;
+        return Ok(status.code().unwrap_or(128));
+    }
+
     let mut paths = ConfigPaths::discover()?;
     if let Some(path) = config_path {
         paths.set_config_file(path)?;
@@ -821,6 +980,7 @@ pub fn run_git(
             "当前仓库身份无法唯一解析，已按 unresolved=fail 停止操作".into(),
         ));
     }
+    validate_commit_signing_argv(&ctx, args, &operation)?;
     validate_git_auth_safety(&ctx, args, &operation)?;
     let execution_policy = validate_profile_operation(&ctx, &operation)?;
     let repository_binding = matches!(ctx.resolution.source, ResolutionSource::RepositoryBinding);
@@ -851,7 +1011,7 @@ pub fn run_git(
     // particular, forwarding `git -C relative/path` after changing into that
     // path would make Git apply the relative path a second time.
     let policy_index = git_policy_insertion_index(args);
-    let mut command = CommandSpec::new("git");
+    let mut command = CommandSpec::git();
     if let (Some(id), Some(profile)) = (ctx.profile_id(), ctx.profile.as_ref())
         && !repository_binding
         && !should_auto_bind
@@ -867,11 +1027,17 @@ pub fn run_git(
     // credential policy after caller global options, but before Git's `--`
     // option terminator/subcommand. Appending `-c` after `--` makes Git treat it
     // as a command (notably for `git --version` and `ghis git -- --version`).
-    command = command.args(args[..policy_index].iter().cloned());
+    command = command.args(forwarded_args[..policy_index].iter().cloned());
     if let Some(signing_key) = execution_policy.signing_key.as_deref() {
         command = command
             .arg("-c")
             .arg(format!("user.signingKey={signing_key}"));
+    }
+    if execution_policy.force_commit_signing {
+        // Keep this after caller-supplied global options. The argv validator
+        // also rejects unsafe overrides embedded in aliases, where insertion
+        // order cannot reliably restore the Profile policy.
+        command = command.arg("-c").arg("commit.gpgSign=true");
     }
     if let Some(profile) = ctx.profile.as_ref() {
         // Restrict the fail-closed helper to this Profile's GitHub host. Other
@@ -889,7 +1055,7 @@ pub fn run_git(
         // the same custom cache/state namespace after Git changes directory.
         command = command.env("GHIS_CONFIG", ctx.paths.config_file.as_os_str());
     }
-    command = command.args(args[policy_index..].iter().cloned());
+    command = command.args(forwarded_args[policy_index..].iter().cloned());
     if let Some(ssh_command) = execution_policy.ssh_command {
         command = apply_managed_ssh_environment(command, ssh_command);
     }
@@ -904,6 +1070,125 @@ pub fn run_git(
 struct GitExecutionPolicy {
     ssh_command: Option<String>,
     signing_key: Option<String>,
+    force_commit_signing: bool,
+}
+
+/// Return true only for Git invocations whose command and relevant options are
+/// in the local-inspection allowlist. Unknown commands and aliases deliberately
+/// return false: resolving an alias would require consulting Git config, and a
+/// shell alias can run arbitrary commands or contact a remote.
+fn is_local_read_only_git(args: &[String]) -> bool {
+    if args.is_empty()
+        || args.iter().any(|arg| {
+            arg == "-c"
+                || arg.starts_with("-c")
+                || arg == "--config-env"
+                || arg.starts_with("--config-env=")
+        })
+    {
+        return false;
+    }
+
+    let Some(index) = git_subcommand_index(args) else {
+        return matches!(args, [flag] if matches!(flag.as_str(), "--version" | "--help" | "-h"));
+    };
+    let command = args[index].as_str();
+    let command_args = &args[index + 1..];
+    match command {
+        "branch" => is_read_only_branch(command_args),
+        "config" => is_read_only_config(command_args),
+        "remote" => is_read_only_remote(command_args),
+        "reflog" => is_read_only_reflog(command_args),
+        "stash" => is_read_only_stash(command_args),
+        "tag" => is_read_only_tag(command_args),
+        "worktree" => command_args.first().is_some_and(|arg| arg == "list"),
+        "sparse-checkout" => command_args.first().is_some_and(|arg| arg == "list"),
+        "status" | "log" | "diff" | "show" | "rev-parse" | "rev-list" | "describe" | "ls-files"
+        | "ls-tree" | "cat-file" | "for-each-ref" | "for-each-reflog" | "name-rev" | "shortlog"
+        | "blame" | "grep" | "check-ignore" | "check-attr" | "verify-commit" | "verify-tag"
+        | "whatchanged" => true,
+        _ => false,
+    }
+}
+
+fn is_read_only_branch(args: &[String]) -> bool {
+    if args.is_empty() {
+        return true;
+    }
+    if args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "-d" | "-D"
+                | "-m"
+                | "-M"
+                | "-c"
+                | "-C"
+                | "--delete"
+                | "--move"
+                | "--copy"
+                | "--set-upstream-to"
+                | "-u"
+                | "--unset-upstream"
+                | "--edit-description"
+                | "--create-reflog"
+                | "--track"
+                | "--no-track"
+        ) || arg.starts_with("--delete=")
+            || arg.starts_with("--move=")
+            || arg.starts_with("--copy=")
+            || arg.starts_with("--set-upstream-to=")
+    }) {
+        return false;
+    }
+    // Require an explicit listing selector when options are present. This
+    // intentionally declines harmless but harder-to-parse forms rather than
+    // risking that a branch creation option is treated as a read.
+    args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--list" | "-l" | "-a" | "--all" | "-r" | "--remotes"
+        )
+    })
+}
+
+fn is_read_only_config(args: &[String]) -> bool {
+    args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--get"
+                | "--get-all"
+                | "--get-regexp"
+                | "--get-urlmatch"
+                | "--list"
+                | "-l"
+                | "--name-only"
+                | "--show-origin"
+                | "--show-scope"
+        )
+    })
+}
+
+fn is_read_only_remote(args: &[String]) -> bool {
+    args.is_empty()
+        || args
+            .iter()
+            .all(|arg| matches!(arg.as_str(), "-v" | "--verbose" | "get-url"))
+}
+
+fn is_read_only_reflog(args: &[String]) -> bool {
+    args.first().is_some_and(|arg| arg == "show")
+}
+
+fn is_read_only_stash(args: &[String]) -> bool {
+    args.first()
+        .is_some_and(|arg| matches!(arg.as_str(), "list" | "show"))
+}
+
+fn is_read_only_tag(args: &[String]) -> bool {
+    args.is_empty()
+        || args
+            .first()
+            .is_some_and(|arg| matches!(arg.as_str(), "--list" | "-l"))
 }
 
 #[derive(Debug)]
@@ -913,7 +1198,11 @@ struct ManagedSshMaterial {
     command: String,
 }
 
-fn managed_ssh_material(profile: &Profile) -> Result<Option<ManagedSshMaterial>> {
+fn managed_ssh_material(
+    paths: &ConfigPaths,
+    profile_id: &str,
+    profile: &Profile,
+) -> Result<Option<ManagedSshMaterial>> {
     let Some(ssh) = profile.ssh.as_ref().filter(|ssh| {
         matches!(
             ssh.mode,
@@ -928,10 +1217,14 @@ fn managed_ssh_material(profile: &Profile) -> Result<Option<ManagedSshMaterial>>
         .map(signing::expand_user)
         .ok_or_else(|| AppError::Message("当前 Profile 已纳管 SSH，但未配置公钥文件".into()))?;
     let socket = signing::discover_agent_socket(ssh.agent_socket.as_deref());
-    let command = socket
-        .as_deref()
-        .map(|socket| signing::render_ssh_command(socket, &public_key_path))
-        .unwrap_or_else(ssh_guard_command);
+    let command = match socket.as_deref() {
+        Some(_) => {
+            let config_path = write_managed_ssh_config(paths, profile_id, profile)?
+                .ok_or_else(|| AppError::Message("无法生成 managed SSH 配置".into()))?;
+            signing::render_ssh_command(&config_path, &ssh.proxy_jump, ssh.forward_agent)
+        }
+        None => ssh_guard_command(),
+    };
     Ok(Some(ManagedSshMaterial {
         socket,
         public_key_path,
@@ -987,6 +1280,7 @@ fn validate_profile_operation(
         return Ok(policy);
     };
     if operation.name == "commit" && profile.signing.enabled {
+        policy.force_commit_signing = true;
         let status = inspect_profile_signing(profile)?;
         if !status.warnings.is_empty() {
             return Err(AppError::Message(format!(
@@ -1005,7 +1299,10 @@ fn validate_profile_operation(
     }
 
     let may_use_remote = operation.may_contact_remote();
-    let managed_material = managed_ssh_material(profile)?;
+    let profile_id = ctx
+        .profile_id()
+        .ok_or_else(|| AppError::Message("未解析 Profile，无法准备 managed SSH".into()))?;
+    let managed_material = managed_ssh_material(&ctx.paths, profile_id, profile)?;
     policy.ssh_command = managed_ssh_environment_command(profile, managed_material.as_ref())
         .or_else(|| {
             (ctx.config.behavior.ssh_unmanaged == config::SshUnmanagedPolicy::Fail)
@@ -1153,12 +1450,24 @@ pub fn profile_signing_fingerprint(profile: &Profile) -> Option<String> {
 }
 
 /// 执行一次带 profile token 的 gh 命令，token 只进入子进程环境。
-pub fn run_gh(
-    args: &[String],
+pub fn run_gh<A>(
+    args: &[A],
     config_path: Option<&Path>,
     explicit: Option<&str>,
     cwd: &Path,
-) -> Result<i32> {
+) -> Result<i32>
+where
+    A: AsRef<std::ffi::OsStr>,
+{
+    let forwarded_args = args
+        .iter()
+        .map(|arg| arg.as_ref().to_os_string())
+        .collect::<Vec<_>>();
+    let argument_view = forwarded_args
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let args = argument_view.as_slice();
     let mut paths = ConfigPaths::discover()?;
     if let Some(path) = config_path {
         paths.set_config_file(path)?;
@@ -1184,8 +1493,8 @@ pub fn run_gh(
         if !ctx.warnings.is_empty() {
             eprintln!("ghis: {}", ctx.warnings.join("；"));
         }
-        let mut command = CommandSpec::new("gh")
-            .args(args.iter().cloned())
+        let mut command = CommandSpec::gh()
+            .args(forwarded_args.iter().cloned())
             .current_dir(cwd);
         if config_path.is_some() {
             command = command.env("GHIS_CONFIG", ctx.paths.config_file.as_os_str());
@@ -1209,7 +1518,10 @@ pub fn run_gh(
             .and_then(repo::GhRemoteContext::remote)
             .and_then(|remote| remote.host.as_deref()),
     )?;
-    let ssh_command = managed_ssh_material(profile)?
+    let profile_id = ctx
+        .profile_id()
+        .ok_or_else(|| AppError::Message("未解析 Profile，无法准备 managed SSH".into()))?;
+    let ssh_command = managed_ssh_material(&ctx.paths, profile_id, profile)?
         .as_ref()
         .and_then(|material| managed_ssh_environment_command(profile, Some(material)))
         .or_else(|| {
@@ -1220,8 +1532,8 @@ pub fn run_gh(
     let token_text = token
         .as_str()
         .ok_or_else(|| AppError::Message("gh 返回的 token 不是 UTF-8".into()))?;
-    let mut command = CommandSpec::new("gh")
-        .args(args.iter().cloned())
+    let mut command = CommandSpec::gh()
+        .args(forwarded_args.iter().cloned())
         .clear_github_auth_env()
         .remove_env("GH_REPO")
         .env_secret(
@@ -2324,11 +2636,13 @@ fn repository_binding_needs_repair(ctx: &AppContext) -> Result<bool> {
         return Ok(true);
     }
     let fragment = profile_fragment_path(&ctx.paths, profile_id);
-    let expected_fragment = profile_fragment_content(profile);
+    let ssh_config = managed_ssh_config_path(&ctx.paths, profile_id);
+    let expected_fragment =
+        profile_fragment_content(profile, ssh_config.exists().then_some(ssh_config.as_path()));
     if fs::read_to_string(&fragment).ok().as_deref() != Some(expected_fragment.as_str()) {
         return Ok(true);
     }
-    let include_key = profile_include_keys(repository)[0].clone();
+    let include_key = profile_include_key(repository);
     let configured = repo::local_config(repository, &include_key)?;
     if configured.as_deref() != Some(fragment.to_string_lossy().as_ref()) {
         return Ok(true);
@@ -2763,6 +3077,95 @@ fn push_config_override(values: &mut Vec<GitConfigOverride>, assignment: &str, s
     });
 }
 
+fn validate_commit_signing_argv(
+    ctx: &AppContext,
+    args: &[String],
+    operation: &GitOperation,
+) -> Result<()> {
+    let signing_enabled = ctx
+        .profile
+        .as_ref()
+        .is_some_and(|profile| profile.signing.enabled);
+    validate_commit_signing_policy(signing_enabled, args, operation)
+}
+
+fn validate_commit_signing_policy(
+    signing_enabled: bool,
+    args: &[String],
+    operation: &GitOperation,
+) -> Result<()> {
+    if !signing_enabled || operation.name != "commit" {
+        return Ok(());
+    }
+
+    if commit_disables_signing(&operation.arguments) {
+        return Err(AppError::Message(
+            "当前 Profile 要求提交签名，不能使用 `commit --no-gpg-sign`；请移除该参数，或改用已禁用 signing 的 Profile"
+                .into(),
+        ));
+    }
+
+    let mut overrides = command_line_git_config(args);
+    overrides.extend(command_line_git_config(&operation.arguments));
+    if overrides
+        .iter()
+        .any(|item| item.key == "commit.gpgsign" && !git_boolean_is_enabled(&item.value))
+    {
+        return Err(AppError::Message(
+            "当前 Profile 要求提交签名，命令行 Git 配置不能关闭 `commit.gpgSign`；请移除该配置覆盖，或改用已禁用 signing 的 Profile"
+                .into(),
+        ));
+    }
+
+    Ok(())
+}
+
+fn commit_disables_signing(args: &[String]) -> bool {
+    let Some(command) = git_subcommand_index(args) else {
+        return false;
+    };
+    let mut index = command + 1;
+    while let Some(argument) = args.get(index) {
+        if argument == "--" {
+            break;
+        }
+        if argument == "--no-gpg-sign" {
+            return true;
+        }
+        // Do not interpret the value of an option as another option. This list
+        // covers commit options whose value can be supplied as the next argv.
+        let takes_value = matches!(
+            argument.as_str(),
+            "-m" | "--message"
+                | "-F"
+                | "--file"
+                | "-C"
+                | "--reuse-message"
+                | "-c"
+                | "--reedit-message"
+                | "--fixup"
+                | "--squash"
+                | "--author"
+                | "--date"
+                | "--cleanup"
+                | "-t"
+                | "--template"
+                | "--trailer"
+                | "--pathspec-from-file"
+                | "--untracked-files"
+        );
+        index += if takes_value { 2 } else { 1 };
+    }
+    false
+}
+
+fn git_boolean_is_enabled(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "true" | "yes" | "on" | "1"
+    )
+}
+
 fn validate_git_auth_safety(
     ctx: &AppContext,
     args: &[String],
@@ -3102,6 +3505,7 @@ fn push_unique(values: &mut Vec<String>, value: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::process::Command;
     use tempfile::tempdir;
 
@@ -3123,6 +3527,7 @@ mod tests {
             public_key: Some(PathBuf::from("/keys/authentication.pub")),
             fingerprint: Some("SHA256:authentication".into()),
             agent_socket: Some(PathBuf::from("/tmp/agent.sock")),
+            ..config::SshProfile::default()
         });
         profile.signing.enabled = true;
 
@@ -3151,6 +3556,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn binding_uses_fragment_without_global_identity_changes() {
         let temp = tempdir().expect("temporary directory");
@@ -3295,6 +3701,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn linked_worktrees_keep_profile_bindings_isolated() {
         let temp = tempdir().expect("temporary directory");
@@ -3484,6 +3891,125 @@ mod tests {
             "commit".into(),
         ];
         assert_eq!(git_subcommand(&args), "commit");
+    }
+
+    #[test]
+    fn commit_signing_policy_rejects_no_gpg_sign_before_launching_git() {
+        let args = vec![
+            "commit".into(),
+            "--allow-empty".into(),
+            "--no-gpg-sign".into(),
+        ];
+        let operation = GitOperation {
+            name: "commit".into(),
+            conservative_sensitive: false,
+            uninspectable_alias: false,
+            arguments: args.clone(),
+        };
+
+        let error = validate_commit_signing_policy(true, &args, &operation)
+            .expect_err("enabled signing must reject --no-gpg-sign");
+        let message = error.to_string();
+        assert!(message.contains("--no-gpg-sign"));
+        assert!(message.contains("移除"));
+    }
+
+    #[test]
+    fn commit_signing_policy_rejects_false_global_config_overrides() {
+        for value in ["false", "no", "off", "0", ""] {
+            let args = vec![
+                "-c".into(),
+                format!("commit.gpgSign={value}"),
+                "commit".into(),
+            ];
+            let operation = GitOperation {
+                name: "commit".into(),
+                conservative_sensitive: false,
+                uninspectable_alias: false,
+                arguments: vec!["commit".into()],
+            };
+
+            let error = validate_commit_signing_policy(true, &args, &operation)
+                .expect_err("enabled signing must reject a false config override");
+            let message = error.to_string();
+            assert!(message.contains("commit.gpgSign"));
+            assert!(!message.contains(value) || value.is_empty());
+        }
+    }
+
+    #[test]
+    fn commit_signing_policy_allows_disabled_profiles_and_non_commit_commands() {
+        let bypass_args = vec![
+            "-c".into(),
+            "commit.gpgSign=false".into(),
+            "commit".into(),
+            "--no-gpg-sign".into(),
+        ];
+        let commit = GitOperation {
+            name: "commit".into(),
+            conservative_sensitive: false,
+            uninspectable_alias: false,
+            arguments: vec!["commit".into(), "--no-gpg-sign".into()],
+        };
+        validate_commit_signing_policy(false, &bypass_args, &commit)
+            .expect("disabled signing keeps normal Git behavior");
+
+        let status = GitOperation {
+            name: "status".into(),
+            conservative_sensitive: false,
+            uninspectable_alias: false,
+            arguments: vec!["status".into(), "--no-gpg-sign".into()],
+        };
+        validate_commit_signing_policy(true, &bypass_args, &status)
+            .expect("non-commit commands are unaffected");
+    }
+
+    #[test]
+    fn commit_signing_policy_ignores_option_values_and_pathspecs() {
+        for args in [
+            vec!["commit", "-m", "--no-gpg-sign"],
+            vec!["commit", "--", "--no-gpg-sign"],
+        ] {
+            let arguments = args.into_iter().map(String::from).collect::<Vec<_>>();
+            let operation = GitOperation {
+                name: "commit".into(),
+                conservative_sensitive: false,
+                uninspectable_alias: false,
+                arguments: arguments.clone(),
+            };
+            validate_commit_signing_policy(true, &arguments, &operation)
+                .expect("non-option values must not be rejected");
+        }
+    }
+
+    #[test]
+    fn local_git_classifier_allows_only_proven_read_operations() {
+        for args in [
+            vec!["status"],
+            vec!["log", "-1"],
+            vec!["-C", "nested", "diff"],
+            vec!["branch", "--list"],
+            vec!["remote", "-v"],
+            vec!["config", "--get", "user.name"],
+            vec!["--", "show", "HEAD"],
+        ] {
+            let args = args.into_iter().map(String::from).collect::<Vec<_>>();
+            assert!(is_local_read_only_git(&args), "{args:?}");
+        }
+
+        for args in [
+            vec!["commit", "-m", "message"],
+            vec!["push"],
+            vec!["fetch"],
+            vec!["submodule", "update"],
+            vec!["branch", "new-branch"],
+            vec!["branch", "--delete", "old-branch"],
+            vec!["unknown-command"],
+            vec!["-c", "alias.st=status", "st"],
+        ] {
+            let args = args.into_iter().map(String::from).collect::<Vec<_>>();
+            assert!(!is_local_read_only_git(&args), "{args:?}");
+        }
     }
 
     #[test]

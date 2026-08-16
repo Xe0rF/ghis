@@ -1,8 +1,8 @@
 [package]
 name = "ghis"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
-description = "Per-repository GitHub Identity Switcher for git, gh, and zsh"
+description = "Per-repository GitHub Identity Switcher for git, gh, and multiple shells"
 license = "AGPL-3.0-or-later"
 rust-version = "1.97"
 exclude = ["/dist/"]
@@ -37,6 +37,7 @@ zeroize = "1.8"
 
 [dev-dependencies]
 assert_cmd = "2.0"
+libc = "0.2"
 predicates = "3.1"
 
 [[bin]]

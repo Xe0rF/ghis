@@ -7,14 +7,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::env;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
 use fd_lock::RwLock;
 use globset::{Glob, GlobBuilder};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tempfile::NamedTempFile;
 use thiserror::Error;
 use toml_edit::{ArrayOfTables, DocumentMut, Item};
 
@@ -45,24 +44,13 @@ pub struct ConfigPaths {
 impl ConfigPaths {
     /// Resolve paths from the process environment.
     pub fn discover() -> Result<Self, ConfigError> {
-        let home = env::var_os("HOME")
-            .map(PathBuf::from)
-            .ok_or_else(|| ConfigError::Paths("HOME is not set".into()))?;
-        let config_base = xdg_dir("XDG_CONFIG_HOME", home.join(".config"));
-        let cache_base = xdg_dir("XDG_CACHE_HOME", home.join(".cache"));
-        let state_base = xdg_dir("XDG_STATE_HOME", home.join(".local").join("state"));
-        let config_dir = config_base.join("ghis");
-        let cache_dir = cache_base.join("ghis");
-        let state_dir = state_base.join("ghis");
-        Ok(Self {
-            config_file: config_dir.join("config.toml"),
-            fragments_dir: config_dir.join("fragments"),
-            log_file: state_dir.join("ghis.log"),
-            repositories_file: state_dir.join("repositories.json"),
-            config_dir,
-            cache_dir,
-            state_dir,
-        })
+        let directories = crate::platform::UserDirectories::discover()
+            .map_err(|error| ConfigError::Paths(error.to_string()))?;
+        Ok(Self::from_bases(
+            directories.config_base,
+            directories.cache_base,
+            directories.state_base,
+        ))
     }
 
     /// Build paths under explicit XDG base directories.  This is useful for
@@ -92,7 +80,23 @@ impl ConfigPaths {
         fs::create_dir_all(&self.config_dir)?;
         fs::create_dir_all(&self.fragments_dir)?;
         fs::create_dir_all(&self.cache_dir)?;
-        fs::create_dir_all(&self.state_dir)
+        fs::create_dir_all(&self.state_dir)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            for directory in [
+                &self.config_dir,
+                &self.fragments_dir,
+                &self.cache_dir,
+                &self.state_dir,
+            ] {
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Select an explicit config file and make its path independent of later
@@ -165,14 +169,6 @@ fn config_namespace_base(path: &Path) -> PathBuf {
     } else {
         path.to_path_buf()
     }
-}
-
-fn xdg_dir(variable: &str, fallback: PathBuf) -> PathBuf {
-    xdg_dir_from_value(env::var_os(variable).map(PathBuf::from), fallback)
-}
-
-fn xdg_dir_from_value(value: Option<PathBuf>, fallback: PathBuf) -> PathBuf {
-    value.filter(|path| path.is_absolute()).unwrap_or(fallback)
 }
 
 /// Policy for a repository whose profile cannot be resolved uniquely.
@@ -254,6 +250,12 @@ pub struct SshProfile {
     pub public_key: Option<PathBuf>,
     pub fingerprint: Option<String>,
     pub agent_socket: Option<PathBuf>,
+    /// Explicit jump hosts used only by managed SSH transport.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub proxy_jump: Vec<String>,
+    /// Explicitly forward the selected agent through managed SSH transport.
+    #[serde(skip_serializing_if = "bool_is_false")]
+    pub forward_agent: bool,
 }
 
 impl Default for SshProfile {
@@ -263,8 +265,24 @@ impl Default for SshProfile {
             public_key: None,
             fingerprint: None,
             agent_socket: None,
+            proxy_jump: Vec::new(),
+            forward_agent: false,
         }
     }
+}
+
+fn bool_is_false(value: &bool) -> bool {
+    !*value
+}
+
+fn managed_proxy_jump_is_valid(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('-')
+        && value.len() <= 255
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'.' | b'-' | b'_' | b'@' | b':' | b'[' | b']')
+        })
 }
 
 /// How a profile's SSH connection is supplied.
@@ -423,9 +441,9 @@ impl Config {
     pub fn save(&self, path: impl AsRef<Path>) -> Result<(), ConfigError> {
         self.validate()?;
         let path = path.as_ref();
-        with_config_write_lock(path, |parent| {
+        with_config_write_lock(path, || {
             let document = load_document(path)?;
-            write_document(path, parent, document, self)
+            write_document(path, document, self)
         })
     }
 
@@ -440,11 +458,11 @@ impl Config {
         F: FnOnce(&mut Self) -> std::result::Result<T, E>,
     {
         let path = path.as_ref();
-        with_config_write_lock(path, |parent| {
+        with_config_write_lock(path, || {
             let (document, mut config) = load_document_and_config(path).map_err(E::from)?;
             let result = update(&mut config)?;
             config.validate().map_err(E::from)?;
-            write_document(path, parent, document, &config).map_err(E::from)?;
+            write_document(path, document, &config).map_err(E::from)?;
             Ok((config, result))
         })
     }
@@ -511,6 +529,25 @@ impl Config {
                 return Err(ConfigError::Validation(format!(
                     "profile `{id}` with managed SSH needs public_key"
                 )));
+            }
+            if let Some(ssh) = profile.ssh.as_ref() {
+                if matches!(ssh.mode, SshMode::External)
+                    && (!ssh.proxy_jump.is_empty() || ssh.forward_agent)
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "profile `{id}` can use proxy_jump/forward_agent only with managed or one-password SSH"
+                    )));
+                }
+                if ssh.proxy_jump.len() > 8
+                    || ssh
+                        .proxy_jump
+                        .iter()
+                        .any(|jump| !managed_proxy_jump_is_valid(jump))
+                {
+                    return Err(ConfigError::Validation(format!(
+                        "profile `{id}` has an invalid managed SSH proxy_jump"
+                    )));
+                }
             }
             if profile
                 .signing
@@ -609,7 +646,7 @@ fn config_lock_path(path: &Path) -> PathBuf {
 fn with_config_write_lock<T, E, F>(path: &Path, operation: F) -> std::result::Result<T, E>
 where
     E: From<ConfigError>,
-    F: FnOnce(&Path) -> std::result::Result<T, E>,
+    F: FnOnce() -> std::result::Result<T, E>,
 {
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)
@@ -628,7 +665,7 @@ where
         .map_err(E::from)?;
     let mut lock = RwLock::new(lock_file);
     let _guard = lock.write().map_err(ConfigError::Lock).map_err(E::from)?;
-    operation(parent)
+    operation()
 }
 
 fn load_document(path: &Path) -> Result<DocumentMut, ConfigError> {
@@ -670,7 +707,6 @@ fn load_document_and_config(path: &Path) -> Result<(DocumentMut, Config), Config
 
 fn write_document(
     path: &Path,
-    parent: &Path,
     mut document: DocumentMut,
     config: &Config,
 ) -> Result<(), ConfigError> {
@@ -679,42 +715,13 @@ fn write_document(
         .parse::<DocumentMut>()
         .map_err(|error| ConfigError::Validation(format!("invalid generated TOML: {error}")))?;
     merge_document(&mut document, &replacement);
-
-    let mut temp = NamedTempFile::new_in(parent).map_err(|source| ConfigError::Io {
-        path: parent.to_path_buf(),
-        source,
-    })?;
-    temp.write_all(document.to_string().as_bytes())
-        .map_err(|source| ConfigError::Io {
-            path: temp.path().to_path_buf(),
+    crate::platform::atomic_write(path, document.to_string().as_bytes()).map_err(|source| {
+        ConfigError::Io {
+            path: path.to_path_buf(),
             source,
-        })?;
-    temp.as_file()
-        .sync_all()
-        .map_err(|source| ConfigError::Io {
-            path: temp.path().to_path_buf(),
-            source,
-        })?;
-    if let Ok(metadata) = fs::metadata(path) {
-        let _ = fs::set_permissions(temp.path(), metadata.permissions());
-    } else {
-        set_private_permissions(temp.path());
-    }
-    temp.persist(path).map_err(|error| ConfigError::Io {
-        path: path.to_path_buf(),
-        source: error.error,
-    })?;
-    Ok(())
+        }
+    })
 }
-
-#[cfg(unix)]
-fn set_private_permissions(path: &Path) {
-    use std::os::unix::fs::PermissionsExt;
-    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
-}
-
-#[cfg(not(unix))]
-fn set_private_permissions(_path: &Path) {}
 
 fn merge_document(dst: &mut DocumentMut, src: &DocumentMut) {
     for (key, source_item) in src.iter() {
@@ -827,7 +834,14 @@ fn merge_profile(destination: &mut Item, source: &Item) {
         merge_known_table(
             destination,
             source,
-            &["mode", "public_key", "fingerprint", "agent_socket"],
+            &[
+                "mode",
+                "public_key",
+                "fingerprint",
+                "agent_socket",
+                "proxy_jump",
+                "forward_agent",
+            ],
         );
     }
     if let (Some(destination), Some(source)) =
@@ -1408,24 +1422,6 @@ profile = "work"
     }
 
     #[test]
-    fn xdg_paths_ignore_empty_and_relative_overrides() {
-        let fallback = PathBuf::from("/home/alice/.config");
-        assert_eq!(xdg_dir_from_value(None, fallback.clone()), fallback);
-        assert_eq!(
-            xdg_dir_from_value(Some(PathBuf::new()), fallback.clone()),
-            fallback
-        );
-        assert_eq!(
-            xdg_dir_from_value(Some(PathBuf::from("relative")), fallback.clone()),
-            fallback
-        );
-        assert_eq!(
-            xdg_dir_from_value(Some(PathBuf::from("/var/tmp/config")), fallback),
-            PathBuf::from("/var/tmp/config")
-        );
-    }
-
-    #[test]
     fn transactional_updates_keep_changes_from_concurrent_writers() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -1513,6 +1509,8 @@ mode = "one-password"
 public_key = "/tmp/alice.pub"
 fingerprint = "SHA256:old"
 agent_socket = "/tmp/agent.sock"
+proxy_jump = ["bastion.example"]
+forward_agent = true
 future_ssh = "keep"
 
 [profiles.personal.signing]
@@ -1533,6 +1531,8 @@ future_signing = "keep"
         ssh.public_key = None;
         ssh.fingerprint = None;
         ssh.agent_socket = None;
+        ssh.proxy_jump.clear();
+        ssh.forward_agent = false;
         personal.signing.signing_key = None;
         personal.signing.program = None;
         config.save(&path).unwrap();
@@ -1543,6 +1543,8 @@ future_signing = "keep"
         assert!(!saved.contains("public_key"));
         assert!(!saved.contains("fingerprint"));
         assert!(!saved.contains("agent_socket"));
+        assert!(!saved.contains("proxy_jump"));
+        assert!(!saved.contains("forward_agent"));
         assert!(!saved.contains("signing_key"));
         assert!(!saved.contains("program ="));
         assert!(saved.contains("future_root = \"keep\""));
@@ -1681,5 +1683,41 @@ priority = 1
             .unwrap();
         assert_eq!(paths.cache_dir, base_cache);
         assert_eq!(paths.state_dir, base_state);
+    }
+
+    #[test]
+    fn managed_ssh_accepts_explicit_safe_proxy_jump_chain() {
+        let mut config = Config::default();
+        let mut profile = profile();
+        profile.ssh = Some(SshProfile {
+            mode: SshMode::Managed,
+            public_key: Some("/keys/work.pub".into()),
+            proxy_jump: vec!["deploy@bastion.example:2222".into(), "inner.example".into()],
+            forward_agent: true,
+            ..SshProfile::default()
+        });
+        config.profiles.insert("work".into(), profile);
+        config.validate().unwrap();
+    }
+
+    #[test]
+    fn managed_ssh_rejects_unsafe_or_external_proxy_jump() {
+        let mut config = Config::default();
+        let mut profile = profile();
+        profile.ssh = Some(SshProfile {
+            mode: SshMode::Managed,
+            public_key: Some("/keys/work.pub".into()),
+            proxy_jump: vec!["-F/etc/ssh/evil.conf".into()],
+            ..SshProfile::default()
+        });
+        config.profiles.insert("work".into(), profile);
+        assert!(config.validate().is_err());
+
+        config.profiles.get_mut("work").unwrap().ssh = Some(SshProfile {
+            mode: SshMode::External,
+            proxy_jump: vec!["bastion.example".into()],
+            ..SshProfile::default()
+        });
+        assert!(config.validate().is_err());
     }
 }

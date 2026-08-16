@@ -1,13 +1,13 @@
 # GitHub Identity Switcher (`ghis`)
 
-`ghis` 是面向 Linux 和 zsh 的本地 GitHub 提交身份切换器。它按仓库或 worktree 选择 Profile，让普通的 `git commit`、`git push` 和 `gh` 命令使用对应的提交姓名、邮箱与 GitHub 账号，并在敏感操作前显示实际身份。
+`ghis` 是跨平台的本地 GitHub 提交身份切换器，支持 Linux、macOS 和 Windows。它按仓库或 worktree 选择 Profile，让普通的 `git commit`、`git push` 和 `gh` 命令使用对应的提交姓名、邮箱与 GitHub 账号，并在敏感操作前显示实际身份。Unix shell 集成支持 zsh、bash 和 fish；Windows 原生 shell 集成仅支持 PowerShell 7（`pwsh`），不支持 Windows PowerShell 5.1。
 
 默认使用 HTTPS，不要求配置 SSH Authentication Key。ghis 不调用 `gh auth switch`，不保存 GitHub token，不改写 remote，也不会修改全局 `user.name` 或 `user.email`。
 
 ## 核心能力
 
 - 按仓库绑定身份，也可用规则、工作目录、remote owner 或默认值自动选择。
-- 提供完整 CLI 和透明的 zsh wrapper。
+- 提供完整 CLI 和 zsh、bash、fish、PowerShell 集成。
 - 自动发现 `gh` 已保存的账号，并为 HTTPS 操作精确选择对应凭据。
 - 可选集成 1Password SSH Agent 和 `op-ssh-sign`，为不同 Profile 使用不同的 SSH commit signing key。
 - 提供身份预览、结构化执行检查和带安全快速修复的 `doctor`；已选身份不可用时不会静默换成另一个账号。
@@ -15,7 +15,7 @@
 
 ## 安装
 
-需要 Linux、Rust 1.97+、Git、GitHub CLI（`gh`）和 zsh。当前安装来源是源码构建或本地 Arch 归档。
+Linux、macOS 和 Windows 原生运行需要 Rust 1.97+、Git 与 GitHub CLI（`gh`）；Unix shell 集成使用 zsh、bash 或 fish，Windows 原生 shell 集成需要 PowerShell 7（`pwsh`）。当前 GitHub Release 已验证的预编译归档 target 为 `x86_64-unknown-linux-gnu`、`aarch64-unknown-linux-gnu`、`x86_64-unknown-linux-musl`、`aarch64-unknown-linux-musl`、`aarch64-apple-darwin` 和 `x86_64-pc-windows-msvc`；musl 归档会在无 `gcompat` 的 Alpine 3.22 中执行 runtime smoke。macOS x86_64 与 Windows ARM64 目前只有 build-only CI，不作为稳定 Release 制品；BSD 仅在官方 Rust std 可用时做 compile-only 探测，不声明运行时支持。Windows 上的 SSH signing、1Password socket 发现和 Unix shell 属于单独的兼容边界，默认使用 HTTPS 与 PowerShell 7。
 
 ```sh
 cargo install --locked --path .
@@ -25,11 +25,10 @@ cargo install --locked --path .
 目标平台和 debug/release 模式。设置 `SOURCE_DATE_EPOCH` 后，构建时间使用该 Unix
 时间戳，以便生成可复现的发布产物。
 
-Arch Linux 可以从当前源码生成本地归档并交给 pacman 安装：
+本地生成发布归档需要 POSIX `sh`、zsh、bash 和 Python 3：
 
 ```sh
 scripts/package-release.sh
-(cd packaging/arch && makepkg -si)
 ```
 
 ## 快速开始
@@ -46,7 +45,7 @@ ghis onboard --repo ~/src/project
 
 设置 `NO_COLOR=1` 可禁用颜色；`TERM=dumb` 或 `GHIS_ONBOARD_LINE_MODE=1` 会使用不含光标控制的中文兼容模式。最终确认前不会修改主配置、仓库或 shell 文件；失败时会尝试恢复原状态并给出检查命令。
 
-也可以继续使用独立命令手工完成相同配置。先确认需要使用的账号都已经由 `gh` 登录，然后创建 Profile、绑定当前仓库并安装 zsh wrapper。下面的账号、姓名、邮箱、路径均为示例，需要替换成自己的值：
+也可以继续使用独立命令手工完成相同配置。先确认需要使用的账号都已经由 `gh` 登录，然后创建 Profile、绑定当前仓库并安装 shell 集成。下面的账号、姓名、邮箱、路径均为示例，需要替换成自己的值：
 
 ```sh
 ghis discover
@@ -61,8 +60,9 @@ ghis use personal
 ghis status
 
 ghis setup
-exec zsh
 ```
+
+PowerShell 7 使用 `ghis setup`（也可以显式运行 `ghis setup powershell`）；Unix 环境可显式选择 `zsh`、`bash` 或 `fish`。
 
 之后照常使用原命令：
 
@@ -144,6 +144,12 @@ ghis gh -- issue list --repo OWNER/REPO
 
 `--cwd` 可以与 `--host`、`--owner`、`--repo` 组合，使规则同时限制工作目录和 GitHub 目标。规则仍遵循显式 `--profile`、仓库绑定、规则优先级和歧义检测；规则只在运行时选择身份，不会把非 Git 目录绑定成仓库。
 
+### 机器可读诊断输出
+
+`ghis status --json`、`ghis doctor --json` 和 `ghis check --operation <git|gh> --json -- ...` 分别输出当前身份状态、环境诊断和单次操作预检；它们是三种不同的 JSON 对象，不能按同一字段集合解析。每个对象都包含整数 `schema_version`。同一 schema 版本内可能增加字段，调用方应忽略未知字段；仓库、配置、工具路径以及其他由运行环境产生的字段不保证跨机器或版本稳定。
+
+退出码应与 JSON 一起判断：`status` 和完成诊断的 `doctor` 返回 `0`，`check` 在存在错误级检查项时返回 `1`，参数、配置或运行时失败返回 `2`，此时不保证 stdout 中有完整 JSON。机器输出不会包含 token 或私钥内容，但不能据此把整份输出视为可公开的脱敏报告：例如 `doctor` 可能包含 SSH Agent socket 路径，路径、账号和环境信息也可能敏感；分享前仍应审阅并按需移除。
+
 ### 远程开发与 SSH Agent forwarding
 
 在远程开发机上使用本地 1Password SSH Agent 时，先由用户自行配置 SSH forwarding，例如 `ssh -A user@host` 或本地 `~/.ssh/config` 的 `ForwardAgent yes`；远端 SSH 服务端也必须允许 `AllowAgentForwarding yes`。登录后 OpenSSH 会为当前会话设置临时 `SSH_AUTH_SOCK`。
@@ -160,7 +166,31 @@ fingerprint = "SHA256:example"
 
 `forwarded-agent` 只使用当前会话的 `SSH_AUTH_SOCK`，要求显式 public key 或 fingerprint 精确匹配；它不会查找本地 1Password socket、写入 `IdentityAgent`、覆盖 socket、自动开启 `ForwardAgent` 或把本机 `op-ssh-sign` 路径写到远端。ghis 不传输、导出或同步私钥，也不绕过 1Password 的本地批准。未显式配置 `program` 时使用远端 Git/OpenSSH 默认 SSH signer；只有显式配置的签名程序不可执行时，签名操作才会停止。
 
-`local-agent` 是旧配置的默认 transport，继续使用本机 Agent/1Password 的现有发现行为。远程 forwarding、VS Code Remote、多跳 SSH 和容器的安全边界与排障步骤见 [Wiki](../../wiki) 的 [Remote Development and Agent Forwarding](../../wiki/Remote-Development-and-Agent-Forwarding)。
+`local-agent` 是旧配置的默认 transport，继续使用本机 Agent/1Password 的现有发现行为。managed/one-password SSH 会生成权限受限的专用 OpenSSH 配置，而不读取用户 `~/.ssh/config`；该配置把同一个 `IdentityAgent`、`IdentityFile`、`IdentitiesOnly yes` 和连接复用禁用策略应用到最终目标及每个 ProxyJump 子连接：
+
+```toml
+[profiles.work.ssh]
+mode = "managed"
+public_key = "/home/user/.ssh/work.pub"
+agent_socket = "/run/user/1000/ssh-agent.sock"
+proxy_jump = ["deploy@bastion.example:2222", "inner.example"]
+forward_agent = true
+```
+
+`proxy_jump` 按数组顺序渲染为一个受 shell quoting 保护的 `ssh -J` 参数，只接受主机、用户、端口和 IPv6 bracket 所需字符、拒绝以 `-` 开头的值，最多八跳；每个跳板都读取上述专用配置，因此不能改用 Agent 中未被 Profile 选中的 key。它不会重新启用任意 `Host`、`Match`、`ProxyCommand` 或其他用户 SSH 设置。
+
+CLI 中 `--proxy-jump` 使用逗号分隔的有序链；`profile edit` 会整体替换现有链，清空和关闭 forwarding 分别使用 `--clear-proxy-jump` 与 `--forward-agent=false`：
+
+```sh
+ghis profile add work --host github.com --login worker \
+  --name "Work Identity" --email work@example.test \
+  --ssh managed --public-key ~/.ssh/work.pub \
+  --proxy-jump deploy@bastion.example:2222,inner.example --forward-agent
+ghis profile edit work --proxy-jump replacement.example --forward-agent
+ghis profile edit work --clear-proxy-jump --forward-agent=false
+```
+
+`forward_agent = true` 只对最终目标启用 Agent forwarding，跳板本身保持 `ForwardAgent no`。最终目标可以借助转发 socket 请求 Agent 签名，因此仅应对受信任目标启用。若多跳需要 `Match`、证书、复杂 `ProxyCommand` 等完整 OpenSSH 能力，仍应使用 external SSH transport。远程 forwarding、VS Code Remote、多跳 SSH 和容器的安全边界与排障步骤见 [Wiki](../../wiki) 的 [Remote Development and Agent Forwarding](../../wiki/Remote-Development-and-Agent-Forwarding)。
 
 ### 多 remote 与 push URL
 
@@ -182,7 +212,7 @@ ghis agent setup claude --yes
 ghis agent status claude
 ```
 
-Codex launcher 使用 CLI 的 `developer_instructions` 注入；运行 `ghis setup` 后，zsh 中直接输入 `codex` 也会透明转发到该 launcher。两者都不依赖 MCP、skill 或联网文档。上下文不包含 token、私钥、SSH socket、raw remote URL 或 Doctor 诊断。agent 在具体 `git`/`gh` 操作遇到阻力时，再从 shell 运行 `ghis check` 或 `ghis doctor` 获取结构化修复信息。
+Codex launcher 使用 CLI 的 `developer_instructions` 注入；在 Unix zsh、bash 或 fish 中运行 `ghis setup` 后，直接输入 `codex` 也会透明转发到该 launcher；PowerShell 等其他 shell 可显式运行 `ghis agent run codex --`。两者都不依赖 MCP、skill 或联网文档。上下文不包含 token、私钥、SSH socket、raw remote URL 或 Doctor 诊断。agent 在具体 `git`/`gh` 操作遇到阻力时，再从 shell 运行 `ghis check` 或 `ghis doctor` 获取结构化修复信息。
 
 完整的配置、规则、1Password、SSH 签名、安全边界、Shell 说明和排障方法见 [Wiki](../../wiki)。
 

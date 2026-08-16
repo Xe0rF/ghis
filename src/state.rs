@@ -317,21 +317,26 @@ fn create_private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn set_private_file(file: &File, path: &Path) -> Result<()> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|source| StateError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|source| StateError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(not(unix))]
+fn set_private_file(_file: &File, _path: &Path) -> Result<()> {
     Ok(())
 }
 
 fn absolute_path(path: &Path) -> PathBuf {
-    std::path::absolute(path).unwrap_or_else(|_| path.to_path_buf())
+    std::fs::canonicalize(path)
+        .or_else(|_| std::path::absolute(path))
+        .unwrap_or_else(|_| path.to_path_buf())
 }
 
 fn sort_records(records: &mut [RepositoryBindingRecord]) {

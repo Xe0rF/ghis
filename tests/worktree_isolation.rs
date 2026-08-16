@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use assert_cmd::Command as AssertCommand;
 use std::ffi::OsStr;
 use std::fs;
