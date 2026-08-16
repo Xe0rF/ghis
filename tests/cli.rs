@@ -338,6 +338,245 @@ fn status_shows_only_profile_and_description() {
 }
 
 #[test]
+fn prompt_is_compact_read_only_and_preserves_resolution_precedence() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let repository = temp.path().join("repository");
+    let rule_directory = temp.path().join("prompt-rule-cwd");
+    fs::create_dir_all(&rule_directory).expect("rule directory");
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repository)
+            .status()
+            .expect("git init")
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args(["config", "--local", "ghis.profile", "bound"])
+            .current_dir(&repository)
+            .status()
+            .expect("set repository binding")
+            .success()
+    );
+
+    let config_directory = temp.path().join("config/ghis");
+    fs::create_dir_all(&config_directory).expect("config directory");
+    let config = config_directory.join("config.toml");
+    fs::write(
+        &config,
+        r#"version = 1
+
+[behavior]
+default_profile = "default"
+
+[profiles.default]
+host = "github.com"
+login = "default"
+git_name = "Default"
+git_email = "default@example.test"
+
+[profiles.bound]
+host = "github.com"
+login = "bound"
+git_name = "Bound"
+git_email = "bound@example.test"
+
+[profiles.rule]
+host = "github.com"
+login = "rule"
+git_name = "Rule"
+git_email = "rule@example.test"
+
+[[rules]]
+id = "low-priority"
+profile = "default"
+priority = 10
+cwd = "*prompt-rule-cwd*"
+
+[[rules]]
+id = "high-priority"
+profile = "rule"
+priority = 20
+cwd = "*prompt-rule-cwd*"
+"#,
+    )
+    .expect("config");
+    let repository_config_before =
+        fs::read(repository.join(".git/config")).expect("repository config");
+    let before = fs::read(&config).expect("read config before prompt");
+
+    let run_prompt = |cwd: &Path, args: &[&str], environment_profile: Option<&str>| {
+        let mut command = isolated_ghis_command();
+        command
+            .current_dir(cwd)
+            .args(args)
+            .env("CI", "true")
+            .env("GH_TOKEN", "CANARY_DIR_ENV_TOKEN");
+        if let Some(profile) = environment_profile {
+            command.env("GHIS_PROFILE", profile);
+        }
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.output().expect("run prompt")
+    };
+    let assert_prompt = |output: std::process::Output, profile: Option<&str>, source: &str| {
+        assert_eq!(
+            output.status.code(),
+            Some(if profile.is_some() { 0 } else { 1 })
+        );
+        let rendered = String::from_utf8_lossy(&output.stdout);
+        assert!(!rendered.contains("CANARY_DIR_ENV_TOKEN"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("CANARY_DIR_ENV_TOKEN"));
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).expect("prompt JSON");
+        assert_eq!(value["schema_version"], 1);
+        assert_eq!(value["profile"], profile.unwrap_or_default());
+        assert_eq!(value["resolution_source"], source);
+    };
+
+    assert_prompt(
+        run_prompt(&repository, &["prompt"], None),
+        Some("bound"),
+        "repository-binding",
+    );
+    let profile_only = run_prompt(&repository, &["prompt", "--format", "profile"], None);
+    assert_eq!(profile_only.status.code(), Some(0));
+    assert_eq!(profile_only.stdout, b"bound\n");
+    assert!(profile_only.stderr.is_empty());
+    assert_prompt(
+        run_prompt(&rule_directory, &["prompt"], None),
+        Some("rule"),
+        "rule",
+    );
+    assert_prompt(
+        run_prompt(temp.path(), &["prompt"], None),
+        Some("default"),
+        "default",
+    );
+    assert_prompt(
+        run_prompt(&repository, &["--profile", "default", "prompt"], None),
+        Some("default"),
+        "explicit",
+    );
+    assert_prompt(
+        run_prompt(
+            &repository,
+            &["--profile", "bound", "prompt"],
+            Some("default"),
+        ),
+        Some("bound"),
+        "explicit",
+    );
+    assert_prompt(
+        run_prompt(&repository, &["prompt"], Some("default")),
+        Some("default"),
+        "explicit",
+    );
+    assert_prompt(
+        run_prompt(&rule_directory, &["prompt"], Some("default")),
+        Some("default"),
+        "explicit",
+    );
+
+    let unresolved = run_prompt(
+        &repository,
+        &["--profile", "missing", "prompt", "--format", "profile"],
+        None,
+    );
+    assert_eq!(unresolved.status.code(), Some(1));
+    assert!(
+        unresolved.stdout.is_empty(),
+        "unresolved profile output must be empty"
+    );
+    assert!(
+        unresolved.stderr.is_empty(),
+        "prompt must not print resolution warnings"
+    );
+    assert_eq!(fs::read(&config).expect("read config after prompt"), before);
+    assert_eq!(
+        fs::read(repository.join(".git/config")).expect("repository config after prompt"),
+        repository_config_before
+    );
+    assert!(
+        !temp.path().join("cache").exists(),
+        "prompt created cache state"
+    );
+    assert!(
+        !temp.path().join("state").exists(),
+        "prompt created state files"
+    );
+}
+
+#[test]
+fn prompt_profile_format_rejects_control_characters_but_json_escapes_them() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let config_directory = temp.path().join("config/ghis");
+    fs::create_dir_all(&config_directory).expect("config directory");
+    let safe = "safe profile 日本語";
+    let newline = format!("line{}break", char::from(10));
+    let escape = format!("escape{}sequence", char::from(27));
+    let tab = format!("tab{}separated", char::from(9));
+    let profile = |login: &str| ghis::config::Profile {
+        host: "github.com".into(),
+        login: login.into(),
+        git_name: "Prompt Test".into(),
+        git_email: "prompt@example.test".into(),
+        ..ghis::config::Profile::default()
+    };
+    let mut config = Config::default();
+    for (id, login) in [
+        (safe, "safe"),
+        (newline.as_str(), "newline"),
+        (escape.as_str(), "escape"),
+        (tab.as_str(), "tab"),
+    ] {
+        config.profiles.insert(id.into(), profile(login));
+    }
+    config
+        .save(config_directory.join("config.toml"))
+        .expect("config");
+
+    let run_prompt = |profile: &str, profile_only: bool| {
+        let mut command = isolated_ghis_command();
+        command
+            .current_dir(temp.path())
+            .args(["--profile", profile, "prompt"]);
+        if profile_only {
+            command.args(["--format", "profile"]);
+        }
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.output().expect("run prompt")
+    };
+
+    let safe_output = run_prompt(safe, true);
+    assert_eq!(safe_output.status.code(), Some(0));
+    assert_eq!(safe_output.stdout, format!("{safe}\n").as_bytes());
+    assert!(safe_output.stderr.is_empty());
+
+    for profile in ["line\nbreak", "escape\u{1b}sequence", "tab\tseparated"] {
+        let profile_output = run_prompt(profile, true);
+        assert_eq!(profile_output.status.code(), Some(2));
+        assert!(
+            profile_output.stdout.is_empty(),
+            "profile format wrote an unsafe id: {profile:?}"
+        );
+        assert!(String::from_utf8_lossy(&profile_output.stderr).contains("control characters"));
+
+        let json_output = run_prompt(profile, false);
+        assert_eq!(json_output.status.code(), Some(0));
+        assert!(!json_output.stdout.contains(&0x1b));
+        assert!(!json_output.stdout.contains(&b'\t'));
+        let json: serde_json::Value =
+            serde_json::from_slice(&json_output.stdout).expect("safe prompt JSON");
+        assert_eq!(json["profile"], profile);
+        assert_eq!(json["resolution_source"], "explicit");
+    }
+}
+
+#[test]
 fn bare_command_defaults_to_status() {
     let temp = tempfile::tempdir().expect("temporary directory");
     write_default_profile(&temp);

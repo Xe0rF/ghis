@@ -34,6 +34,8 @@ struct Cli {
 enum Commands {
     /// 显示当前仓库和有效身份
     Status(StatusArgs),
+    /// 输出供 prompt 和 direnv 使用的最小、无凭据解析状态
+    Prompt(PromptArgs),
     /// 输出供 coding agent 使用的最小、脱敏仓库身份上下文
     Context(ContextArgs),
     /// 从 gh CLI 发现已有账号
@@ -155,6 +157,20 @@ struct StatusArgs {
     shell: bool,
     #[arg(long, hide = true)]
     quiet: bool,
+}
+
+#[derive(Debug, Args, Default)]
+struct PromptArgs {
+    /// Output format. JSON is the stable default; profile emits only the ID for direnv.
+    #[arg(long, value_enum, default_value_t = PromptFormatArg::Json)]
+    format: PromptFormatArg,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum, Default)]
+enum PromptFormatArg {
+    #[default]
+    Json,
+    Profile,
 }
 
 #[derive(Debug, Args, Default)]
@@ -485,6 +501,7 @@ fn run(cli: Cli) -> app::Result<i32> {
         .unwrap_or_else(|| Commands::Status(StatusArgs::default()));
     match command {
         Commands::Status(args) => status(cli.config.as_deref(), cli.profile.as_deref(), args),
+        Commands::Prompt(args) => prompt(cli.config.as_deref(), cli.profile.as_deref(), args),
         Commands::Context(args) => {
             agent_context(cli.config.as_deref(), cli.profile.as_deref(), args)
         }
@@ -772,6 +789,27 @@ fn status(path: Option<&Path>, explicit: Option<&str>, args: StatusArgs) -> app:
         }
     }
     Ok(0)
+}
+
+fn prompt(path: Option<&Path>, explicit: Option<&str>, args: PromptArgs) -> app::Result<i32> {
+    let (paths, config) = load_config(path)?;
+    let ctx =
+        AppContext::from_config_for_prompt(paths, config, std::env::current_dir()?, explicit)?;
+    let report = app::prompt_status(&ctx);
+    match args.format {
+        PromptFormatArg::Json => print_json(&report)?,
+        PromptFormatArg::Profile => {
+            if let Some(profile) = report.profile.as_deref() {
+                if profile.chars().any(char::is_control) {
+                    return Err(app::AppError::Message(
+                        "`prompt --format profile` cannot render a profile id containing control characters; use JSON output instead".into(),
+                    ));
+                }
+                println!("{profile}");
+            }
+        }
+    }
+    Ok(i32::from(!report.is_resolved()))
 }
 
 fn shell_status(path: Option<&Path>) -> app::Result<i32> {

@@ -28,7 +28,7 @@ fn zsh_cli_output_bytes_match_golden() {
     );
     assert_eq!(
         sha256_hex(&zsh_cli_output("completion")),
-        "1352a06f3b6502fe8edead05804358e7b3037e8ab2017cc8fc3a80877477e5c8",
+        "946cd9d31dd7519615841eaf23e555e77ec1e0788c07e79d3d58b9e1cd8cbc86",
         "completion zsh bytes changed"
     );
 }

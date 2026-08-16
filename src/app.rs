@@ -70,7 +70,21 @@ impl AppContext {
         cwd: impl AsRef<Path>,
         explicit: Option<&str>,
     ) -> Result<Self> {
-        Self::from_config_with_target(paths, config, cwd, explicit, None)
+        Self::from_config_with_target(paths, config, cwd, explicit, None, true)
+    }
+
+    /// Resolve the minimal prompt state without inspecting Git identities.
+    ///
+    /// This deliberately shares the normal resolution chain while avoiding the
+    /// extra `git var` subprocess that is useful for detailed status reporting
+    /// but unnecessary for a prompt or direnv integration.
+    pub fn from_config_for_prompt(
+        paths: ConfigPaths,
+        config: Config,
+        cwd: impl AsRef<Path>,
+        explicit: Option<&str>,
+    ) -> Result<Self> {
+        Self::from_config_with_target(paths, config, cwd, explicit, None, false)
     }
 
     fn from_config_for_gh(
@@ -80,7 +94,7 @@ impl AppContext {
         explicit: Option<&str>,
         target: Option<&GhProfileTarget>,
     ) -> Result<Self> {
-        Self::from_config_with_target(paths, config, cwd, explicit, target)
+        Self::from_config_with_target(paths, config, cwd, explicit, target, true)
     }
 
     fn from_config_with_target(
@@ -89,6 +103,7 @@ impl AppContext {
         cwd: impl AsRef<Path>,
         explicit: Option<&str>,
         target: Option<&GhProfileTarget>,
+        inspect_identities: bool,
     ) -> Result<Self> {
         let cwd = std::path::absolute(cwd.as_ref())?;
         let mut warnings = Vec::new();
@@ -96,7 +111,9 @@ impl AppContext {
             Ok(repository) => {
                 let remote = repo::primary_remote(&repository)?;
                 let binding = repo::local_config(&repository, PROFILE_CONFIG_KEY)?;
-                let identities = git::effective_identities(&repository).ok();
+                let identities = inspect_identities
+                    .then(|| git::effective_identities(&repository).ok())
+                    .flatten();
                 (Some(repository), remote, binding, identities)
             }
             Err(RepoError::NotRepository { .. }) => (None, None, None, None),
@@ -699,6 +716,36 @@ fn forget_registry_record(
 
 pub fn display_status(ctx: &AppContext) -> StatusReport {
     StatusReport::from_context(ctx)
+}
+
+/// Versioned, credential-free resolution state for prompts and direnv.
+///
+/// This intentionally exposes only the active profile and why it was chosen.
+/// It is safe to consume from a non-interactive shell without loading a
+/// wrapper, inspecting credentials, or creating ghis state.
+#[derive(Debug, Clone, Serialize)]
+pub struct PromptStatusReport {
+    pub schema_version: u32,
+    pub profile: Option<String>,
+    pub resolution_source: String,
+}
+
+impl PromptStatusReport {
+    pub fn from_context(ctx: &AppContext) -> Self {
+        Self {
+            schema_version: 1,
+            profile: ctx.profile_id().map(str::to_owned),
+            resolution_source: resolution_source_name(&ctx.resolution.source),
+        }
+    }
+
+    pub fn is_resolved(&self) -> bool {
+        self.profile.is_some()
+    }
+}
+
+pub fn prompt_status(ctx: &AppContext) -> PromptStatusReport {
+    PromptStatusReport::from_context(ctx)
 }
 
 #[derive(Debug, Clone, Serialize)]
