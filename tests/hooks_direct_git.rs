@@ -139,6 +139,48 @@ fn named_hooks_available() -> bool {
         && String::from_utf8_lossy(&output.stdout).contains("hook.<friendly-name>.command")
 }
 
+fn assert_ghis_named_hooks(root: &Path, repository: &Path) {
+    for (name, expected_event) in [
+        ("ghis-prepare-commit-msg", "prepare-commit-msg"),
+        ("ghis-pre-push", "pre-push"),
+    ] {
+        let event_key = format!("hook.{name}.event");
+        let event_output = run_git(
+            root,
+            repository,
+            &["config", "--worktree", "--get", &event_key],
+        );
+        assert_success(&event_output, "read named hook event");
+        assert_eq!(
+            String::from_utf8_lossy(&event_output.stdout).trim(),
+            expected_event
+        );
+
+        let command_key = format!("hook.{name}.command");
+        let command_output = run_git(
+            root,
+            repository,
+            &["config", "--worktree", "--get", &command_key],
+        );
+        assert_success(&command_output, "read named hook command");
+        assert!(
+            String::from_utf8_lossy(&command_output.stdout)
+                .contains(&format!("hook --hook '{expected_event}'")),
+            "unexpected named hook command: {}",
+            String::from_utf8_lossy(&command_output.stdout)
+        );
+    }
+
+    for key in ["hook.ghis-pre-commit.command", "hook.ghis-pre-commit.event"] {
+        let output = run_git(root, repository, &["config", "--worktree", "--get", key]);
+        assert_eq!(
+            output.status.code(),
+            Some(1),
+            "ghis must not register a named pre-commit hook: {key}"
+        );
+    }
+}
+
 fn set_executable(path: &Path, contents: &str) {
     fs::write(path, contents).expect("write executable");
     let mut permissions = fs::metadata(path)
@@ -209,22 +251,7 @@ fn named_hooks_coexist_with_core_hooks_path_and_run_on_direct_push() {
         String::from_utf8_lossy(&configured_path.stdout).trim(),
         hook_directory.to_string_lossy()
     );
-    for (name, expected_event) in [
-        ("ghis-prepare-commit-msg", "prepare-commit-msg"),
-        ("ghis-pre-push", "pre-push"),
-    ] {
-        let event_key = format!("hook.{name}.event");
-        let event_output = run_git(
-            root,
-            &repository,
-            &["config", "--worktree", "--get", &event_key],
-        );
-        assert_success(&event_output, "read named hook event");
-        assert_eq!(
-            String::from_utf8_lossy(&event_output.stdout).trim(),
-            expected_event
-        );
-    }
+    assert_ghis_named_hooks(root, &repository);
 
     let committed = run_git(
         root,
@@ -318,7 +345,127 @@ fn named_hooks_coexist_with_core_hooks_path_and_run_on_direct_push() {
 }
 
 #[test]
-fn absolute_git_reads_bound_fragment_and_credential_helper() {
+fn husky_style_hooks_path_coexists_with_named_hooks_and_nested_absolute_git() {
+    if !named_hooks_available() {
+        return;
+    }
+
+    let temporary = TempDir::new().expect("temporary directory");
+    let root = temporary.path();
+    let repository = initialize_repository(root);
+    let config = write_config(root);
+    let husky_directory = repository.join(".husky");
+    let hook_record = root.join("husky-pre-commit-record");
+    fs::create_dir_all(&husky_directory).expect("Husky hook directory");
+    set_executable(
+        &husky_directory.join("pre-commit"),
+        &format!(
+            "#!/bin/sh\nset -eu\nprintf 'husky-pre-commit\\n' > {record}\nemail=$({git} config --includes --get user.email)\nprintf 'nested_email=%s\\n' \"$email\" >> {record}\n",
+            record = shell_quote(&hook_record),
+            git = shell_quote(&git_binary()),
+        ),
+    );
+    assert_success(
+        &run_git(root, &repository, &["config", "core.hooksPath", ".husky"]),
+        "configure Husky-style hooks path",
+    );
+
+    assert_success(&bind(root, &repository, &config, None), "bind repository");
+
+    let configured_path = run_git(root, &repository, &["config", "--get", "core.hooksPath"]);
+    assert_success(&configured_path, "read Husky core.hooksPath");
+    assert_eq!(
+        String::from_utf8_lossy(&configured_path.stdout).trim(),
+        ".husky"
+    );
+    assert_ghis_named_hooks(root, &repository);
+
+    let committed = run_git(
+        root,
+        &repository,
+        &["commit", "--allow-empty", "-m", "Husky integration"],
+    );
+    assert_success(&committed, "commit through Husky-style hooks path");
+    assert!(
+        String::from_utf8_lossy(&committed.stderr).contains("ghis: profile=work"),
+        "ghis prepare-commit-msg named hook did not run: {}",
+        String::from_utf8_lossy(&committed.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&hook_record).expect("Husky pre-commit record"),
+        "husky-pre-commit\nnested_email=work@example.test\n"
+    );
+}
+
+#[test]
+fn pre_commit_style_legacy_chain_coexists_with_ghis_named_hooks() {
+    if !named_hooks_available() {
+        return;
+    }
+
+    let temporary = TempDir::new().expect("temporary directory");
+    let root = temporary.path();
+    let repository = initialize_repository(root);
+    let canonical_repository = canonical_worktree(&repository);
+    let config = write_config(root);
+    let hooks_directory = repository.join(".git/hooks");
+    let hook_record = root.join("pre-commit-chain-record");
+    let legacy_hook = hooks_directory.join("pre-commit.legacy");
+    let installed_hook = hooks_directory.join("pre-commit");
+
+    // This mirrors pre-commit's offline legacy-hook contract: the installed
+    // runner performs its work, then delegates to the preserved `.legacy` hook.
+    set_executable(
+        &legacy_hook,
+        &format!(
+            "#!/bin/sh\nset -eu\ntoplevel=$({git} rev-parse --show-toplevel)\nprintf 'legacy=%s\\n' \"$toplevel\" >> {record}\n",
+            git = shell_quote(&git_binary()),
+            record = shell_quote(&hook_record),
+        ),
+    );
+    set_executable(
+        &installed_hook,
+        &format!(
+            "#!/bin/sh\nset -eu\nprintf 'runner=pre-commit\\n' > {record}\nlegacy=\"$(dirname \"$0\")/pre-commit.legacy\"\n\"$legacy\" \"$@\"\n",
+            record = shell_quote(&hook_record),
+        ),
+    );
+    let installed_before = fs::read_to_string(&installed_hook).expect("installed pre-commit hook");
+    let legacy_before = fs::read_to_string(&legacy_hook).expect("legacy pre-commit hook");
+
+    assert_success(&bind(root, &repository, &config, None), "bind repository");
+    assert_ghis_named_hooks(root, &repository);
+    assert_eq!(
+        fs::read_to_string(&installed_hook).expect("retained installed hook"),
+        installed_before
+    );
+    assert_eq!(
+        fs::read_to_string(&legacy_hook).expect("retained legacy hook"),
+        legacy_before
+    );
+
+    let committed = run_git(
+        root,
+        &repository,
+        &["commit", "--allow-empty", "-m", "legacy hook integration"],
+    );
+    assert_success(&committed, "commit through legacy hook chain");
+    assert!(
+        String::from_utf8_lossy(&committed.stderr).contains("ghis: profile=work"),
+        "ghis prepare-commit-msg named hook did not run: {}",
+        String::from_utf8_lossy(&committed.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(&hook_record).expect("pre-commit chain record"),
+        format!(
+            "runner=pre-commit\nlegacy={}\n",
+            canonical_repository.display()
+        )
+    );
+}
+
+#[test]
+fn editor_and_tui_direct_git_invocations_read_fragment_and_helper() {
     let temporary = TempDir::new().expect("temporary directory");
     let root = temporary.path();
     let repository = initialize_repository(root);
@@ -330,7 +477,7 @@ fn absolute_git_reads_bound_fragment_and_credential_helper() {
     set_executable(
         &bin_directory.join("gh"),
         &format!(
-            "#!/bin/sh\nprintf 'cwd=%s\\nargs=%s\\n' \"$PWD\" \"$*\" > {}\nif [ \"$1 $2 $3 $4 $5 $6\" = \"auth token --hostname github.com --user worker\" ]; then\n  printf 'credential-token\\n'\n  exit 0\nfi\nexit 1\n",
+            "#!/bin/sh\nprintf 'cwd=%s\\nargs=%s\\n' \"$PWD\" \"$*\" >> {}\nif [ \"$1 $2 $3 $4 $5 $6\" = \"auth token --hostname github.com --user worker\" ]; then\n  printf 'credential-token\\n'\n  exit 0\nfi\nexit 1\n",
             shell_quote(&gh_record)
         ),
     );
@@ -341,49 +488,66 @@ fn absolute_git_reads_bound_fragment_and_credential_helper() {
         "bind repository",
     );
 
-    let fragment_email = run_git(
-        root,
-        &repository,
-        &["config", "--includes", "--get", "user.email"],
-    );
-    assert_success(&fragment_email, "read included identity");
-    assert_eq!(
-        String::from_utf8_lossy(&fragment_email.stdout).trim(),
-        "work@example.test"
-    );
+    // VS Code, JetBrains IDEs, and LazyGit all ultimately launch Git directly.
+    // Model only that shared process contract here; this is intentionally not
+    // GUI automation or a claim that those products were launched.
+    for client in ["VS Code", "JetBrains", "LazyGit"] {
+        let fragment_email = run_git(
+            root,
+            &repository,
+            &["config", "--includes", "--get", "user.email"],
+        );
+        assert_success(
+            &fragment_email,
+            &format!("{client} direct Git reads included identity"),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&fragment_email.stdout).trim(),
+            "work@example.test",
+            "{client} direct Git did not load the ghis fragment"
+        );
 
-    let mut credential = Command::new(git_binary());
-    credential
-        .current_dir(&repository)
-        .args(["credential", "fill"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped());
-    common_environment(&mut credential, root);
-    credential.env("PATH", path);
-    let mut credential = credential
-        .spawn()
-        .expect("start direct git credential fill");
-    use std::io::Write as _;
-    credential
-        .stdin
-        .take()
-        .expect("credential stdin")
-        .write_all(b"protocol=https\nhost=github.com\nusername=worker\n\n")
-        .expect("write credential request");
-    let credential = credential
-        .wait_with_output()
-        .expect("read credential response");
-    assert_success(&credential, "direct Git credential fill");
-    let response = String::from_utf8_lossy(&credential.stdout);
-    assert!(response.contains("username=worker"));
-    assert!(response.contains("password=credential-token"));
-    let invocation = fs::read_to_string(&gh_record).expect("gh invocation record");
+        let mut credential = Command::new(git_binary());
+        credential
+            .current_dir(&repository)
+            .args(["credential", "fill"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        common_environment(&mut credential, root);
+        credential.env("PATH", &path);
+        let mut credential = credential
+            .spawn()
+            .expect("start direct git credential fill");
+        use std::io::Write as _;
+        credential
+            .stdin
+            .take()
+            .expect("credential stdin")
+            .write_all(b"protocol=https\nhost=github.com\nusername=worker\n\n")
+            .expect("write credential request");
+        let credential = credential
+            .wait_with_output()
+            .expect("read credential response");
+        assert_success(&credential, &format!("{client} direct Git credential fill"));
+        let response = String::from_utf8_lossy(&credential.stdout);
+        assert!(
+            response.contains("username=worker"),
+            "{client} credential response omitted username: {response}"
+        );
+        assert!(
+            response.contains("password=credential-token"),
+            "{client} credential response omitted password: {response}"
+        );
+    }
+
+    let one_invocation = format!(
+        "cwd={}\nargs=auth token --hostname github.com --user worker\n",
+        canonical_repository.display()
+    );
     assert_eq!(
-        invocation,
-        format!(
-            "cwd={}\nargs=auth token --hostname github.com --user worker\n",
-            canonical_repository.display()
-        )
+        fs::read_to_string(&gh_record).expect("gh invocation record"),
+        one_invocation.repeat(3)
     );
 }
 
