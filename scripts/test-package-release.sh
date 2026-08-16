@@ -48,8 +48,14 @@ mkdir -p "$target_dir/$target/release"
 if [ "$binary_name" = ghis ]; then
   cat > "$target_dir/$target/release/$binary_name" <<'SCRIPT'
 #!/bin/sh
-[ "$1" = completion ] && [ "$2" = zsh ]
-printf '%s\n' '#compdef ghis' '_ghis() { :; }'
+[ "$1" = completion ]
+case "$2" in
+  zsh) printf '%s\n' '#compdef ghis' '_ghis() { :; }' ;;
+  bash) printf '%s\n' '_ghis() { :; }' 'complete -F _ghis ghis' ;;
+  fish) printf '%s\n' 'complete -c ghis' ;;
+  powershell) printf '%s\n' "Register-ArgumentCompleter -CommandName 'ghis' -ScriptBlock { }" ;;
+  *) exit 2 ;;
+esac
 SCRIPT
 else
   printf '%s\n' 'cross-target binary' > "$target_dir/$target/release/$binary_name"
@@ -90,6 +96,9 @@ with zipfile.ZipFile(archive) as zip_file:
         f"{package}/ghis.exe",
         f"{package}/completions/",
         f"{package}/completions/_ghis",
+        f"{package}/completions/ghis.bash",
+        f"{package}/completions/ghis.fish",
+        f"{package}/completions/ghis.ps1",
         f"{package}/README.md",
         f"{package}/LICENSE",
     }
@@ -141,6 +150,15 @@ for path in \
   [ -f "$pkgdir/$path" ]
 done
 [ -x "$pkgdir/usr/bin/ghis" ]
+# The Arch package declares zsh as its supported completion integration. The
+# release archive carries all renderers, but PKGBUILD must not accidentally
+# install an unowned Bash, Fish, or PowerShell completion.
+for path in \
+  usr/share/bash-completion/completions/ghis \
+  usr/share/fish/vendor_completions.d/ghis.fish \
+  usr/share/powershell/Modules/ghis/ghis.ps1; do
+  [ ! -e "$pkgdir/$path" ]
+done
 cmp "$srcdir/ghis-v${pkgver}-x86_64-unknown-linux-gnu/ghis" "$pkgdir/usr/bin/ghis"
 cmp "$srcdir/ghis-v${pkgver}-x86_64-unknown-linux-gnu/completions/_ghis" \
   "$pkgdir/usr/share/zsh/site-functions/_ghis"
@@ -192,6 +210,9 @@ with tarfile.open(archive, mode="r:gz") as tar:
         f"{package}/ghis",
         f"{package}/completions",
         f"{package}/completions/_ghis",
+        f"{package}/completions/ghis.bash",
+        f"{package}/completions/ghis.fish",
+        f"{package}/completions/ghis.ps1",
         f"{package}/README.md",
         f"{package}/LICENSE",
     }
@@ -203,6 +224,10 @@ checksum = archive.with_suffix(archive.suffix + ".sha256").read_text(encoding="a
 if checksum != f"{sha256(archive.read_bytes()).hexdigest()}  {archive.name}\n":
     raise SystemExit("tar checksum does not match")
 PY
-assert_arch_pkgbuild "$unix_archive"
+if [ "$(uname -s)" = Linux ]; then
+  assert_arch_pkgbuild "$unix_archive"
+else
+  printf '%s\n' 'skipping Arch PKGBUILD install test outside Linux' >&2
+fi
 
 printf '%s\n' 'package release smoke tests passed'

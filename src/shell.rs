@@ -163,6 +163,7 @@ impl ShellSpec {
 }
 
 /// Shell-specific renderer implementations.
+pub mod bash;
 pub mod fish;
 pub mod powershell;
 pub mod zsh;
@@ -271,8 +272,12 @@ pub fn detect_shell_from(
 ///
 /// Adding a shell requires its sibling module plus one entry here; unsupported
 /// recognised shells fail closed without duplicating another renderer match.
-static RENDERERS: [&dyn ShellRenderer; 3] =
-    [&zsh::RENDERER, &fish::RENDERER, &powershell::RENDERER];
+static RENDERERS: [&dyn ShellRenderer; 4] = [
+    &zsh::RENDERER,
+    &bash::RENDERER,
+    &fish::RENDERER,
+    &powershell::RENDERER,
+];
 
 /// Renderer selection for diagnostics that inspect the inherited health marker.
 ///
@@ -393,19 +398,22 @@ mod tests {
     }
 
     #[test]
-    fn exact_renderers_are_registered_and_other_shells_fail_closed() {
+    fn all_renderers_are_registered_and_unknown_shells_fail_closed() {
         assert!(matches!(
             "nu".parse::<ShellKind>(),
             Err(ShellError::Unknown(_))
         ));
-        assert_eq!(
-            renderer(ShellKind::Fish).expect("fish renderer").spec(),
-            ShellKind::Fish.spec()
-        );
-        assert!(matches!(
-            renderer(ShellKind::Bash),
-            Err(ShellError::Unsupported(ShellKind::Bash))
-        ));
+        for kind in [
+            ShellKind::Zsh,
+            ShellKind::Bash,
+            ShellKind::Fish,
+            ShellKind::PowerShell,
+        ] {
+            assert_eq!(
+                renderer(kind).expect("registered renderer").spec(),
+                kind.spec()
+            );
+        }
         assert_eq!(
             render_init(ShellKind::PowerShell, "ghis"),
             Ok(powershell::powershell_init_script("ghis"))

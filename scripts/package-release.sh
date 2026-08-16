@@ -133,7 +133,11 @@ install -d -m 0755 "$package_dir" "$package_dir/completions"
 install -m 0755 "$binary" "$package_dir/$binary_name"
 install -m 0644 README.md LICENSE "$package_dir/"
 "$completion_binary" completion zsh > "$package_dir/completions/_ghis"
+"$completion_binary" completion bash > "$package_dir/completions/ghis.bash"
+"$completion_binary" completion fish > "$package_dir/completions/ghis.fish"
+"$completion_binary" completion powershell > "$package_dir/completions/ghis.ps1"
 zsh -n "$package_dir/completions/_ghis"
+bash -n "$package_dir/completions/ghis.bash"
 
 archive_format=tar.gz
 case "$target" in

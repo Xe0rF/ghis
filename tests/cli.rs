@@ -1839,6 +1839,73 @@ exec "$GHIS_REAL_GIT" "$@"
 }
 
 #[test]
+fn bash_wrapper_preserves_tty_and_sigint_status() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let tty_trace = temp.path().join("tty-trace");
+    let fake_bin = temp.path().join("fake-bin");
+    fs::create_dir_all(&fake_bin).expect("fake bin");
+    write_executable(
+        &fake_bin.join("git"),
+        r#"#!/bin/sh
+if [ "${1:-}" = tty-probe ]; then
+  if [ -t 0 ] && [ -t 1 ]; then
+    printf 'tty-ok\n' > "$GHIS_TTY_TRACE"
+  else
+    printf 'tty-lost\n' > "$GHIS_TTY_TRACE"
+    exit 72
+  fi
+  kill -INT "$$"
+  exit 99
+fi
+exec "$GHIS_REAL_GIT" "$@"
+"#,
+    );
+    let init = temp.path().join("init.bash");
+    fs::write(&init, ghis::shell::bash::bash_init_script("ghis")).expect("init");
+    let ghis_bin = assert_cmd::cargo::cargo_bin!("ghis");
+    let binary_dir = ghis_bin.parent().unwrap();
+    let inherited = std::env::var_os("PATH").unwrap_or_default();
+    let path = std::env::join_paths(
+        [fake_bin.as_path(), binary_dir]
+            .into_iter()
+            .map(Path::to_path_buf)
+            .chain(std::env::split_paths(&inherited)),
+    )
+    .unwrap();
+    let real_git = std::env::var_os("GHIS_TEST_REAL_GIT").unwrap_or_else(|| {
+        std::env::split_paths(&inherited)
+            .map(|directory| directory.join("git"))
+            .find(|candidate| candidate.is_file())
+            .expect("real git in PATH")
+            .into_os_string()
+    });
+    let probe = temp.path().join("probe.bash");
+    fs::write(&probe, "source \"$1\"\ngit tty-probe\n").expect("probe");
+    let mut command = Command::new("bash");
+    command
+        .args(["--noprofile", "--norc", "-i"])
+        .arg(&probe)
+        .arg(&init)
+        .current_dir(temp.path())
+        .env("PATH", path)
+        .env("GHIS_REAL_GIT", real_git)
+        .env("GHIS_TTY_TRACE", &tty_trace)
+        .env("HOME", temp.path().join("home"))
+        .env("XDG_CONFIG_HOME", temp.path().join("config"))
+        .env("XDG_CACHE_HOME", temp.path().join("cache"))
+        .env("XDG_STATE_HOME", temp.path().join("state"));
+    clear_ghis_environment(&mut command);
+    let status =
+        run_in_pseudo_terminal(&mut command).expect("run Bash wrapper in a pseudo-terminal");
+
+    assert_eq!(status.code(), Some(130));
+    assert_eq!(
+        fs::read_to_string(tty_trace).expect("TTY trace"),
+        "tty-ok\n"
+    );
+}
+
+#[test]
 fn agent_setup_claude_requires_confirmation_before_writing_settings() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let project = temp.path().join("project");
@@ -2092,19 +2159,35 @@ fn concurrent_profile_add_commands_keep_every_identity() {
 
 #[test]
 fn completion_treats_a_closed_stdout_as_success() {
-    let (closed_reader, writer) = UnixStream::pair().expect("unix stream pair");
-    drop(closed_reader);
-    let writer: OwnedFd = writer.into();
+    for shell in ["zsh", "bash", "fish", "powershell"] {
+        let (closed_reader, writer) = UnixStream::pair().expect("unix stream pair");
+        drop(closed_reader);
+        let writer: OwnedFd = writer.into();
 
-    let mut command = Command::new(assert_cmd::cargo::cargo_bin!("ghis"));
-    clear_ghis_environment(&mut command);
-    let status = command
-        .args(["completion", "zsh"])
-        .stdout(Stdio::from(writer))
-        .status()
-        .expect("run completion with closed stdout");
+        let mut command = Command::new(assert_cmd::cargo::cargo_bin!("ghis"));
+        clear_ghis_environment(&mut command);
+        let status = command
+            .args(["completion", shell])
+            .stdout(Stdio::from(writer))
+            .status()
+            .expect("run completion with closed stdout");
 
-    assert!(status.success());
+        assert!(
+            status.success(),
+            "completion {shell} must ignore broken pipe"
+        );
+    }
+}
+
+#[test]
+fn completion_rejects_unknown_shell_without_output() {
+    let mut command = isolated_ghis_command();
+    command.args(["completion", "nu"]);
+    command
+        .assert()
+        .failure()
+        .stdout(predicate::str::is_empty())
+        .stderr(predicate::str::contains("未知 shell `nu`"));
 }
 
 #[test]
@@ -2124,22 +2207,46 @@ fn init_output_is_valid_when_piped_directly_to_zsh() {
 }
 
 #[test]
-fn shell_commands_fail_closed_for_known_and_unknown_shells() {
+fn shell_commands_support_bash_and_reject_unknown_shells() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let home = temp.path().join("home");
     fs::create_dir_all(&home).expect("home directory");
 
-    let mut known = isolated_ghis_command();
-    known
-        .args(["setup", "bash", "--yes"])
-        .env("HOME", &home)
-        .env("XDG_CONFIG_HOME", temp.path().join("config"))
-        .env("SHELL", "/usr/bin/zsh");
-    known
+    let configure = |command: &mut AssertCommand| {
+        command
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", temp.path().join("config"))
+            .env("SHELL", "/usr/bin/zsh");
+    };
+
+    let mut setup = isolated_ghis_command();
+    setup.args(["setup", "bash", "--yes"]);
+    configure(&mut setup);
+    setup.assert().success();
+    let bashrc = home.join(".bashrc");
+    assert!(
+        fs::read_to_string(&bashrc)
+            .expect("bashrc")
+            .contains(ghis::shell::bash::START_MARKER)
+    );
+
+    let mut second = isolated_ghis_command();
+    second.args(["setup", "bash", "--yes"]);
+    configure(&mut second);
+    second
         .assert()
-        .failure()
-        .stderr(predicate::str::contains("shell `bash` 尚未支持"));
-    assert!(!home.join(".bashrc").exists());
+        .success()
+        .stdout(predicate::str::contains("无需更新"));
+
+    let mut uninstall = isolated_ghis_command();
+    uninstall.args(["uninstall", "bash"]);
+    configure(&mut uninstall);
+    uninstall.assert().success();
+    assert!(
+        !fs::read_to_string(&bashrc)
+            .expect("bashrc")
+            .contains(ghis::shell::bash::START_MARKER)
+    );
 
     let mut unknown = isolated_ghis_command();
     unknown.arg("init").arg("nu");
