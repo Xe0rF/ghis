@@ -6,12 +6,11 @@
 //! `.zshrc` can be installed and removed without touching any other content.
 
 use std::ffi::OsStr;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
-#[cfg(unix)]
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use crate::managed_file::{self, ManagedBlock};
 
 /// Start marker for the block owned by ghis in a zsh startup file.
 pub const START_MARKER: &str = "# >>> ghis setup >>>";
@@ -292,60 +291,16 @@ pub fn managed_block(init_file: &Path) -> String {
 /// intentional: silently deleting a user file after a truncated write is more
 /// surprising than asking the user to repair the marker manually.
 pub fn remove_managed_blocks(contents: &str) -> (String, bool) {
-    let mut output = String::with_capacity(contents.len());
-    let mut cursor = 0usize;
-    let mut changed = false;
-
-    while let Some(start_rel) = contents[cursor..].find(START_MARKER) {
-        let start = cursor + start_rel;
-        let Some(end_rel) = contents[start + START_MARKER.len()..].find(END_MARKER) else {
-            break;
-        };
-        let end_marker = start + START_MARKER.len() + end_rel;
-        let mut end = end_marker + END_MARKER.len();
-        // Consume one line ending, while preserving the surrounding content.
-        if contents[end..].starts_with("\r\n") {
-            end += 2;
-        } else if contents[end..].starts_with('\n') || contents[end..].starts_with('\r') {
-            end += 1;
-        }
-        // `replace_managed_block` owns one separator line before the marker.
-        // Remove that separator as part of uninstall so the pre-setup content
-        // is restored byte-for-byte in the normal case.
-        let owned_start = if contents[cursor..start].ends_with("\r\n\r\n") {
-            start - 2
-        } else if contents[cursor..start].ends_with("\n\n")
-            || contents[cursor..start].ends_with("\r\r")
-        {
-            start - 1
-        } else {
-            start
-        };
-        output.push_str(&contents[cursor..owned_start]);
-        cursor = end;
-        changed = true;
-    }
-
-    output.push_str(&contents[cursor..]);
-    (output, changed)
+    managed_block_file().remove_from(contents)
 }
 
 /// Replace ghis's block in a startup file, preserving unrelated text.
 pub fn replace_managed_block(contents: &str, block: &str) -> String {
-    let (mut cleaned, _) = remove_managed_blocks(contents);
-    if !cleaned.is_empty() && !cleaned.ends_with('\n') {
-        cleaned.push('\n');
-    }
-    if !cleaned.is_empty() {
-        // Separate the generated block from a previous line without creating
-        // duplicate blank lines on repeated setup calls.
-        if !cleaned.ends_with("\n\n") {
-            cleaned.push('\n');
-        }
-    }
-    cleaned.push_str(block.trim_end_matches(['\n', '\r']));
-    cleaned.push('\n');
-    cleaned
+    ManagedBlock::new(START_MARKER, END_MARKER, block.to_string()).replace_in(contents)
+}
+
+fn managed_block_file() -> ManagedBlock {
+    ManagedBlock::new(START_MARKER, END_MARKER, String::new())
 }
 
 /// Install the generated init file and managed `.zshrc` source block.
@@ -354,116 +309,17 @@ pub fn setup(
     init_file: impl AsRef<Path>,
     binary: &str,
 ) -> io::Result<SetupReport> {
-    let zshrc = zshrc.as_ref().to_path_buf();
-    let zshrc_target = editable_target(&zshrc)?;
-    let init_file = init_file.as_ref().to_path_buf();
-    let init_target = editable_target(&init_file)?;
-    let backup_path = PathBuf::from(format!("{}.ghis.bak", zshrc.display()));
-    let snapshots = [
-        FileSnapshot::capture(&init_target)?,
-        FileSnapshot::capture(&zshrc_target)?,
-        FileSnapshot::capture(&backup_path)?,
-    ];
-
-    let result = (|| {
-        if let Some(parent) = init_target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let init_content = zsh_init_script(binary);
-        let init_changed = read_optional(&init_target)?.as_deref() != Some(init_content.as_str());
-        if init_changed {
-            atomic_write(
-                &init_target,
-                init_content.as_bytes(),
-                metadata_mode(&init_target),
-            )?;
-        }
-
-        if let Some(parent) = zshrc_target.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let existing = read_optional(&zshrc_target)?.unwrap_or_default();
-        let block = managed_block(&init_file);
-        let updated = replace_managed_block(&existing, &block);
-        let zshrc_changed = updated != existing;
-        let mut backup = None;
-        if zshrc_changed {
-            if !backup_path.exists() {
-                // A backup is made only once so repeated setup cannot overwrite
-                // the user's original file with a later generated version.
-                if zshrc_target.exists() {
-                    fs::copy(&zshrc_target, &backup_path)?;
-                    backup = Some(backup_path.clone());
-                }
-            }
-            let mode = metadata_mode(&zshrc_target);
-            atomic_write(&zshrc_target, updated.as_bytes(), mode)?;
-        }
-
-        Ok(SetupReport {
-            zshrc: zshrc.clone(),
-            init_file: init_file.clone(),
-            backup,
-            changed: init_changed || zshrc_changed,
-        })
-    })();
-
-    match result {
-        Ok(report) => Ok(report),
-        Err(error) => {
-            let failures = snapshots
-                .iter()
-                .filter_map(|snapshot| snapshot.restore().err())
-                .map(|error| error.to_string())
-                .collect::<Vec<_>>();
-            if failures.is_empty() {
-                Err(error)
-            } else {
-                Err(io::Error::other(format!(
-                    "{error}; shell setup rollback failed: {}",
-                    failures.join("; ")
-                )))
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-struct FileSnapshot {
-    path: PathBuf,
-    contents: Option<Vec<u8>>,
-    mode: Option<u32>,
-}
-
-impl FileSnapshot {
-    fn capture(path: &Path) -> io::Result<Self> {
-        let contents = match fs::read(path) {
-            Ok(contents) => Some(contents),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
-        Ok(Self {
-            path: path.to_path_buf(),
-            contents,
-            mode: metadata_mode(path),
-        })
-    }
-
-    fn restore(&self) -> io::Result<()> {
-        match self.contents.as_deref() {
-            Some(contents) => {
-                if let Some(parent) = self.path.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                atomic_write(&self.path, contents, self.mode)
-            }
-            None => match fs::remove_file(&self.path) {
-                Ok(()) => Ok(()),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
-                Err(error) => Err(error),
-            },
-        }
-    }
+    let init_file = init_file.as_ref();
+    // The source path intentionally stays as requested, even if that file is a
+    // symlink whose resolved target receives the generated init script.
+    let block = ManagedBlock::new(START_MARKER, END_MARKER, managed_block(init_file));
+    let report = managed_file::setup(zshrc.as_ref(), init_file, &zsh_init_script(binary), &block)?;
+    Ok(SetupReport {
+        zshrc: report.zshrc,
+        init_file: report.init_file,
+        backup: report.backup,
+        changed: report.changed,
+    })
 }
 
 /// Remove ghis's managed block from a startup file.
@@ -471,17 +327,7 @@ impl FileSnapshot {
 /// The generated init file and backup are intentionally retained.  They are
 /// useful for recovery and deleting them would make uninstall less reversible.
 pub fn uninstall(zshrc: impl AsRef<Path>) -> io::Result<bool> {
-    let zshrc = zshrc.as_ref();
-    let target = editable_target(zshrc)?;
-    let Some(existing) = read_optional(&target)? else {
-        return Ok(false);
-    };
-    let (updated, changed) = remove_managed_blocks(&existing);
-    if changed {
-        let mode = metadata_mode(&target);
-        atomic_write(&target, updated.as_bytes(), mode)?;
-    }
-    Ok(changed)
+    managed_file::uninstall(zshrc.as_ref(), &managed_block_file())
 }
 
 /// Explicitly named aliases for callers that prefer operation-oriented names.
@@ -496,82 +342,6 @@ pub fn setup_zsh(
 /// Remove the managed zsh block (the generated file is retained).
 pub fn uninstall_zsh(zshrc: impl AsRef<Path>) -> io::Result<bool> {
     uninstall(zshrc)
-}
-
-fn read_optional(path: &Path) -> io::Result<Option<String>> {
-    if !path.exists() {
-        return Ok(None);
-    }
-    let mut content = String::new();
-    File::open(path)?.read_to_string(&mut content)?;
-    Ok(Some(content))
-}
-
-fn editable_target(path: &Path) -> io::Result<PathBuf> {
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if metadata.file_type().is_symlink() => {
-            let target = fs::read_link(path)?;
-            let target = if target.is_absolute() {
-                target
-            } else {
-                path.parent().unwrap_or_else(|| Path::new(".")).join(target)
-            };
-            // Resolve a possible link chain and reject dangling links instead
-            // of replacing the user's symlink with a generated regular file.
-            fs::canonicalize(target)
-        }
-        Ok(_) => Ok(path.to_path_buf()),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(path.to_path_buf()),
-        Err(error) => Err(error),
-    }
-}
-
-fn metadata_mode(path: &Path) -> Option<u32> {
-    #[cfg(unix)]
-    {
-        path.metadata()
-            .ok()
-            .map(|metadata| metadata.permissions().mode())
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        None
-    }
-}
-
-fn atomic_write(path: &Path, contents: &[u8], mode: Option<u32>) -> io::Result<()> {
-    #[cfg(not(unix))]
-    let _ = mode;
-
-    let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("ghis-file");
-    let temporary = parent.join(format!(".{name}.ghis-tmp-{}", std::process::id()));
-
-    let result = (|| {
-        let mut options = OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            options.mode(mode.unwrap_or(0o600));
-        }
-        let mut file = options.open(&temporary)?;
-        file.write_all(contents)?;
-        file.sync_all()?;
-        #[cfg(unix)]
-        if let Some(mode) = mode {
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(mode))?;
-        }
-        fs::rename(&temporary, path)
-    })();
-
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
 }
 
 #[cfg(test)]
@@ -642,6 +412,32 @@ mod tests {
     }
 
     #[test]
+    fn replacement_preserves_content_after_an_unmatched_start() {
+        let malformed = format!("before\n{START_MARKER}\nuser content\n");
+        let block = managed_block(Path::new("/tmp/init.zsh"));
+        let once = replace_managed_block(&malformed, &block);
+        let twice = replace_managed_block(&once, &block);
+
+        assert_eq!(twice, once);
+        assert!(twice.contains("user content"));
+        assert_eq!(twice.matches(START_MARKER).count(), 2);
+    }
+
+    #[test]
+    fn removal_preserves_nested_malformed_block_and_orphan_end() {
+        let input = format!(
+            "before\n{END_MARKER}\n{START_MARKER}\nmalformed\n{START_MARKER}\nmanaged\n{END_MARKER}\nafter\n"
+        );
+        let (output, changed) = remove_managed_blocks(&input);
+
+        assert!(changed);
+        assert_eq!(
+            output,
+            format!("before\n{END_MARKER}\n{START_MARKER}\nmalformed\nafter\n")
+        );
+    }
+
+    #[test]
     fn setup_and_uninstall_round_trip() {
         let directory = tempfile::tempdir().expect("tempdir");
         let zshrc = directory.path().join(".zshrc");
@@ -697,5 +493,144 @@ mod tests {
                 .is_symlink()
         );
         assert_eq!(fs::read_to_string(&target).unwrap(), "export LINKED=1\n");
+    }
+
+    #[test]
+    fn removal_preserves_exact_lf_and_crlf_surrounding_content() {
+        let block = managed_block(Path::new("/tmp/init.zsh"));
+        let lf = format!("before\n\n{block}\nafter\n");
+        assert_eq!(
+            remove_managed_blocks(&lf),
+            ("before\nafter\n".to_string(), true)
+        );
+
+        let crlf_block = block.replace('\n', "\r\n");
+        let crlf = format!("before\r\n\r\n{crlf_block}\r\nafter\r\n");
+        assert_eq!(
+            remove_managed_blocks(&crlf),
+            ("before\r\nafter\r\n".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn removal_removes_multiple_complete_blocks_only() {
+        let block = managed_block(Path::new("/tmp/init.zsh"));
+        let input = format!("before\n\n{block}\nbetween\n\n{block}\nafter\n");
+        assert_eq!(
+            remove_managed_blocks(&input),
+            ("before\nbetween\nafter\n".to_string(), true)
+        );
+    }
+
+    #[test]
+    fn setup_preserves_the_first_backup_across_later_updates() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let zshrc = directory.path().join(".zshrc");
+        let init = directory.path().join("init.zsh");
+        fs::write(&zshrc, "export ORIGINAL=1\n").expect("write zshrc");
+
+        let first = setup(&zshrc, &init, "ghis").expect("first setup");
+        let backup = first.backup.expect("first backup");
+        fs::write(&zshrc, "export MODIFIED=1\n").expect("modify zshrc");
+        let second = setup(&zshrc, &init, "ghis").expect("second setup");
+
+        assert!(second.changed);
+        assert_eq!(second.backup, None);
+        assert_eq!(fs::read_to_string(backup).unwrap(), "export ORIGINAL=1\n");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_sources_the_requested_init_symlink_path() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let zshrc = directory.path().join(".zshrc");
+        let init_target = directory.path().join("dotfiles/init.zsh");
+        fs::create_dir_all(init_target.parent().unwrap()).expect("dotfiles directory");
+        fs::write(&init_target, "old init\n").expect("init target");
+        let requested_init = directory.path().join(".config/ghis/init.zsh");
+        fs::create_dir_all(requested_init.parent().unwrap()).expect("config directory");
+        symlink("../../dotfiles/init.zsh", &requested_init).expect("init symlink");
+
+        setup(&zshrc, &requested_init, "ghis").expect("setup");
+        assert_eq!(
+            fs::read_to_string(&init_target).unwrap(),
+            zsh_init_script("ghis")
+        );
+        assert!(
+            fs::read_to_string(&zshrc)
+                .unwrap()
+                .contains(&shell_quote(&requested_init.to_string_lossy()))
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_rejects_dangling_zshrc_and_init_symlinks_without_writing() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let zshrc = directory.path().join(".zshrc");
+        let init = directory.path().join("init.zsh");
+        symlink("missing-zshrc", &zshrc).expect("zshrc symlink");
+        assert!(setup(&zshrc, &init, "ghis").is_err());
+        assert!(!init.exists());
+        assert!(
+            fs::symlink_metadata(&zshrc)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+
+        fs::remove_file(&zshrc).expect("remove test symlink");
+        fs::write(&zshrc, "export SAFE=1\n").expect("zshrc");
+        symlink("missing-init", &init).expect("init symlink");
+        assert!(setup(&zshrc, &init, "ghis").is_err());
+        assert_eq!(fs::read_to_string(&zshrc).unwrap(), "export SAFE=1\n");
+        assert!(
+            fs::symlink_metadata(&init)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn invalid_utf8_zshrc_rolls_back_the_init_file() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let zshrc = directory.path().join(".zshrc");
+        let init = directory.path().join("init.zsh");
+        fs::write(&zshrc, [b'#', 0xff, b'\n']).expect("invalid zshrc");
+        fs::write(&init, "old init\n").expect("old init");
+
+        let error = setup(&zshrc, &init, "ghis").expect_err("invalid UTF-8 must fail");
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert_eq!(fs::read_to_string(&init).unwrap(), "old init\n");
+        assert_eq!(fs::read(&zshrc).unwrap(), vec![b'#', 0xff, b'\n']);
+        assert!(!directory.path().join(".zshrc.ghis.bak").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_and_uninstall_preserve_existing_zshrc_mode() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().expect("tempdir");
+        let zshrc = directory.path().join(".zshrc");
+        let init = directory.path().join("init.zsh");
+        fs::write(&zshrc, "export MODE=1\n").expect("zshrc");
+        fs::set_permissions(&zshrc, fs::Permissions::from_mode(0o640)).expect("set mode");
+
+        setup(&zshrc, &init, "ghis").expect("setup");
+        assert_eq!(
+            fs::metadata(&zshrc).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        uninstall(&zshrc).expect("uninstall");
+        assert_eq!(
+            fs::metadata(&zshrc).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
     }
 }

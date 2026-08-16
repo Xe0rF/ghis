@@ -12,6 +12,7 @@ pub mod credential;
 pub mod diagnostics;
 pub mod git;
 pub mod github;
+mod managed_file;
 pub mod onboarding;
 pub mod platform;
 pub mod process;
