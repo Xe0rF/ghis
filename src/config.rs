@@ -80,7 +80,23 @@ impl ConfigPaths {
         fs::create_dir_all(&self.config_dir)?;
         fs::create_dir_all(&self.fragments_dir)?;
         fs::create_dir_all(&self.cache_dir)?;
-        fs::create_dir_all(&self.state_dir)
+        fs::create_dir_all(&self.state_dir)?;
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            for directory in [
+                &self.config_dir,
+                &self.fragments_dir,
+                &self.cache_dir,
+                &self.state_dir,
+            ] {
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+            }
+        }
+
+        Ok(())
     }
 
     /// Select an explicit config file and make its path independent of later
