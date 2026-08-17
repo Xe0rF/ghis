@@ -170,7 +170,7 @@ fi
     assert_eq!(report["shell_integration"]["setup_installed"], true);
     assert_eq!(
         report["shell_integration"]["repair_command"],
-        "ghis setup fish"
+        "ghis shell setup fish"
     );
 }
 

@@ -23,14 +23,14 @@ cargo install --locked --path .
 安装 Shell 集成：
 
 ```sh
-ghis setup
+ghis shell setup
 ```
 
-`ghis setup` 会自动检测当前 Shell。也可以显式指定 `zsh`、`bash`、`fish` 或 `powershell`：
+`ghis shell setup` 会自动检测当前 Shell。也可以显式指定 `zsh`、`bash`、`fish` 或 `powershell`：
 
 ```sh
-ghis setup zsh
-ghis setup --print  # 只输出初始化内容，不修改启动文件
+ghis shell setup zsh
+ghis shell setup --print  # 只输出初始化内容，不修改启动文件
 ```
 
 Windows 原生环境使用 PowerShell 7（`pwsh`）。平台与 Shell 的适用范围见 [Wiki：平台与 Shell 边界](https://github.com/Xe0rF/ghis/wiki/Architecture#平台与-shell-边界)。
@@ -87,6 +87,30 @@ ghis doctor
 
 按步骤排查见 [Wiki：故障排查](https://github.com/Xe0rF/ghis/wiki/Troubleshooting)。远程开发和 `forwarded-agent` 见 [Wiki：远程开发与 SSH Agent 转发](https://github.com/Xe0rF/ghis/wiki/Remote-Development-and-Agent-Forwarding)。
 
+## 撤销集成与卸载
+
+只移除当前 Shell 集成：
+
+```sh
+ghis shell uninstall
+```
+
+撤销 ghis 管理的 Shell、Claude Code 和当前仓库集成，同时保留 Profile、规则、配置、缓存和状态：
+
+```sh
+ghis teardown
+ghis teardown --dry-run  # 只预览，不修改文件或仓库
+```
+
+完整删除当前配置 namespace 中的 ghis 用户数据需要显式确认：
+
+```sh
+ghis teardown --purge
+ghis teardown --purge --yes  # 非交互环境
+```
+
+`teardown` 不删除 `ghis` 程序本体。二进制、man page 和补全等软件包文件仍由原安装器或包管理器卸载，例如 `cargo uninstall ghis` 或 `brew uninstall ghis`。
+
 ## 命令帮助
 
 完整参数以本机帮助为准：
@@ -94,7 +118,9 @@ ghis doctor
 ```sh
 ghis --help
 ghis profile --help
-ghis setup --help
+ghis shell --help
+ghis shell setup --help
+ghis teardown --help
 ghis agent --help
 ghis doctor --help
 ```

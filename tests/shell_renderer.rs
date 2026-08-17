@@ -6,7 +6,7 @@ use std::process::Command;
 
 fn shell_cli_output(command: &str, shell: &str) -> Vec<u8> {
     let output = Command::new(cargo_bin!("ghis"))
-        .args([command, shell])
+        .args(["shell", command, shell])
         .output()
         .expect("run ghis shell renderer");
     assert!(
@@ -26,11 +26,11 @@ fn init_cli_output_bytes_match_goldens() {
     for (shell, expected) in [
         (
             "zsh",
-            "89effa45f19ac819ab3f9c9f86440ba18bb2250bce043451fcf4e23109c8ce0f",
+            "165aa95961892d6b3d45fc52a438256b349de20bcfc9f0d04aecefff473446e4",
         ),
         (
             "bash",
-            "60ecc5a06d6c29cbf236525790ca72365960b5d0e93c832c6dd8a197d5bdd2c1",
+            "35aa42338773e44beb62ab4aed40ae674b096b591c702458211b0103fb9cc1c8",
         ),
     ] {
         assert_eq!(
@@ -46,19 +46,19 @@ fn completion_cli_output_bytes_match_goldens() {
     for (shell, expected) in [
         (
             "zsh",
-            "20bc1bd29193cfdb2d8bd68ffec2aa9e11e0639511b4f67eedf24f90033c3be3",
+            "f889b60e03d31f533b9f5d2c57107176bc14d0ab629a3f243d9d6dc506d1b816",
         ),
         (
             "bash",
-            "91421862974eb22e163803518aae97b7bca1e46c97c36fff9f2e2a25e13ec300",
+            "0b3ce8b9d97601d28ffc44bd5c795ca6c6212f5b27278fab1a926617e2cd2b8c",
         ),
         (
             "fish",
-            "5a904ccaf9b1f7d3f53155a022477d7ac2b3040e3aa9fd9d2fc7c432af672cb9",
+            "b2416ed8ad316c457409eff2a131d49967b5e50a7eefeaabfaac557b68f71da6",
         ),
         (
             "powershell",
-            "a7e9dab6a101e2b6bdd9a6abaec3c9a0b2ac17074939c91ab33f713786bcd338",
+            "2505a888cb6670e8b857a6918d1b4c2c97760dc08bc2448cd52a08d26c976da4",
         ),
     ] {
         assert_eq!(

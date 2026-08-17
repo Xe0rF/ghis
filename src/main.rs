@@ -1,4 +1,5 @@
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use fd_lock::RwLock;
 use ghis::agent_context::{AgentContext, AgentContextFormat};
 use ghis::app::{self, AppContext};
 use ghis::config::{
@@ -7,8 +8,9 @@ use ghis::config::{
 };
 use ghis::{credential, diagnostics, github, platform, shell, signing};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
-use std::fs;
+use std::fs::{self, OpenOptions};
 use std::io::{self, BufReader, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 
@@ -79,14 +81,13 @@ enum Commands {
         #[command(subcommand)]
         command: AgentCommand,
     },
-    /// 安装 shell 包装器
-    Setup(SetupArgs),
-    /// 移除 ghis shell 集成
-    Uninstall(ShellArgs),
-    /// 输出 shell 初始化脚本
-    Init(ShellArgs),
-    /// 输出 shell 补全脚本
-    Completion(ShellArgs),
+    /// 管理 Shell 包装器、初始化脚本与补全
+    Shell {
+        #[command(subcommand)]
+        command: ShellCommand,
+    },
+    /// 撤销 ghis 管理的用户集成
+    Teardown(TeardownArgs),
     /// 由 shell wrapper 调用，透明执行真实 git
     #[command(trailing_var_arg = true)]
     Git(Passthrough),
@@ -107,6 +108,18 @@ enum Commands {
         #[arg(allow_hyphen_values = true)]
         args: Vec<String>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+enum ShellCommand {
+    /// 安装 Shell 包装器
+    Setup(SetupArgs),
+    /// 移除 ghis 管理的 Shell 集成
+    Uninstall(ShellArgs),
+    /// 输出 Shell 初始化脚本
+    Init(ShellArgs),
+    /// 输出 Shell 补全脚本
+    Completion(ShellArgs),
 }
 
 #[derive(Debug, Args, Default)]
@@ -281,6 +294,24 @@ struct SetupArgs {
     /// 跳过修改 shell 启动文件前的确认，供脚本安装使用
     #[arg(short = 'y', long)]
     yes: bool,
+}
+
+#[derive(Debug, Args)]
+struct TeardownArgs {
+    #[command(flatten)]
+    shell: ShellArgs,
+    /// 仅列出将执行的清理，不修改文件或仓库
+    #[arg(long)]
+    dry_run: bool,
+    /// 同时删除当前配置 namespace 中的 ghis 用户数据
+    #[arg(long)]
+    purge: bool,
+    /// 跳过 --purge 的交互确认
+    #[arg(short = 'y', long, requires = "purge")]
+    yes: bool,
+    /// 清理指定仓库；默认检查当前目录
+    #[arg(short = 'r', long)]
+    repo: Option<PathBuf>,
 }
 
 #[derive(Debug, Args, Default)]
@@ -542,7 +573,74 @@ fn parse_cli() -> Cli {
     Cli::parse()
 }
 
+#[derive(Clone, Copy)]
+enum OperationLockMode {
+    None,
+    Shared,
+    Exclusive,
+}
+
+fn operation_lock_mode(command: Option<&Commands>) -> OperationLockMode {
+    match command {
+        Some(Commands::Teardown(_)) => OperationLockMode::Exclusive,
+        Some(
+            Commands::Discover(_)
+            | Commands::Onboard(_)
+            | Commands::Profile { .. }
+            | Commands::Use { .. }
+            | Commands::Unbind { .. }
+            | Commands::Rule { .. }
+            | Commands::Config { .. }
+            | Commands::Sync
+            | Commands::Doctor(_),
+        ) => OperationLockMode::Shared,
+        Some(Commands::Agent {
+            command: AgentCommand::Setup { .. } | AgentCommand::Uninstall { .. },
+        }) => OperationLockMode::Shared,
+        Some(Commands::Shell {
+            command: ShellCommand::Setup(_) | ShellCommand::Uninstall(_),
+        }) => OperationLockMode::Shared,
+        _ => OperationLockMode::None,
+    }
+}
+
+fn operation_lock() -> app::Result<RwLock<std::fs::File>> {
+    let paths = ConfigPaths::discover()?;
+    let digest = Sha256::digest(paths.config_dir.as_os_str().as_encoded_bytes());
+    let mut namespace = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut namespace, "{byte:02x}").expect("writing a digest to a string cannot fail");
+    }
+    let path = std::env::temp_dir().join(format!("ghis-{namespace}.operation.lock"));
+    let mut options = OpenOptions::new();
+    options.create(true).truncate(false).read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(path)?;
+    Ok(RwLock::new(file))
+}
+
 fn run(cli: Cli) -> app::Result<i32> {
+    match operation_lock_mode(cli.command.as_ref()) {
+        OperationLockMode::None => dispatch(cli),
+        OperationLockMode::Shared => {
+            let lock = operation_lock()?;
+            let _guard = lock.read()?;
+            dispatch(cli)
+        }
+        OperationLockMode::Exclusive => {
+            let mut lock = operation_lock()?;
+            let _guard = lock.write()?;
+            dispatch(cli)
+        }
+    }
+}
+
+fn dispatch(cli: Cli) -> app::Result<i32> {
     let command = cli
         .command
         .unwrap_or_else(|| Commands::Status(StatusArgs::default()));
@@ -573,17 +671,8 @@ fn run(cli: Cli) -> app::Result<i32> {
         Commands::Agent { command } => {
             agent_command(cli.config.as_deref(), cli.profile.as_deref(), command)
         }
-        Commands::Setup(args) => setup(args),
-        Commands::Uninstall(args) => uninstall(args),
-        Commands::Init(args) => {
-            print!(
-                "{}",
-                shell::render_init(resolve_shell(args.shell)?, "ghis")
-                    .map_err(|error| app::AppError::Message(error.to_string()))?
-            );
-            Ok(0)
-        }
-        Commands::Completion(args) => completion(resolve_shell(args.shell)?),
+        Commands::Shell { command } => shell_command(command),
+        Commands::Teardown(args) => teardown(cli.config.as_deref(), args),
         Commands::Git(args) => {
             let argument_view = args
                 .args
@@ -792,11 +881,9 @@ fn claude_settings_path(scope: AgentScope, project: Option<PathBuf>) -> app::Res
         AgentScope::Project => Ok(project
             .unwrap_or(std::env::current_dir()?)
             .join(".claude/settings.local.json")),
-        AgentScope::User => {
-            let home = std::env::var_os("HOME")
-                .ok_or_else(|| app::AppError::Message("HOME 未设置".into()))?;
-            Ok(PathBuf::from(home).join(".claude/settings.json"))
-        }
+        AgentScope::User => Ok(platform::user_home()
+            .map_err(|error| app::AppError::Message(format!("无法解析用户目录：{error}")))?
+            .join(".claude/settings.json")),
     }
 }
 fn agent_binary() -> String {
@@ -1011,7 +1098,7 @@ fn cache_discovery(paths: &ConfigPaths, discovery: &github::GhDiscovery) -> Opti
 fn onboard(path: Option<&Path>, args: OnboardArgs) -> app::Result<i32> {
     if !io::stdin().is_terminal() || !io::stderr().is_terminal() {
         return Err(app::AppError::Message(
-            "`ghis onboard` 需要交互终端；脚本环境请使用 `ghis profile add ...`、`ghis use ...` 和 `ghis setup --yes`。".into(),
+            "`ghis onboard` 需要交互终端；脚本环境请使用 `ghis profile add ...`、`ghis use ...` 和 `ghis shell setup --yes`。".into(),
         ));
     }
 
@@ -2738,7 +2825,7 @@ fn doctor_shell_integration_advice(
                 .into()
         }
         DoctorShellIntegrationState::WrapperIncomplete => format!(
-            "GHIS marker 存在，但函数依赖不完整；运行 `ghis setup {kind}` 或重新启动 {kind}"
+            "GHIS marker 存在，但函数依赖不完整；运行 `ghis shell setup {kind}` 或重新启动 {kind}"
         ),
         DoctorShellIntegrationState::InstalledNotLoaded => {
             format!("运行 `exec {kind}` 或新开终端后再试；ghis 不会替换当前 shell")
@@ -2748,7 +2835,9 @@ fn doctor_shell_integration_advice(
                 .into()
         }
         DoctorShellIntegrationState::NotIntegrated => {
-            format!("普通 git/gh 不会经过 ghis；需要时先运行 `ghis setup {kind}` 并重新加载 {kind}")
+            format!(
+                "普通 git/gh 不会经过 ghis；需要时先运行 `ghis shell setup {kind}` 并重新加载 {kind}"
+            )
         }
     }
 }
@@ -3022,6 +3111,189 @@ fn completion(kind: shell::ShellKind) -> app::Result<i32> {
     Ok(0)
 }
 
+fn shell_command(command: ShellCommand) -> app::Result<i32> {
+    match command {
+        ShellCommand::Setup(args) => setup(args),
+        ShellCommand::Uninstall(args) => uninstall(args),
+        ShellCommand::Init(args) => {
+            print!(
+                "{}",
+                shell::render_init(resolve_shell(args.shell)?, "ghis")
+                    .map_err(|error| app::AppError::Message(error.to_string()))?
+            );
+            Ok(0)
+        }
+        ShellCommand::Completion(args) => completion(resolve_shell(args.shell)?),
+    }
+}
+
+fn teardown(path: Option<&Path>, args: TeardownArgs) -> app::Result<i32> {
+    if args.purge && !args.dry_run && !args.yes {
+        if !io::stdin().is_terminal() {
+            return Err(app::AppError::Message(
+                "非交互环境执行完整清理时必须使用 `ghis teardown --purge --yes`".into(),
+            ));
+        }
+        eprint!("将删除当前 ghis 配置、缓存和状态，继续吗？[y/N] ");
+        io::stderr().flush()?;
+        let mut answer = String::new();
+        io::stdin().read_line(&mut answer)?;
+        if !matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes") {
+            println!("已取消，未修改任何文件。");
+            return Ok(0);
+        }
+    }
+
+    let mut paths = ConfigPaths::discover()?;
+    if let Some(path) = path {
+        paths.set_config_file(path)?;
+    }
+    let kind = resolve_shell(args.shell.shell)?;
+    let renderer =
+        shell::renderer(kind).map_err(|error| app::AppError::Message(error.to_string()))?;
+    let home = shell_home()?;
+    let startup_file = renderer.startup_file(&home);
+    let init_file = paths.config_dir.join(renderer.spec().init_file_name());
+    let cwd = args.repo.unwrap_or(std::env::current_dir()?);
+    let ctx = context(path, None, &cwd)?;
+    let project_root = ctx
+        .repository
+        .as_ref()
+        .map(|repository| repository.command_dir().to_path_buf())
+        .unwrap_or_else(|| cwd.clone());
+    let user_settings = claude_settings_path(AgentScope::User, None)?;
+    let project_settings = claude_settings_path(AgentScope::Project, Some(project_root))?;
+
+    if args.dry_run {
+        println!("将检查并撤销以下 ghis 管理的集成：");
+        println!("  Shell ({kind})：{}", startup_file.display());
+        println!("  Shell 初始化文件：{}", init_file.display());
+        println!("  Claude Code 用户 Hook：{}", user_settings.display());
+        println!("  Claude Code 项目 Hook：{}", project_settings.display());
+        if let Some(repository) = &ctx.repository {
+            println!("  仓库绑定：{}", repository.command_dir().display());
+        } else {
+            println!("  仓库绑定：跳过（{} 不是 Git 仓库）", cwd.display());
+        }
+        if args.purge {
+            println!("将删除当前配置 namespace 中的用户数据：");
+            for target in purge_targets(&paths) {
+                println!("  {}", target.display());
+            }
+            println!(
+                "  {} 中由 ghis 生成的配置片段",
+                paths.fragments_dir.display()
+            );
+        } else {
+            println!("将保留 Profile、规则、配置、缓存和状态；使用 --purge 才会删除。")
+        }
+        return Ok(0);
+    }
+
+    let shell_changed = renderer.uninstall(&startup_file)?;
+    let init_removed = remove_file_if_exists(&init_file)?;
+    println!(
+        "Shell ({kind})：{}",
+        if shell_changed || init_removed {
+            "已撤销"
+        } else {
+            "未发现"
+        }
+    );
+
+    for (label, settings) in [("用户", user_settings), ("项目", project_settings)] {
+        let changed = ghis::agent::claude::uninstall_settings(&settings)
+            .map_err(|error| app::AppError::Message(error.to_string()))?;
+        println!(
+            "Claude Code {label} Hook：{}（{}）",
+            if changed { "已移除" } else { "未发现" },
+            settings.display()
+        );
+    }
+
+    if ctx.repository.is_some() {
+        app::unbind_repository(&ctx)?;
+        println!("仓库集成：已撤销（{}）", cwd.display());
+    } else {
+        println!("仓库集成：跳过（{} 不是 Git 仓库）", cwd.display());
+    }
+
+    if args.purge {
+        purge_user_data(&paths)?;
+        println!("用户数据：已清理当前配置 namespace。");
+    } else {
+        println!("用户数据：已保留。");
+    }
+    println!("ghis 程序本体仍由原安装器或包管理器管理。");
+    Ok(0)
+}
+
+fn purge_targets(paths: &ConfigPaths) -> Vec<PathBuf> {
+    vec![
+        paths.config_file.clone(),
+        config_lock_path(&paths.config_file),
+        paths.cache_dir.join(github::DISCOVERY_CACHE_FILENAME),
+        paths.repositories_file.clone(),
+        config_lock_path(&paths.repositories_file),
+        paths.log_file.clone(),
+        config_lock_path(&paths.log_file),
+    ]
+}
+
+fn config_lock_path(path: &Path) -> PathBuf {
+    path.with_extension(format!(
+        "{}lock",
+        path.extension()
+            .and_then(|value| value.to_str())
+            .map(|value| format!("{value}."))
+            .unwrap_or_default()
+    ))
+}
+
+fn remove_file_if_exists(path: &Path) -> io::Result<bool> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn purge_user_data(paths: &ConfigPaths) -> app::Result<()> {
+    for target in purge_targets(paths) {
+        remove_file_if_exists(&target)?;
+    }
+    match fs::read_dir(&paths.fragments_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let entry = entry?;
+                let name = entry.file_name();
+                let entry_path = entry.path();
+                let extension = entry_path.extension().and_then(|value| value.to_str());
+                if name == ".lock" || matches!(extension, Some("gitconfig" | "sshconfig")) {
+                    let file_type = entry.file_type()?;
+                    if file_type.is_file() || file_type.is_symlink() {
+                        remove_file_if_exists(&entry_path)?;
+                    }
+                }
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    for directory in [&paths.fragments_dir, &paths.cache_dir, &paths.state_dir] {
+        match fs::remove_dir(directory) {
+            Ok(()) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::DirectoryNotEmpty
+                ) => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
 fn setup(args: SetupArgs) -> app::Result<i32> {
     let kind = resolve_shell(args.shell.shell)?;
     let renderer =
@@ -3038,7 +3310,7 @@ fn setup(args: SetupArgs) -> app::Result<i32> {
     if !args.yes {
         if !io::stdin().is_terminal() {
             return Err(app::AppError::Message(format!(
-                "非交互环境不会自动修改 {}；确认目标后重新运行 `ghis setup --yes`",
+                "非交互环境不会自动修改 {}；确认目标后重新运行 `ghis shell setup --yes`",
                 startup_file.display()
             )));
         }
@@ -3310,23 +3582,38 @@ mod tests {
     #[test]
     fn shell_commands_share_optional_shell_arguments() {
         for command in ["setup", "uninstall", "init", "completion"] {
-            let parsed = Cli::try_parse_from(["ghis", command, "zsh"])
-                .unwrap_or_else(|error| panic!("{command} should accept zsh: {error}"));
+            let parsed = Cli::try_parse_from(["ghis", "shell", command, "zsh"])
+                .unwrap_or_else(|error| panic!("shell {command} should accept zsh: {error}"));
             assert!(matches!(
                 parsed.command,
-                Some(Commands::Setup(SetupArgs {
-                    shell: ShellArgs {
+                Some(Commands::Shell {
+                    command: ShellCommand::Setup(SetupArgs {
+                        shell: ShellArgs {
+                            shell: Some(shell::ShellKind::Zsh)
+                        },
+                        ..
+                    })
+                }) | Some(Commands::Shell {
+                    command: ShellCommand::Uninstall(ShellArgs {
                         shell: Some(shell::ShellKind::Zsh)
-                    },
-                    ..
-                })) | Some(Commands::Uninstall(ShellArgs {
-                    shell: Some(shell::ShellKind::Zsh)
-                })) | Some(Commands::Init(ShellArgs {
-                    shell: Some(shell::ShellKind::Zsh)
-                })) | Some(Commands::Completion(ShellArgs {
-                    shell: Some(shell::ShellKind::Zsh)
-                }))
+                    })
+                }) | Some(Commands::Shell {
+                    command: ShellCommand::Init(ShellArgs {
+                        shell: Some(shell::ShellKind::Zsh)
+                    })
+                }) | Some(Commands::Shell {
+                    command: ShellCommand::Completion(ShellArgs {
+                        shell: Some(shell::ShellKind::Zsh)
+                    })
+                })
             ));
+        }
+    }
+
+    #[test]
+    fn legacy_top_level_shell_commands_are_rejected() {
+        for command in ["setup", "uninstall", "init", "completion"] {
+            Cli::try_parse_from(["ghis", command]).unwrap_err();
         }
     }
 
@@ -3338,8 +3625,8 @@ mod tests {
 
     #[test]
     fn unknown_shell_is_rejected_during_cli_parsing() {
-        let error =
-            Cli::try_parse_from(["ghis", "init", "nu"]).expect_err("unknown shell must not parse");
+        let error = Cli::try_parse_from(["ghis", "shell", "init", "nu"])
+            .expect_err("unknown shell must not parse");
         assert_eq!(error.kind(), clap::error::ErrorKind::ValueValidation);
         assert!(error.to_string().contains("未知 shell `nu`"));
     }

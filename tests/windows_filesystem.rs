@@ -105,6 +105,37 @@ fn prepend_path(directory: &Path) -> OsString {
 }
 
 #[test]
+fn teardown_uses_userprofile_when_home_is_absent() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let layout = WindowsLayout::new(temporary.path());
+    fs::create_dir_all(&layout.root).expect("test root");
+
+    let setup = layout
+        .command()
+        .env_remove("HOME")
+        .args(["shell", "setup", "powershell", "--yes"])
+        .output()
+        .expect("PowerShell setup without HOME");
+    assert_success(&setup, "PowerShell setup without HOME");
+    assert!(layout.profile().is_file());
+    assert!(layout.init().is_file());
+
+    let teardown = layout
+        .command()
+        .env_remove("HOME")
+        .args(["teardown", "powershell"])
+        .output()
+        .expect("teardown without HOME");
+    assert_success(&teardown, "teardown without HOME");
+    assert!(!layout.init().exists());
+    assert!(
+        !fs::read_to_string(layout.profile())
+            .expect("PowerShell profile after teardown")
+            .contains(START_MARKER)
+    );
+}
+
+#[test]
 fn powershell_setup_and_uninstall_use_native_roots_and_preserve_crlf_user_content() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let layout = WindowsLayout::new(temporary.path());
@@ -113,7 +144,7 @@ fn powershell_setup_and_uninstall_use_native_roots_and_preserve_crlf_user_conten
     let original = b"$env:USER_SETTING = 'keep me'\r\n# user-owned CRLF content\r\n";
     fs::write(&profile, original).expect("initial PowerShell profile");
 
-    let first = layout.run(&["setup", "powershell", "--yes"]);
+    let first = layout.run(&["shell", "setup", "powershell", "--yes"]);
     assert_success(&first, "explicit PowerShell setup");
     assert!(text(&first.stdout).contains("powershell 集成已安装"));
     assert_eq!(
@@ -156,7 +187,7 @@ fn powershell_setup_and_uninstall_use_native_roots_and_preserve_crlf_user_conten
     assert!(!layout.root.join("Wrong XDG Cache").exists());
     assert!(!layout.root.join("Wrong XDG State").exists());
 
-    let repeated = layout.run(&["setup", "pwsh", "-y"]);
+    let repeated = layout.run(&["shell", "setup", "pwsh", "-y"]);
     assert_success(&repeated, "repeated pwsh alias setup");
     assert!(text(&repeated.stdout).contains("powershell 集成无需更新"));
     let repeated_profile = fs::read_to_string(&profile).expect("repeated profile");
@@ -165,7 +196,7 @@ fn powershell_setup_and_uninstall_use_native_roots_and_preserve_crlf_user_conten
 
     // On Windows the omitted shell is PowerShell. Uninstall owns only its block;
     // the generated init and backup intentionally remain available for recovery.
-    let uninstall = layout.run(&["uninstall"]);
+    let uninstall = layout.run(&["shell", "uninstall"]);
     assert_success(&uninstall, "implicit PowerShell uninstall");
     assert!(text(&uninstall.stdout).contains("移除 ghis 管理的 powershell 集成"));
     assert_eq!(fs::read(&profile).expect("uninstalled profile"), original);
@@ -175,7 +206,7 @@ fn powershell_setup_and_uninstall_use_native_roots_and_preserve_crlf_user_conten
         original
     );
 
-    let repeated_uninstall = layout.run(&["uninstall", "powershell"]);
+    let repeated_uninstall = layout.run(&["shell", "uninstall", "powershell"]);
     assert_success(&repeated_uninstall, "repeated explicit uninstall");
     assert!(text(&repeated_uninstall.stdout).contains("未在"));
     assert_eq!(fs::read(profile).expect("user profile remains"), original);
@@ -187,7 +218,7 @@ fn pwsh_loads_the_cli_installed_profile_and_finds_ghis_exe_through_pathext() {
     let layout = WindowsLayout::new(temporary.path());
     fs::create_dir_all(&layout.root).expect("test root");
 
-    let setup = layout.run(&["setup", "powershell", "--yes"]);
+    let setup = layout.run(&["shell", "setup", "powershell", "--yes"]);
     assert_success(&setup, "PowerShell setup before runtime probe");
 
     let executable_directory = layout.root.join("Ghis Program Files");
@@ -258,7 +289,7 @@ Write-Output "GIT=$gitVersion"
     assert!(stdout.contains("GHIS=ghis "), "{stdout}");
     assert!(stdout.contains("GIT=git version "), "{stdout}");
 
-    let uninstall = layout.run(&["uninstall", "pwsh"]);
+    let uninstall = layout.run(&["shell", "uninstall", "pwsh"]);
     assert_success(&uninstall, "PowerShell uninstall after runtime probe");
 }
 
@@ -276,7 +307,7 @@ fn setup_fails_on_a_readonly_profile_without_leaving_partial_files() {
     permissions.set_readonly(true);
     fs::set_permissions(&profile, permissions).expect("set readonly attribute");
 
-    let setup = layout.run(&["setup", "powershell", "--yes"]);
+    let setup = layout.run(&["shell", "setup", "powershell", "--yes"]);
     assert!(
         !setup.status.success(),
         "setup unexpectedly replaced a readonly Windows profile\nstdout:\n{}\nstderr:\n{}",
@@ -324,11 +355,11 @@ fn powershell_setup_supports_a_provisioned_unc_share() {
     );
     let layout = WindowsLayout::new(root.join(format!("ghis-unc-e2e-{}", std::process::id())));
     fs::create_dir_all(&layout.root).expect("create isolated UNC test root");
-    let setup = layout.run(&["setup", "powershell", "--yes"]);
+    let setup = layout.run(&["shell", "setup", "powershell", "--yes"]);
     assert_success(&setup, "UNC PowerShell setup");
     assert!(layout.profile().is_file());
     assert!(layout.init().is_file());
-    let uninstall = layout.run(&["uninstall", "powershell"]);
+    let uninstall = layout.run(&["shell", "uninstall", "powershell"]);
     assert_success(&uninstall, "UNC PowerShell uninstall");
     fs::remove_dir_all(&layout.root).expect("remove isolated UNC test root");
 }
@@ -347,10 +378,10 @@ fn powershell_setup_supports_a_provisioned_long_path() {
     );
     let layout = WindowsLayout::new(root);
     fs::create_dir_all(&layout.root).expect("create long-path test root");
-    let setup = layout.run(&["setup", "powershell", "--yes"]);
+    let setup = layout.run(&["shell", "setup", "powershell", "--yes"]);
     assert_success(&setup, "long-path PowerShell setup");
     assert!(layout.profile().is_file());
     assert!(layout.init().is_file());
-    let uninstall = layout.run(&["uninstall", "powershell"]);
+    let uninstall = layout.run(&["shell", "uninstall", "powershell"]);
     assert_success(&uninstall, "long-path PowerShell uninstall");
 }
