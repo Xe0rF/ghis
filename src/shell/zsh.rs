@@ -83,9 +83,9 @@ impl ShellRenderer for ZshRenderer {
 pub(super) static RENDERER: ZshRenderer = ZshRenderer;
 
 /// Start marker for the block owned by ghis in a zsh startup file.
-pub const START_MARKER: &str = "# >>> ghis setup >>>";
+pub const START_MARKER: &str = "# >>> ghis shell setup >>>";
 /// End marker for the block owned by ghis in a zsh startup file.
-pub const END_MARKER: &str = "# <<< ghis setup <<<";
+pub const END_MARKER: &str = "# <<< ghis shell setup <<<";
 /// Exported by the generated init script so child `ghis` processes can tell
 /// that this shell sourced some version of the wrapper.
 pub const LOADED_ENV: &str = "GHIS_SHELL_INTEGRATION";
@@ -438,9 +438,9 @@ mod tests {
     }
 
     #[test]
-    fn managed_markers_remain_compatible_with_pre_namespace_setup() {
-        assert_eq!(START_MARKER, "# >>> ghis setup >>>");
-        assert_eq!(END_MARKER, "# <<< ghis setup <<<");
+    fn managed_markers_follow_the_shell_command_namespace() {
+        assert_eq!(START_MARKER, "# >>> ghis shell setup >>>");
+        assert_eq!(END_MARKER, "# <<< ghis shell setup <<<");
     }
 
     #[test]

@@ -84,9 +84,9 @@ impl ShellRenderer for BashRenderer {
 pub(super) static RENDERER: BashRenderer = BashRenderer;
 
 /// Start marker for the block owned by ghis in `.bashrc`.
-pub const START_MARKER: &str = "# >>> ghis setup >>>";
+pub const START_MARKER: &str = "# >>> ghis shell setup >>>";
 /// End marker for the block owned by ghis in `.bashrc`.
-pub const END_MARKER: &str = "# <<< ghis setup <<<";
+pub const END_MARKER: &str = "# <<< ghis shell setup <<<";
 /// Set only after the interactive Bash wrapper has loaded.
 pub const LOADED_ENV: &str = "GHIS_SHELL_INTEGRATION";
 /// Versioned health marker emitted after all Bash functions are defined.

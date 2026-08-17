@@ -87,9 +87,9 @@ impl ShellRenderer for FishRenderer {
 pub(super) static RENDERER: FishRenderer = FishRenderer;
 
 /// Start marker for the complete fish drop-in owned by ghis.
-pub const START_MARKER: &str = "# >>> ghis fish setup >>>";
+pub const START_MARKER: &str = "# >>> ghis shell setup fish >>>";
 /// End marker for the complete fish drop-in owned by ghis.
-pub const END_MARKER: &str = "# <<< ghis fish setup <<<";
+pub const END_MARKER: &str = "# <<< ghis shell setup fish <<<";
 /// Exported when fish sourced the integration.
 pub const LOADED_ENV: &str = "GHIS_SHELL_INTEGRATION";
 /// Versioned health marker, set only after every function and event hook exists.

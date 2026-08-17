@@ -85,8 +85,8 @@ impl ShellRenderer for PowerShellRenderer {
 pub(super) static RENDERER: PowerShellRenderer = PowerShellRenderer;
 
 /// Markers delimit the sole portion of a PowerShell profile owned by ghis.
-pub const START_MARKER: &str = "# >>> ghis PowerShell setup >>>";
-pub const END_MARKER: &str = "# <<< ghis PowerShell setup <<<";
+pub const START_MARKER: &str = "# >>> ghis shell setup powershell >>>";
+pub const END_MARKER: &str = "# <<< ghis shell setup powershell <<<";
 pub const LOADED_ENV: &str = "GHIS_SHELL_INTEGRATION";
 pub const HEALTH_ENV: &str = "GHIS_SHELL_INTEGRATION_HEALTH";
 pub const HEALTHY_MARKER: &str = "powershell-v1";
