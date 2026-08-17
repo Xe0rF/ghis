@@ -1,6 +1,6 @@
 [package]
 name = "ghis"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2024"
 description = "Per-repository GitHub Identity Switcher for git, gh, and multiple shells"
 license = "AGPL-3.0-or-later"
