@@ -1,9 +1,11 @@
 #![cfg(unix)]
 
 use assert_cmd::Command as AssertCommand;
+use fd_lock::RwLock;
 use ghis::config::{Config, SshMode};
 use predicates::prelude::*;
-use std::fs;
+use sha2::{Digest, Sha256};
+use std::fs::{self, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::os::unix::fs::PermissionsExt;
@@ -1977,7 +1979,7 @@ fn zsh_chpwd_is_silent_on_source_and_displays_profile_after_directory_change() {
 fn generated_zsh_wrapper_is_valid_and_preserves_git_exit_status() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let output = isolated_ghis_command()
-        .args(["init", "zsh"])
+        .args(["shell", "init", "zsh"])
         .output()
         .expect("generate init");
     assert!(output.status.success());
@@ -2387,15 +2389,15 @@ fn setup_respects_zdotdir_and_requires_explicit_noninteractive_consent() {
     };
 
     let mut refused = isolated_ghis_command();
-    refused.arg("setup");
+    refused.args(["shell", "setup"]);
     configure(&mut refused);
     refused
         .assert()
         .failure()
-        .stderr(predicate::str::contains("ghis setup --yes"));
+        .stderr(predicate::str::contains("ghis shell setup --yes"));
 
     let mut setup = isolated_ghis_command();
-    setup.args(["setup", "--yes"]);
+    setup.args(["shell", "setup", "--yes"]);
     configure(&mut setup);
     setup.assert().success().stdout(predicate::str::contains(
         zdotdir.join(".zshrc").display().to_string(),
@@ -2406,7 +2408,7 @@ fn setup_respects_zdotdir_and_requires_explicit_noninteractive_consent() {
     assert!(!home.join(".zshrc").exists());
 
     let mut second = isolated_ghis_command();
-    second.args(["setup", "--yes"]);
+    second.args(["shell", "setup", "--yes"]);
     configure(&mut second);
     second
         .assert()
@@ -2414,13 +2416,226 @@ fn setup_respects_zdotdir_and_requires_explicit_noninteractive_consent() {
         .stdout(predicate::str::contains("无需更新"));
 
     let mut uninstall = isolated_ghis_command();
-    uninstall.arg("uninstall");
+    uninstall.args(["shell", "uninstall"]);
     configure(&mut uninstall);
     uninstall.assert().success();
     assert_eq!(
         fs::read_to_string(zdotdir.join(".zshrc")).expect("uninstalled zshrc"),
         "export EXISTING=1\n"
     );
+}
+
+#[test]
+fn teardown_dry_run_preserves_state_and_purge_removes_only_ghis_owned_data() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let environment = xdg_environment(&temp);
+    let home = environment[0].1.clone();
+    let repository = temp.path().join("repository");
+    let repository_subdirectory = repository.join("nested");
+    fs::create_dir_all(&home).expect("home directory");
+    fs::write(home.join(".zshrc"), "export KEEP_ME=1\n").expect("zshrc");
+    Command::new("git")
+        .args(["init", "-q"])
+        .arg(&repository)
+        .status()
+        .expect("git init");
+    fs::create_dir_all(&repository_subdirectory).expect("repository subdirectory");
+
+    let configure = |command: &mut AssertCommand| {
+        command.current_dir(&repository).env("SHELL", "/bin/zsh");
+        for (key, value) in &environment {
+            command.env(key, value);
+        }
+    };
+
+    let mut setup = isolated_ghis_command();
+    setup.args(["shell", "setup", "zsh", "--yes"]);
+    configure(&mut setup);
+    setup.assert().success();
+
+    let mut add = isolated_ghis_command();
+    add.args([
+        "profile",
+        "add",
+        "teardown-test",
+        "--login",
+        "teardown-test",
+        "--name",
+        "Teardown Test",
+        "--email",
+        "teardown@example.test",
+    ]);
+    configure(&mut add);
+    add.assert().success();
+
+    let mut bind = isolated_ghis_command();
+    bind.args(["use", "teardown-test"]);
+    configure(&mut bind);
+    bind.assert().success();
+
+    let mut agent = isolated_ghis_command();
+    agent.args(["agent", "setup", "claude", "--yes"]);
+    configure(&mut agent);
+    agent.assert().success();
+
+    let mut project_agent = isolated_ghis_command();
+    project_agent
+        .args([
+            "agent",
+            "setup",
+            "claude",
+            "--scope",
+            "project",
+            "--project",
+        ])
+        .arg(&repository)
+        .arg("--yes");
+    configure(&mut project_agent);
+    project_agent.assert().success();
+
+    let config = environment[1].1.join("ghis/config.toml");
+    let fragment = environment[1]
+        .1
+        .join("ghis/fragments/teardown-test.gitconfig");
+    let zshrc = home.join(".zshrc");
+    let settings = home.join(".claude/settings.json");
+    let project_settings = repository.join(".claude/settings.local.json");
+    let cache_directory = environment[2].1.join("ghis");
+    let state_directory = environment[3].1.join("ghis");
+    assert!(config.is_file());
+    assert!(fragment.is_file());
+    assert!(settings.is_file());
+    assert!(project_settings.is_file());
+
+    let mut dry_run = isolated_ghis_command();
+    dry_run.args(["teardown", "--dry-run", "--purge"]);
+    configure(&mut dry_run);
+    dry_run.current_dir(&repository_subdirectory);
+    dry_run
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("将删除当前配置 namespace"));
+    assert!(config.is_file());
+    assert!(fragment.is_file());
+    assert!(
+        fs::read_to_string(&zshrc)
+            .expect("zshrc after dry run")
+            .contains(ghis::shell::START_MARKER)
+    );
+
+    let mut teardown = isolated_ghis_command();
+    teardown.arg("teardown");
+    configure(&mut teardown);
+    teardown.current_dir(&repository_subdirectory);
+    teardown.assert().success();
+    assert_eq!(
+        fs::read_to_string(&zshrc).expect("zshrc after teardown"),
+        "export KEEP_ME=1\n"
+    );
+    assert!(config.is_file(), "default teardown must preserve config");
+    assert!(
+        fragment.is_file(),
+        "default teardown must preserve fragments"
+    );
+    let settings_text = fs::read_to_string(&settings).expect("settings after teardown");
+    assert!(!settings_text.contains("ghis agent hook"));
+    let project_settings_text =
+        fs::read_to_string(&project_settings).expect("project settings after teardown");
+    assert!(!project_settings_text.contains("ghis agent hook"));
+
+    let profile = Command::new("git")
+        .args(["config", "--local", "--get", "ghis.profile"])
+        .current_dir(&repository)
+        .output()
+        .expect("read repository binding");
+    assert!(!profile.status.success(), "teardown must unbind repository");
+
+    let keep = environment[1].1.join("ghis/fragments/keep.txt");
+    fs::write(&keep, "user-owned\n").expect("unmanaged fragment neighbor");
+    let mut purge = isolated_ghis_command();
+    purge.args(["teardown", "--purge", "--yes"]);
+    configure(&mut purge);
+    purge.current_dir(&repository_subdirectory);
+    purge.assert().success();
+    assert!(!config.exists());
+    assert!(!fragment.exists());
+    assert!(!cache_directory.exists());
+    assert!(!state_directory.exists());
+    assert!(
+        keep.is_file(),
+        "purge must preserve unknown neighboring files"
+    );
+    assert!(home.join(".zshrc.ghis.bak").is_file());
+}
+
+#[test]
+fn teardown_excludes_concurrent_namespace_writers() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let environment = xdg_environment(&temp);
+    let config_directory = environment[1].1.join("ghis");
+    let namespace = format!(
+        "{:x}",
+        Sha256::digest(config_directory.as_os_str().as_encoded_bytes())
+    );
+    let runtime = temp.path().join("runtime");
+    fs::create_dir_all(&runtime).expect("runtime directory");
+    let lock_file = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(runtime.join(format!("ghis-{namespace}.operation.lock")))
+        .expect("operation lock");
+    let mut lock = RwLock::new(lock_file);
+    let guard = lock.write().expect("exclusive operation lock");
+
+    let mut add = Command::new(assert_cmd::cargo::cargo_bin!("ghis"));
+    add.current_dir(temp.path());
+    add.args([
+        "profile",
+        "add",
+        "blocked-writer",
+        "--login",
+        "blocked-writer",
+        "--name",
+        "Blocked Writer",
+        "--email",
+        "blocked@example.test",
+    ]);
+    for (key, value) in &environment {
+        add.env(key, value);
+    }
+    clear_ghis_environment(&mut add);
+    add.env("TMPDIR", &runtime);
+    let mut child = add.spawn().expect("spawn blocked profile writer");
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        child.try_wait().expect("poll blocked writer").is_none(),
+        "profile writer must wait while teardown owns the namespace lock"
+    );
+    drop(guard);
+    assert!(child.wait().expect("wait for profile writer").success());
+
+    let config = environment[1].1.join("ghis/config.toml");
+    assert!(config.is_file());
+    let read_guard = lock.read().expect("shared operation lock");
+    let mut purge = Command::new(assert_cmd::cargo::cargo_bin!("ghis"));
+    purge.current_dir(temp.path());
+    purge.args(["teardown", "zsh", "--purge", "--yes"]);
+    for (key, value) in &environment {
+        purge.env(key, value);
+    }
+    purge.env("SHELL", "/bin/zsh").env("TMPDIR", &runtime);
+    clear_ghis_environment(&mut purge);
+    let mut child = purge.spawn().expect("spawn blocked teardown");
+    std::thread::sleep(Duration::from_millis(150));
+    assert!(
+        child.try_wait().expect("poll blocked teardown").is_none(),
+        "teardown must wait for active namespace users"
+    );
+    drop(read_guard);
+    assert!(child.wait().expect("wait for teardown").success());
+    assert!(!config.exists());
 }
 
 #[test]
@@ -2483,7 +2698,7 @@ fn completion_treats_a_closed_stdout_as_success() {
         let mut command = Command::new(assert_cmd::cargo::cargo_bin!("ghis"));
         clear_ghis_environment(&mut command);
         let status = command
-            .args(["completion", shell])
+            .args(["shell", "completion", shell])
             .stdout(Stdio::from(writer))
             .status()
             .expect("run completion with closed stdout");
@@ -2498,7 +2713,7 @@ fn completion_treats_a_closed_stdout_as_success() {
 #[test]
 fn completion_rejects_unknown_shell_without_output() {
     let mut command = isolated_ghis_command();
-    command.args(["completion", "nu"]);
+    command.args(["shell", "completion", "nu"]);
     command
         .assert()
         .failure()
@@ -2513,7 +2728,7 @@ fn init_output_is_valid_when_piped_directly_to_zsh() {
         .args([
             "-f",
             "-c",
-            "setopt pipefail; \"$GHIS_TEST_BIN\" init zsh | command zsh -n",
+            "setopt pipefail; \"$GHIS_TEST_BIN\" shell init zsh | command zsh -n",
         ])
         .env("GHIS_TEST_BIN", assert_cmd::cargo::cargo_bin!("ghis"));
     clear_ghis_environment(&mut command);
@@ -2536,7 +2751,7 @@ fn shell_commands_support_bash_and_reject_unknown_shells() {
     };
 
     let mut setup = isolated_ghis_command();
-    setup.args(["setup", "bash", "--yes"]);
+    setup.args(["shell", "setup", "bash", "--yes"]);
     configure(&mut setup);
     setup.assert().success();
     let bashrc = home.join(".bashrc");
@@ -2547,7 +2762,7 @@ fn shell_commands_support_bash_and_reject_unknown_shells() {
     );
 
     let mut second = isolated_ghis_command();
-    second.args(["setup", "bash", "--yes"]);
+    second.args(["shell", "setup", "bash", "--yes"]);
     configure(&mut second);
     second
         .assert()
@@ -2555,7 +2770,7 @@ fn shell_commands_support_bash_and_reject_unknown_shells() {
         .stdout(predicate::str::contains("无需更新"));
 
     let mut uninstall = isolated_ghis_command();
-    uninstall.args(["uninstall", "bash"]);
+    uninstall.args(["shell", "uninstall", "bash"]);
     configure(&mut uninstall);
     uninstall.assert().success();
     assert!(
@@ -2565,7 +2780,7 @@ fn shell_commands_support_bash_and_reject_unknown_shells() {
     );
 
     let mut unknown = isolated_ghis_command();
-    unknown.arg("init").arg("nu");
+    unknown.args(["shell", "init", "nu"]);
     unknown
         .assert()
         .failure()
@@ -2580,7 +2795,7 @@ fn setup_print_keeps_the_zsh_rendering_without_writing_startup_files() {
 
     let mut command = isolated_ghis_command();
     command
-        .args(["setup", "zsh", "--print"])
+        .args(["shell", "setup", "zsh", "--print"])
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", temp.path().join("config"));
     command
@@ -2600,7 +2815,7 @@ fn fish_setup_and_uninstall_messages_name_the_actual_drop_in() {
 
     let mut setup = isolated_ghis_command();
     setup
-        .args(["setup", "fish", "--yes"])
+        .args(["shell", "setup", "fish", "--yes"])
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &config_home);
     setup
@@ -2616,7 +2831,7 @@ fn fish_setup_and_uninstall_messages_name_the_actual_drop_in() {
 
     let mut uninstall = isolated_ghis_command();
     uninstall
-        .args(["uninstall", "fish"])
+        .args(["shell", "uninstall", "fish"])
         .env("HOME", &home)
         .env("XDG_CONFIG_HOME", &config_home);
     uninstall
@@ -2645,7 +2860,7 @@ fn implicit_setup_and_uninstall_keep_zsh_without_environment_hints() {
     };
 
     let mut setup = isolated_ghis_command();
-    setup.args(["setup", "--yes"]);
+    setup.args(["shell", "setup", "--yes"]);
     configure(&mut setup);
     setup
         .assert()
@@ -2659,7 +2874,7 @@ fn implicit_setup_and_uninstall_keep_zsh_without_environment_hints() {
     );
 
     let mut uninstall = isolated_ghis_command();
-    uninstall.arg("uninstall");
+    uninstall.args(["shell", "uninstall"]);
     configure(&mut uninstall);
     uninstall.assert().success();
     assert!(
@@ -2679,7 +2894,7 @@ fn zsh_environment_hint_beats_a_bash_login_shell_for_implicit_print() {
 
     let mut command = isolated_ghis_command();
     command
-        .args(["setup", "--print"])
+        .args(["shell", "setup", "--print"])
         .env("HOME", &home)
         .env("ZDOTDIR", &zdotdir)
         .env("SHELL", "/bin/bash")
@@ -2730,7 +2945,7 @@ git_email = "work@example.test"
     .expect("config");
 
     let init_output = isolated_ghis_command()
-        .args(["init", "zsh"])
+        .args(["shell", "init", "zsh"])
         .output()
         .expect("generate init");
     assert!(init_output.status.success());

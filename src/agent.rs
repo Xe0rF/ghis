@@ -6,9 +6,7 @@
 pub mod claude;
 pub mod codex;
 
-#[cfg(unix)]
-use std::ffi::OsStr;
-use std::ffi::OsString;
+use std::ffi::{OsStr, OsString};
 use std::path::Path;
 #[cfg(unix)]
 use std::path::PathBuf;
