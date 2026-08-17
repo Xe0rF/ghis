@@ -259,14 +259,23 @@ fn session_real_path_from(
     configured: Option<OsString>,
     inherited: Option<OsString>,
 ) -> std::io::Result<OsString> {
-    if let Some(path) = configured {
-        return Ok(path);
+    let mut paths = Vec::new();
+    for path in inherited
+        .iter()
+        .flat_map(|path| std::env::split_paths(path))
+        .filter(|path| !is_agent_shim_directory(path))
+        .chain(
+            configured
+                .iter()
+                .flat_map(|path| std::env::split_paths(path)),
+        )
+    {
+        if !paths.contains(&path) {
+            paths.push(path);
+        }
     }
-    let inherited = inherited.unwrap_or_default();
-    std::env::join_paths(
-        std::env::split_paths(&inherited).filter(|path| !is_agent_shim_directory(path)),
-    )
-    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
+    std::env::join_paths(paths)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))
 }
 
 #[cfg(unix)]
@@ -357,6 +366,34 @@ mod tests {
         assert_eq!(
             session_real_path_from(None, Some(inherited)).unwrap(),
             std::env::join_paths([real]).unwrap()
+        );
+    }
+
+    #[test]
+    fn session_path_preserves_entries_added_after_real_path_was_recorded() {
+        let root = tempfile::tempdir().unwrap();
+        let codex = root.path().join("codex-path");
+        let shim = root.path().join("shim");
+        let real = root.path().join("real");
+        std::fs::create_dir(&codex).unwrap();
+        std::fs::create_dir(&shim).unwrap();
+        std::fs::create_dir(&real).unwrap();
+
+        for command in ["git", "gh"] {
+            std::fs::write(
+                shim.join(command),
+                format!(
+                    "#!/bin/sh\nPATH=\"${{GHIS_AGENT_REAL_PATH:-$PATH}}\"; export PATH\nexec ghis {command} -- \"$@\"\n"
+                ),
+            )
+            .unwrap();
+        }
+
+        let configured = std::env::join_paths([real.clone()]).unwrap();
+        let inherited = std::env::join_paths([codex.clone(), shim, real.clone()]).unwrap();
+        assert_eq!(
+            session_real_path_from(Some(configured), Some(inherited)).unwrap(),
+            std::env::join_paths([codex, real]).unwrap()
         );
     }
 
