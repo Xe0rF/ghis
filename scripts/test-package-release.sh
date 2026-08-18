@@ -46,8 +46,10 @@ mkdir -p "$target_dir/$target/release"
 if [ "$binary_name" = ghis ]; then
   cat > "$target_dir/$target/release/$binary_name" <<'SCRIPT'
 #!/bin/sh
-[ "$1" = completion ]
-case "$2" in
+[ "$#" -eq 3 ]
+[ "$1" = shell ]
+[ "$2" = completion ]
+case "$3" in
   zsh) printf '%s\n' '#compdef ghis' '_ghis() { :; }' ;;
   bash) printf '%s\n' '_ghis() { :; }' 'complete -F _ghis ghis' ;;
   fish) printf '%s\n' 'complete -c ghis' ;;
