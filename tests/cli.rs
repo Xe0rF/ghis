@@ -1449,7 +1449,10 @@ fi
     for (key, value) in xdg_environment(&temp) {
         command.env(key, value);
     }
-    command.assert().success();
+    command
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("GHIS Profile:").not());
 
     let trace_contents = fs::read_to_string(&trace).expect("gh trace");
     assert!(trace_contents.contains("auth token --hostname github.com --user alice"));
@@ -1914,7 +1917,7 @@ fn chpwd_status_reports_non_authoritative_profile_when_enabled() {
 }
 
 #[test]
-fn zsh_chpwd_is_silent_on_source_and_displays_profile_after_directory_change() {
+fn zsh_chpwd_is_silent_without_a_terminal_and_still_refreshes_profile() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let repo = temp.path().join("repo");
     fs::create_dir_all(&repo).expect("repo directory");
@@ -1966,13 +1969,126 @@ fn zsh_chpwd_is_silent_on_source_and_displays_profile_after_directory_change() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(
         stdout.matches("GHIS Profile: personal").count(),
-        1,
-        "{stdout}"
+        0,
+        "non-terminal stdout contained an informational banner: {stdout}"
     );
     assert!(
         stdout.contains("repo=personal authoritative=unset"),
         "{stdout}"
     );
+}
+
+#[test]
+fn zsh_chpwd_displays_profile_when_stdout_is_a_terminal() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo directory");
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .expect("git init")
+            .success()
+    );
+    let config_dir = temp.path().join("config/ghis");
+    fs::create_dir_all(&config_dir).expect("config directory");
+    fs::write(
+        config_dir.join("config.toml"),
+        "version = 1\n[behavior]\ndefault_profile = \"personal\"\ndisplay_profile_on_chpwd = true\n[profiles.personal]\nhost = \"github.com\"\nlogin = \"alice\"\ngit_name = \"Alice\"\ngit_email = \"alice@example.test\"\n",
+    )
+    .expect("config");
+    let init = temp.path().join("init.zsh");
+    let ghis_bin = assert_cmd::cargo::cargo_bin!("ghis");
+    fs::write(
+        &init,
+        ghis::shell::zsh_init_script(&ghis_bin.to_string_lossy()),
+    )
+    .expect("init script");
+
+    let zsh_script = format!(
+        "source {}; cd {}; print -r -- 'state='$GHIS_REPO_PROFILE",
+        ghis::shell::shell_quote(&init.to_string_lossy()),
+        ghis::shell::shell_quote(&repo.to_string_lossy()),
+    );
+    let shell_command = format!("zsh -f -c {}", ghis::shell::shell_quote(&zsh_script),);
+    let mut command = pseudo_terminal_shell(&shell_command);
+    command.current_dir(temp.path());
+    for (key, value) in xdg_environment(&temp) {
+        command.env(key, value);
+    }
+    clear_ghis_environment(&mut command);
+    let output = command.output().expect("run zsh chpwd hook in terminal");
+    assert!(
+        output.status.success(),
+        "stdout: {} stderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(
+        stdout.matches("GHIS Profile: personal").count(),
+        1,
+        "terminal stdout did not contain exactly one banner: {stdout}"
+    );
+    assert!(stdout.contains("state=personal"), "{stdout}");
+}
+
+#[test]
+fn git_wrapper_banner_follows_stderr_terminal_not_stdout() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("repo directory");
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .expect("git init")
+            .success()
+    );
+    write_default_profile(&temp);
+    let init = temp.path().join("init.zsh");
+    let ghis_bin = assert_cmd::cargo::cargo_bin!("ghis");
+    fs::write(
+        &init,
+        ghis::shell::zsh_init_script(&ghis_bin.to_string_lossy()),
+    )
+    .expect("init script");
+
+    // The informational banner targets stderr, so it must survive a redirected
+    // stdout but stay silent when stderr is redirected away from the terminal.
+    for (redirect, expect_banner) in [("1>/dev/null", true), ("2>/dev/null", false)] {
+        let zsh_script = format!(
+            "source {}; cd {}; git commit --allow-empty --no-verify -m t {redirect}",
+            ghis::shell::shell_quote(&init.to_string_lossy()),
+            ghis::shell::shell_quote(&repo.to_string_lossy()),
+        );
+        let shell_command = format!("zsh -f -c {}", ghis::shell::shell_quote(&zsh_script));
+        let mut command = pseudo_terminal_shell(&shell_command);
+        command.current_dir(temp.path());
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        clear_ghis_environment(&mut command);
+        let output = command
+            .output()
+            .expect("run wrapped git commit in terminal");
+        assert!(
+            output.status.success(),
+            "redirect={redirect} stdout: {} stderr: {}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let transcript = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            transcript.contains("GHIS Profile: personal"),
+            expect_banner,
+            "redirect={redirect} transcript: {transcript}"
+        );
+    }
 }
 
 #[test]
@@ -3181,7 +3297,7 @@ exit 42
         }
         hook.assert()
             .success()
-            .stderr(predicate::str::contains("GHIS Profile: work"))
+            .stderr(predicate::str::contains("GHIS Profile: work").not())
             .stderr(predicate::str::contains("Work Identity").not())
             .stderr(predicate::str::contains("Alice").not());
     }
@@ -3390,7 +3506,7 @@ git_email = "work@example.test"
     commit
         .assert()
         .success()
-        .stderr(predicate::str::contains("GHIS Profile: work"))
+        .stderr(predicate::str::contains("GHIS Profile: work").not())
         .stderr(predicate::str::contains("Work Identity").not())
         .stderr(predicate::str::contains("work@example.test").not());
 
@@ -3515,6 +3631,7 @@ git_email = "work@example.test"
     commit
         .assert()
         .success()
+        .stderr(predicate::str::contains("GHIS Profile:").not())
         .stderr(predicate::str::contains(
             "配置身份=Work Identity <work@example.test>",
         ))
@@ -3583,6 +3700,7 @@ fn direct_hook_banner_reports_git_resolved_author_and_committer() {
     }
     hook.assert()
         .success()
+        .stderr(predicate::str::contains("GHIS Profile:").not())
         .stderr(predicate::str::contains("ghis: 警告："))
         .stderr(predicate::str::contains(
             "实际作者=Actual Author <actual-author@example.test>",

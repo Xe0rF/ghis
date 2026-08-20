@@ -259,7 +259,7 @@ ghis_chpwd() {{
   typeset -g GHIS_REPO_PROFILE
   typeset -g GHIS_REPO_PROFILE_DISPLAY
   typeset -g GHIS_REPO_ROOT
-  if [[ "$ghis_silent" != 1 && "$GHIS_CHPWD_ENABLED" == 1 && -n "$GHIS_REPO_PROFILE" ]]; then
+  if [[ "$ghis_silent" != 1 && -t 1 && "$GHIS_CHPWD_ENABLED" == 1 && -n "$GHIS_REPO_PROFILE" ]]; then
     print -r -- "GHIS Profile: $GHIS_REPO_PROFILE_DISPLAY"
   fi
 }}
@@ -474,6 +474,7 @@ mod tests {
         assert!(script.contains("ghis_git_read_only()"));
         assert!(script.contains("status|branch|rev-parse"));
         assert!(!script.contains("|config|ls-files"));
+        assert!(script.contains("[[ \"$ghis_silent\" != 1 && -t 1"));
         assert!(script.contains("GHIS Profile: $GHIS_REPO_PROFILE_DISPLAY"));
         assert!(script.contains("function codex"));
         assert!(script.contains("agent run codex -- \"$@\""));

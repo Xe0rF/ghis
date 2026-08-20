@@ -3417,8 +3417,13 @@ fn hook(path: Option<&Path>, explicit: Option<&str>, hook: &str) -> app::Result<
     let ctx = context(path, explicit, std::env::current_dir()?)?;
     if matches!(hook, "prepare-commit-msg" | "pre-push") {
         ctx.ensure_selection_available()?;
-        if std::env::var_os("GHIS_BANNER_SHOWN").as_deref() != Some(std::ffi::OsStr::new("1")) {
-            eprintln!("{}", ctx.hook_identity_banner());
+        if std::env::var_os("GHIS_BANNER_SHOWN").as_deref() != Some(std::ffi::OsStr::new("1"))
+            && io::stderr().is_terminal()
+        {
+            eprintln!("{}", ctx.operation_banner());
+        }
+        if let Some(warning) = ctx.hook_identity_warning() {
+            eprintln!("{warning}");
         }
         if hook == "prepare-commit-msg"
             && let Some(profile) = ctx.profile.as_ref()

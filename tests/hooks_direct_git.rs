@@ -260,8 +260,8 @@ fn named_hooks_coexist_with_core_hooks_path_and_run_on_direct_push() {
     );
     assert_success(&committed, "commit through direct Git");
     assert!(
-        String::from_utf8_lossy(&committed.stderr).contains("GHIS Profile: work"),
-        "named ghis hook did not run: {}",
+        !String::from_utf8_lossy(&committed.stderr).contains("GHIS Profile: work"),
+        "non-terminal named hook emitted an informational banner: {}",
         String::from_utf8_lossy(&committed.stderr)
     );
     let record = fs::read_to_string(&hook_record).expect("traditional hook record");
@@ -309,8 +309,8 @@ fn named_hooks_coexist_with_core_hooks_path_and_run_on_direct_push() {
         String::from_utf8_lossy(&pushed.stderr)
     );
     assert!(
-        String::from_utf8_lossy(&pushed.stderr).contains("GHIS Profile: work"),
-        "named ghis pre-push hook did not run: {}",
+        !String::from_utf8_lossy(&pushed.stderr).contains("GHIS Profile: work"),
+        "non-terminal pre-push hook emitted an informational banner: {}",
         String::from_utf8_lossy(&pushed.stderr)
     );
 
@@ -387,8 +387,8 @@ fn husky_style_hooks_path_coexists_with_named_hooks_and_nested_absolute_git() {
     );
     assert_success(&committed, "commit through Husky-style hooks path");
     assert!(
-        String::from_utf8_lossy(&committed.stderr).contains("GHIS Profile: work"),
-        "ghis prepare-commit-msg named hook did not run: {}",
+        !String::from_utf8_lossy(&committed.stderr).contains("GHIS Profile: work"),
+        "non-terminal prepare-commit-msg hook emitted an informational banner: {}",
         String::from_utf8_lossy(&committed.stderr)
     );
     assert_eq!(
@@ -451,8 +451,8 @@ fn pre_commit_style_legacy_chain_coexists_with_ghis_named_hooks() {
     );
     assert_success(&committed, "commit through legacy hook chain");
     assert!(
-        String::from_utf8_lossy(&committed.stderr).contains("GHIS Profile: work"),
-        "ghis prepare-commit-msg named hook did not run: {}",
+        !String::from_utf8_lossy(&committed.stderr).contains("GHIS Profile: work"),
+        "non-terminal prepare-commit-msg hook emitted an informational banner: {}",
         String::from_utf8_lossy(&committed.stderr)
     );
     assert_eq!(

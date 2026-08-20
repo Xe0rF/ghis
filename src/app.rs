@@ -14,7 +14,7 @@ use fd_lock::RwLock;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, OpenOptions};
-use std::io;
+use std::io::{self, IsTerminal};
 use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
@@ -218,32 +218,31 @@ impl AppContext {
         }
     }
 
-    /// Add Git-resolved identities only when a hook detects a mismatch.
+    /// Report Git-resolved identities only when a hook detects a mismatch.
     ///
     /// The wrapper can inspect its own `-c` and `--author` arguments before
     /// launching Git. A hook may also be reached through an absolute-path Git
     /// invocation, so it reports `git var` results instead of assuming that
     /// the Profile fragment won every config/environment override.
-    pub fn hook_identity_banner(&self) -> String {
-        let banner = self.operation_banner();
+    pub fn hook_identity_warning(&self) -> Option<String> {
         let (Some(profile), Some(identities)) = (self.profile.as_ref(), self.identities.as_ref())
         else {
-            return banner;
+            return None;
         };
         let check = identities.check(git::IdentityExpectation {
             name: &profile.git_name,
             email: &profile.git_email,
         });
         if check.author_matches && check.committer_matches {
-            return banner;
+            return None;
         }
-        format!(
-            "{banner}\nghis: 警告：Git 实际身份与 Profile 不一致；实际作者={} <{}>；实际提交者={} <{}>",
+        Some(format!(
+            "ghis: 警告：Git 实际身份与 Profile 不一致；实际作者={} <{}>；实际提交者={} <{}>",
             identities.author.name,
             identities.author.email,
             identities.committer.name,
             identities.committer.email
-        )
+        ))
     }
 
     /// Refuse an explicit or stored selection that points at a deleted Profile.
@@ -999,7 +998,8 @@ where
     } else if !ctx.warnings.is_empty() {
         eprintln!("ghis: {}", ctx.warnings.join("；"));
     }
-    let banner = should_display_git_banner(&ctx, &operation);
+    let banner =
+        should_display_identity_banner(&ctx, operation.is_sensitive(), io::stderr().is_terminal());
     let identity_override = identity_override_warning(&ctx, args, &operation);
     if banner {
         eprintln!("{}", ctx.operation_banner());
@@ -1486,7 +1486,11 @@ where
             "当前仓库身份无法唯一解析，已按 unresolved=fail 停止操作".into(),
         ));
     }
-    if should_display_banner(&ctx, "gh", args) {
+    if should_display_identity_banner(
+        &ctx,
+        is_sensitive_operation("gh", args),
+        io::stderr().is_terminal(),
+    ) {
         eprintln!("{}", ctx.operation_banner());
     }
     let Some(profile) = ctx.profile.as_ref() else {
@@ -2661,20 +2665,17 @@ fn repository_binding_needs_repair(ctx: &AppContext) -> Result<bool> {
     Ok(false)
 }
 
-fn should_display_banner(ctx: &AppContext, command: &str, args: &[String]) -> bool {
-    match ctx.config.behavior.display_identity {
-        config::DisplayIdentity::Always => true,
-        config::DisplayIdentity::Never => false,
-        config::DisplayIdentity::SensitiveCommands => is_sensitive_operation(command, args),
-    }
-}
-
-fn should_display_git_banner(ctx: &AppContext, operation: &GitOperation) -> bool {
-    match ctx.config.behavior.display_identity {
-        config::DisplayIdentity::Always => true,
-        config::DisplayIdentity::Never => false,
-        config::DisplayIdentity::SensitiveCommands => operation.is_sensitive(),
-    }
+fn should_display_identity_banner(
+    ctx: &AppContext,
+    sensitive: bool,
+    stderr_is_terminal: bool,
+) -> bool {
+    stderr_is_terminal
+        && match ctx.config.behavior.display_identity {
+            config::DisplayIdentity::Always => true,
+            config::DisplayIdentity::Never => false,
+            config::DisplayIdentity::SensitiveCommands => sensitive,
+        }
 }
 
 fn is_sensitive_operation(command: &str, args: &[String]) -> bool {
@@ -3517,6 +3518,73 @@ mod tests {
             git_email: "alice@example.test".into(),
             ..Profile::default()
         }
+    }
+
+    fn test_context(display_identity: config::DisplayIdentity) -> AppContext {
+        let mut config = Config::default();
+        config.behavior.display_identity = display_identity;
+        AppContext {
+            paths: ConfigPaths::from_bases("config", "cache", "state"),
+            config,
+            repository: None,
+            remote: None,
+            resolution: ProfileResolution {
+                profile: Some("personal".into()),
+                source: ResolutionSource::Explicit,
+                candidates: vec!["personal".into()],
+                warnings: Vec::new(),
+            },
+            profile: Some(profile()),
+            identities: None,
+            warnings: Vec::new(),
+        }
+    }
+
+    fn git_identity(name: &str, email: &str) -> git::GitIdentity {
+        git::GitIdentity {
+            name: name.into(),
+            email: email.into(),
+            raw: format!("{name} <{email}> 0 +0000"),
+        }
+    }
+
+    #[test]
+    fn identity_banner_policy_requires_stderr_terminal() {
+        let sensitive = test_context(config::DisplayIdentity::SensitiveCommands);
+        assert!(!should_display_identity_banner(&sensitive, true, false));
+        assert!(!should_display_identity_banner(&sensitive, false, true));
+        assert!(should_display_identity_banner(&sensitive, true, true));
+
+        let always = test_context(config::DisplayIdentity::Always);
+        assert!(!should_display_identity_banner(&always, true, false));
+        assert!(should_display_identity_banner(&always, false, true));
+
+        let never = test_context(config::DisplayIdentity::Never);
+        assert!(!should_display_identity_banner(&never, true, false));
+        assert!(!should_display_identity_banner(&never, true, true));
+    }
+
+    #[test]
+    fn hook_identity_warning_is_separate_from_profile_banner() {
+        let mut context = test_context(config::DisplayIdentity::SensitiveCommands);
+        context.identities = Some(EffectiveIdentities {
+            author: git_identity("Actual Author", "author@example.test"),
+            committer: git_identity("Actual Committer", "committer@example.test"),
+        });
+
+        let warning = context.hook_identity_warning().expect("identity warning");
+        assert!(warning.starts_with("ghis: 警告："));
+        assert!(warning.contains("实际作者=Actual Author <author@example.test>"));
+        assert!(warning.contains("实际提交者=Actual Committer <committer@example.test>"));
+        assert!(!warning.contains("GHIS Profile:"));
+
+        context.identities = Some(EffectiveIdentities {
+            author: git_identity("Alice Example", "alice@example.test"),
+            committer: git_identity("Alice Example", "alice@example.test"),
+        });
+        assert_eq!(context.hook_identity_warning(), None);
+        context.identities = None;
+        assert_eq!(context.hook_identity_warning(), None);
     }
 
     #[test]

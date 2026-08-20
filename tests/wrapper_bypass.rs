@@ -177,7 +177,8 @@ git_email = "work@example.test"
     .expect("init script");
 
     // A loaded wrapper resolves the default Profile for an otherwise unbound
-    // repository and prints its Profile before the commit.
+    // repository. Captured stderr is not a terminal, so the informational
+    // Profile banner stays silent.
     let output = run_wrapped(
         &binary,
         &init_file,
@@ -196,7 +197,7 @@ git_email = "work@example.test"
         "Work Identity|work@example.test"
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("GHIS Profile: work"));
+    assert!(!stderr.contains("GHIS Profile: work"));
     assert!(!stderr.contains("Work Identity"));
     assert!(!stderr.contains("work@example.test"));
 

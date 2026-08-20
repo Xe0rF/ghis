@@ -26,7 +26,7 @@ fn init_cli_output_bytes_match_goldens() {
     for (shell, expected) in [
         (
             "zsh",
-            "165aa95961892d6b3d45fc52a438256b349de20bcfc9f0d04aecefff473446e4",
+            "d73ffaf3493e68561014a98e91e72765812d00a5a0d48cdc0a1569e18faebc1b",
         ),
         (
             "bash",
