@@ -893,13 +893,37 @@ fn agent_binary() -> String {
         .unwrap_or_else(|| "ghis".into())
 }
 
-fn load_config(path: Option<&Path>) -> app::Result<(ConfigPaths, Config)> {
+/// How the active command treats a missing explicit configuration file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConfigLoadMode {
+    /// Read/execute commands must not silently resolve identities from
+    /// defaults when the operator selected a config file that is absent.
+    Strict,
+    /// Commands whose purpose is creating or extending the configuration may
+    /// initialize a missing file.
+    AllowCreate,
+}
+
+fn load_config_with_mode(
+    path: Option<&Path>,
+    mode: ConfigLoadMode,
+) -> app::Result<(ConfigPaths, Config)> {
     let mut paths = ConfigPaths::discover()?;
+    let explicit = path.is_some();
     if let Some(path) = path {
         paths.set_config_file(path)?;
     }
-    let config = Config::load(&paths.config_file)?;
+    // The default XDG path stays lenient on first use; only an explicitly
+    // selected file can trigger strict loading.
+    let config = match (explicit, mode) {
+        (true, ConfigLoadMode::Strict) => Config::load_required(&paths.config_file)?,
+        _ => Config::load(&paths.config_file)?,
+    };
     Ok((paths, config))
+}
+
+fn load_config(path: Option<&Path>) -> app::Result<(ConfigPaths, Config)> {
+    load_config_with_mode(path, ConfigLoadMode::Strict)
 }
 
 fn update_config<T>(
@@ -1102,7 +1126,7 @@ fn onboard(path: Option<&Path>, args: OnboardArgs) -> app::Result<i32> {
         ));
     }
 
-    let (paths, config) = load_config(path)?;
+    let (paths, config) = load_config_with_mode(path, ConfigLoadMode::AllowCreate)?;
     let target = args.repo.unwrap_or(std::env::current_dir()?);
     let repository = match ghis::repo::discover(&target) {
         Ok(repository) => Some(repository),
@@ -1377,7 +1401,13 @@ fn with_two_rollback_context(
 }
 
 fn profile_command(path: Option<&Path>, command: ProfileCommand) -> app::Result<i32> {
-    let (paths, config) = load_config(path)?;
+    // Only `profile add` is expected to bootstrap a missing config file;
+    // every other subcommand inspects or edits an existing one.
+    let mode = match command {
+        ProfileCommand::Add(_) => ConfigLoadMode::AllowCreate,
+        _ => ConfigLoadMode::Strict,
+    };
+    let (paths, config) = load_config_with_mode(path, mode)?;
     match command {
         ProfileCommand::List(args) => {
             if args.json {
@@ -1699,7 +1729,13 @@ fn unbind(path: Option<&Path>, repo: Option<&Path>) -> app::Result<i32> {
 }
 
 fn rule_command(path: Option<&Path>, command: RuleCommand) -> app::Result<i32> {
-    let (paths, config) = load_config(path)?;
+    // `rule add` may bootstrap a missing explicit config; list/edit/remove
+    // operate on an existing configuration.
+    let mode = match command {
+        RuleCommand::Add(_) => ConfigLoadMode::AllowCreate,
+        _ => ConfigLoadMode::Strict,
+    };
+    let (paths, config) = load_config_with_mode(path, mode)?;
     match command {
         RuleCommand::List(args) => {
             if args.json {
@@ -1795,7 +1831,12 @@ fn rule_from_args(args: RuleArgs) -> Rule {
 }
 
 fn config_command(path: Option<&Path>, command: ConfigCommand) -> app::Result<i32> {
-    let (paths, config) = load_config(path)?;
+    // `config set` may bootstrap a missing explicit config; list/get read one.
+    let mode = match command {
+        ConfigCommand::Set { .. } => ConfigLoadMode::AllowCreate,
+        _ => ConfigLoadMode::Strict,
+    };
+    let (paths, config) = load_config_with_mode(path, mode)?;
     match command {
         ConfigCommand::List(args) => {
             let settings = behavior_settings(&config);
@@ -2070,6 +2111,13 @@ fn doctor(
 ) -> app::Result<i32> {
     let ctx = context(path, explicit, std::env::current_dir()?)?;
     let mut warnings = ctx.warnings.clone();
+    let unknown_keys = diagnostics::unknown_config_keys_report(&ctx.paths.config_file);
+    if !unknown_keys.is_empty() {
+        warnings.push(format!(
+            "配置文件包含 ghis 未识别的键（已保留，不会影响执行）：{}",
+            unknown_keys.join("、")
+        ));
+    }
     let shell_integration = doctor_shell_integration(&ctx)?;
     let diagnostic_cwd = ctx
         .repository

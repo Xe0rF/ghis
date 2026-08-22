@@ -4226,3 +4226,465 @@ git_email = "sentinel@example.test"
     let config = Config::load(&isolated_config).expect("isolated config");
     assert!(config.profiles.contains_key("isolated"));
 }
+
+fn write_absent_custom_config(temp: &TempDir) -> PathBuf {
+    temp.path().join("absent-identities").join("config.toml")
+}
+
+#[test]
+fn missing_explicit_config_fails_read_commands_without_default_or_gh_fallback() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let repository = temp.path().join("repo");
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repository)
+            .status()
+            .expect("git init")
+            .success()
+    );
+    // A complete default configuration exists. Every command below points at
+    // a different, absent file and must fail instead of reading this one.
+    write_default_profile(&temp);
+
+    let absent = write_absent_custom_config(&temp);
+    let configure = |command: &mut AssertCommand| {
+        command
+            .current_dir(&repository)
+            .arg("--config")
+            .arg(&absent);
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+    };
+
+    let mut status = isolated_ghis_command();
+    configure(&mut status);
+    status.arg("status");
+    status
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("指定的配置文件不存在"))
+        .stderr(predicate::str::contains(absent.display().to_string()))
+        .stderr(predicate::str::contains("Alice").not());
+
+    let mut context = isolated_ghis_command();
+    configure(&mut context);
+    context.arg("context");
+    context
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("指定的配置文件不存在"));
+
+    // The credential helper must stop Git's helper chain quietly.
+    let mut helper = isolated_ghis_command();
+    configure(&mut helper);
+    helper
+        .args(["credential-helper", "get"])
+        .write_stdin("protocol=https\nhost=github.com\n\n");
+    helper
+        .assert()
+        .failure()
+        .stdout("quit=true\n\n")
+        .stderr(predicate::str::contains("指定的配置文件不存在"));
+
+    // The git wrapper must not fall back to the default identity either.
+    // A read-only `git config` probe is deliberately passed through untouched;
+    // an identity-writing command goes through profile resolution and fails.
+    let mut wrapper = isolated_ghis_command();
+    configure(&mut wrapper);
+    wrapper.args([
+        "git",
+        "--",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "identity probe",
+    ]);
+    wrapper
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("指定的配置文件不存在"))
+        .stderr(predicate::str::contains("Alice").not());
+
+    assert!(
+        !temp.path().join("cache/ghis/accounts.json").exists(),
+        "缺失显式配置时不得创建账号缓存"
+    );
+
+    // The custom-config namespace directories must not be created for a file
+    // that does not exist.
+    let namespace = temp
+        .path()
+        .join("cache/ghis")
+        .read_dir()
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .any(|entry| entry.file_name().to_string_lossy().starts_with("config-"))
+        })
+        .unwrap_or(false);
+    assert!(!namespace, "缺失显式配置时不得创建自定义命名空间缓存目录");
+}
+
+#[test]
+fn ghis_config_environment_variable_is_strict_for_missing_files() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+    let absent = write_absent_custom_config(&temp);
+
+    let mut command = isolated_ghis_command();
+    command
+        .current_dir(temp.path())
+        .env("GHIS_CONFIG", &absent)
+        .arg("status");
+    for (key, value) in xdg_environment(&temp) {
+        command.env(key, value);
+    }
+    command
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("指定的配置文件不存在"))
+        .stderr(predicate::str::contains(absent.display().to_string()))
+        .stderr(predicate::str::contains("Alice").not());
+}
+
+#[test]
+fn writing_commands_can_bootstrap_a_missing_explicit_config() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let absent = write_absent_custom_config(&temp);
+    let configure = |command: &mut AssertCommand| {
+        command
+            .current_dir(temp.path())
+            .arg("--config")
+            .arg(&absent);
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+    };
+
+    let mut add_profile = isolated_ghis_command();
+    configure(&mut add_profile);
+    add_profile.args([
+        "profile",
+        "add",
+        "work",
+        "-l",
+        "worker",
+        "-n",
+        "Work Identity",
+        "-e",
+        "work@example.test",
+    ]);
+    add_profile
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("已添加 profile `work`"));
+
+    let mut add_rule = isolated_ghis_command();
+    configure(&mut add_rule);
+    add_rule.args([
+        "rule",
+        "add",
+        "work-rule",
+        "--profile",
+        "work",
+        "--owner",
+        "acme",
+    ]);
+    add_rule
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("已添加规则 `work-rule`"));
+
+    let mut set_config = isolated_ghis_command();
+    configure(&mut set_config);
+    set_config.args(["config", "set", "display-identity", "always"]);
+    set_config
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "已设置 behavior.display_identity=always",
+        ));
+
+    // The bootstrapped file must live at the explicit path, and a follow-up
+    // strict read now succeeds against it.
+    let saved = Config::load(&absent).expect("bootstrapped config");
+    assert!(saved.profiles.contains_key("work"));
+    assert_eq!(saved.rules.len(), 1);
+    assert_eq!(
+        saved.behavior.display_identity,
+        ghis::config::DisplayIdentity::Always
+    );
+
+    let mut status = isolated_ghis_command();
+    configure(&mut status);
+    status.arg("status");
+    status.assert().success();
+
+    // The default XDG config must stay untouched by the custom namespace.
+    assert!(!temp.path().join("config/ghis/config.toml").exists());
+}
+
+#[test]
+fn doctor_warns_about_unknown_keys_and_saving_keeps_them() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let directory = temp.path().join("config/ghis");
+    fs::create_dir_all(&directory).expect("config directory");
+    let config_file = directory.join("config.toml");
+    fs::write(
+        &config_file,
+        r#"version = 1
+future_root = "keep"
+
+[behavior]
+default_profile = "personal"
+futur_behaviour = true
+
+[profiles.personal]
+host = "github.com"
+login = "alice"
+git_name = "Alice"
+git_email = "alice@example.test"
+discription = "typo"
+
+[[rules]]
+id = "keep"
+profile = "personal"
+prirority = 5
+"#,
+    )
+    .expect("config with unknown keys");
+
+    let run = |json: bool| {
+        let mut command = isolated_ghis_command();
+        command.current_dir(temp.path()).arg("doctor");
+        if json {
+            command.arg("--json");
+        }
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.output().expect("run doctor")
+    };
+
+    let human = run(false);
+    assert!(human.status.success());
+    let stderr = String::from_utf8_lossy(&human.stderr);
+    assert!(stderr.contains("未识别的键"), "{stderr}");
+    assert!(stderr.contains("future_root"));
+    assert!(stderr.contains("behavior.futur_behaviour"));
+    assert!(stderr.contains("profiles.personal.discription"));
+    assert!(stderr.contains("rules[0].prirority"));
+
+    let report: serde_json::Value = serde_json::from_slice(&run(true).stdout).expect("doctor JSON");
+    let warnings = report["warnings"].as_array().expect("warnings array");
+    assert!(
+        warnings.iter().any(|warning| {
+            warning
+                .as_str()
+                .is_some_and(|text| text.contains("future_root"))
+        }),
+        "JSON warnings must include unknown keys: {warnings:?}"
+    );
+
+    // A profile edit must keep the unknown keys on disk.
+    let mut edit = isolated_ghis_command();
+    edit.current_dir(temp.path()).args([
+        "profile",
+        "edit",
+        "personal",
+        "--description",
+        "正确拼写",
+    ]);
+    for (key, value) in xdg_environment(&temp) {
+        edit.env(key, value);
+    }
+    edit.assert().success();
+
+    let saved = fs::read_to_string(&config_file).expect("saved config");
+    assert!(saved.contains("future_root = \"keep\""));
+    assert!(saved.contains("futur_behaviour = true"));
+    assert!(saved.contains("discription"), "未知键必须保留");
+}
+
+#[test]
+fn explicit_config_error_paths_stay_actionable() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let configure = |command: &mut AssertCommand, config: &Path| {
+        command.current_dir(temp.path()).arg("--config").arg(config);
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+    };
+
+    // A directory instead of a file must surface an I/O error, not defaults.
+    let directory_path = temp.path().join("config-as-directory");
+    fs::create_dir_all(&directory_path).expect("directory");
+    let mut command = isolated_ghis_command();
+    configure(&mut command, &directory_path);
+    command.arg("status");
+    command
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ghis:"))
+        .stderr(predicate::str::contains("Alice").not());
+
+    // Broken TOML keeps its parse error.
+    let broken = temp.path().join("broken.toml");
+    fs::write(&broken, "this is not valid = [toml\n").expect("broken TOML");
+    let mut command = isolated_ghis_command();
+    configure(&mut command, &broken);
+    command.arg("status");
+    command
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("配置错误"));
+
+    // A future schema version must be rejected instead of guessed.
+    let future = temp.path().join("future.toml");
+    fs::write(&future, "version = 99\n").expect("future version");
+    let mut command = isolated_ghis_command();
+    configure(&mut command, &future);
+    command.arg("status");
+    command
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("unsupported version"));
+
+    // A rule that references a missing profile still fails validation.
+    let dangling = temp.path().join("dangling-rule.toml");
+    fs::write(
+        &dangling,
+        r#"version = 1
+
+[[rules]]
+id = "dangling"
+profile = "missing"
+"#,
+    )
+    .expect("dangling rule config");
+    let mut command = isolated_ghis_command();
+    configure(&mut command, &dangling);
+    command.arg("status");
+    command
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("missing profile"));
+}
+
+#[test]
+fn missing_default_config_keeps_first_run_behavior() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let mut command = isolated_ghis_command();
+    command.current_dir(temp.path()).arg("status");
+    for (key, value) in xdg_environment(&temp) {
+        command.env(key, value);
+    }
+    command
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("当前 Profile：未解析"));
+
+    let mut list = isolated_ghis_command();
+    list.current_dir(temp.path()).args(["profile", "list"]);
+    for (key, value) in xdg_environment(&temp) {
+        list.env(key, value);
+    }
+    list.assert().success();
+
+    // The first write bootstraps the default location without strict errors.
+    let mut add = isolated_ghis_command();
+    add.current_dir(temp.path()).args([
+        "profile",
+        "add",
+        "personal",
+        "-l",
+        "alice",
+        "-n",
+        "Alice",
+        "-e",
+        "alice@example.test",
+    ]);
+    for (key, value) in xdg_environment(&temp) {
+        add.env(key, value);
+    }
+    add.assert().success();
+}
+
+#[test]
+fn unreadable_explicit_config_reports_an_io_error_instead_of_defaults() {
+    if std::env::var("GHIS_TEST_AS_ROOT").is_ok() {
+        return;
+    }
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+    let secret = temp.path().join("secret.toml");
+    fs::write(&secret, "version = 1\n").expect("secret config");
+    fs::set_permissions(&secret, fs::Permissions::from_mode(0o000)).expect("lock down");
+
+    let mut command = isolated_ghis_command();
+    command
+        .current_dir(temp.path())
+        .arg("--config")
+        .arg(&secret)
+        .arg("status");
+    for (key, value) in xdg_environment(&temp) {
+        command.env(key, value);
+    }
+    command
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ghis:"))
+        .stderr(predicate::str::contains("Alice").not());
+}
+
+#[test]
+fn missing_explicit_config_credential_helper_never_contacts_gh() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+    let repository = temp.path().join("repo");
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repository)
+            .status()
+            .expect("git init")
+            .success()
+    );
+
+    let absent = write_absent_custom_config(&temp);
+    let fake_bin = temp.path().join("bin");
+    let trace = temp.path().join("gh-trace");
+    fs::create_dir_all(&fake_bin).expect("bin directory");
+    write_executable(
+        &fake_bin.join("gh"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$GHIS_TEST_GH_TRACE"
+printf 'fallback-secret\n'
+"#,
+    );
+
+    let mut command = isolated_ghis_command();
+    command
+        .current_dir(&repository)
+        .arg("--config")
+        .arg(&absent)
+        .args(["credential-helper", "get"])
+        .write_stdin("protocol=https\nhost=github.com\n\n")
+        .env("PATH", prepend_path(&fake_bin))
+        .env("GHIS_TEST_GH_TRACE", &trace);
+    for (key, value) in xdg_environment(&temp) {
+        command.env(key, value);
+    }
+    command
+        .assert()
+        .failure()
+        .stdout("quit=true\n\n")
+        .stderr(predicate::str::contains("指定的配置文件不存在"))
+        .stderr(predicate::str::contains("fallback-secret").not());
+    assert!(
+        !trace.exists(),
+        "缺失显式配置时 credential helper 不得调用 gh"
+    );
+}

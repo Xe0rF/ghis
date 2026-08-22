@@ -9,6 +9,15 @@ use serde::Serialize;
 use serde_json::Value;
 use std::path::Path;
 
+/// Report unknown ghis configuration keys for doctor-style diagnostics.
+///
+/// Unknown keys are legal and preserved across saves; this only surfaces
+/// likely typos to the operator.  A missing or unparseable file reports
+/// nothing here because the normal load path already explains those states.
+pub fn unknown_config_keys_report(path: &Path) -> Vec<String> {
+    crate::config::scan_unknown_config_keys(path)
+}
+
 /// Diagnostic severity shared by CLI JSON and text output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "lowercase")]

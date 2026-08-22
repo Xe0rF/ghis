@@ -386,6 +386,11 @@ impl Default for Config {
 pub enum ConfigError {
     #[error("configuration path error: {0}")]
     Paths(String),
+    /// An explicitly requested configuration file does not exist.  Unlike the
+    /// default XDG path, this is an operator mistake and must not silently
+    /// become an empty configuration.
+    #[error("指定的配置文件不存在：{path}")]
+    Missing { path: PathBuf },
     #[error("I/O error while accessing {path}: {source}")]
     Io { path: PathBuf, source: io::Error },
     #[error("invalid TOML in {path}: {source}")]
@@ -404,6 +409,19 @@ pub enum ConfigError {
 impl Config {
     /// Load configuration from a TOML file.  A missing file produces defaults.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        Self::load_with_mode(path, LoadMode::AllowMissing)
+    }
+
+    /// Load configuration from a TOML file, requiring the file to exist.
+    ///
+    /// Use this for explicitly selected configuration files (`--config` or
+    /// `GHIS_CONFIG`): a missing file is an operator mistake there and must
+    /// not silently become an empty default configuration.
+    pub fn load_required(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
+        Self::load_with_mode(path, LoadMode::RequireExisting)
+    }
+
+    fn load_with_mode(path: impl AsRef<Path>, mode: LoadMode) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let mut input = String::new();
         match File::open(path) {
@@ -414,7 +432,13 @@ impl Config {
                         source,
                     })?;
             }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Self::default()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => match mode {
+                LoadMode::AllowMissing => return Ok(Self::default()),
+                LoadMode::RequireExisting => {
+                    let resolved = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+                    return Err(ConfigError::Missing { path: resolved });
+                }
+            },
             Err(source) => {
                 return Err(ConfigError::Io {
                     path: path.to_path_buf(),
@@ -630,6 +654,130 @@ impl Config {
             }
         }
         Ok(())
+    }
+}
+
+/// How [`Config`] treats a configuration file that does not exist.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LoadMode {
+    /// The default XDG path may be missing on first use: treat it as empty.
+    AllowMissing,
+    /// An explicitly selected path must exist; report the resolved absolute
+    /// location instead of falling back to defaults.
+    RequireExisting,
+}
+
+const KNOWN_ROOT_KEYS: &[&str] = &["version", "behavior", "profiles", "rules"];
+const KNOWN_BEHAVIOR_TABLE_KEYS: &[&str] = &[
+    "default_profile",
+    "auto_bind",
+    "unresolved",
+    "credential_failure",
+    "ssh_unmanaged",
+    "display_identity",
+    "display_profile_on_chpwd",
+];
+const KNOWN_PROFILE_KEYS: &[&str] = &[
+    "host",
+    "login",
+    "git_name",
+    "git_email",
+    "description",
+    "ssh",
+    "signing",
+];
+const KNOWN_SSH_KEYS: &[&str] = &[
+    "mode",
+    "public_key",
+    "fingerprint",
+    "agent_socket",
+    "proxy_jump",
+    "forward_agent",
+];
+const KNOWN_SIGNING_KEYS: &[&str] = &[
+    "enabled",
+    "transport",
+    "signing_key",
+    "fingerprint",
+    "program",
+];
+const KNOWN_RULE_KEYS: &[&str] = &[
+    "id", "profile", "priority", "host", "owner", "repo", "remote", "gitdir", "cwd",
+];
+
+/// Report dotted paths of keys that [`Config`] does not model.
+///
+/// Unknown keys stay legal: loading ignores them and saving preserves them
+/// for forward compatibility.  This scan exists so `ghis doctor` can point
+/// at likely typos instead of silently dropping user intent.  A nested table
+/// under an unknown parent is reported once at the parent path.
+pub fn unknown_config_keys(document: &DocumentMut) -> Vec<String> {
+    let mut unknown = Vec::new();
+    let root = document.as_table();
+    for (key, _) in root.iter() {
+        if KNOWN_ROOT_KEYS.contains(&key) {
+            continue;
+        }
+        unknown.push(key.to_owned());
+    }
+    if let Some(behavior) = root.get("behavior").and_then(Item::as_table) {
+        for key in behavior.iter().map(|(key, _)| key) {
+            if !KNOWN_BEHAVIOR_TABLE_KEYS.contains(&key) {
+                unknown.push(format!("behavior.{key}"));
+            }
+        }
+    }
+    if let Some(profiles) = root.get("profiles").and_then(Item::as_table) {
+        for (id, profile_item) in profiles.iter() {
+            let Some(profile) = profile_item.as_table() else {
+                continue;
+            };
+            for key in profile.iter().map(|(key, _)| key) {
+                if !KNOWN_PROFILE_KEYS.contains(&key) {
+                    unknown.push(format!("profiles.{id}.{key}"));
+                }
+            }
+            if let Some(ssh) = profile.get("ssh").and_then(Item::as_table) {
+                for key in ssh.iter().map(|(key, _)| key) {
+                    if !KNOWN_SSH_KEYS.contains(&key) {
+                        unknown.push(format!("profiles.{id}.ssh.{key}"));
+                    }
+                }
+            }
+            if let Some(signing) = profile.get("signing").and_then(Item::as_table) {
+                for key in signing.iter().map(|(key, _)| key) {
+                    if !KNOWN_SIGNING_KEYS.contains(&key) {
+                        unknown.push(format!("profiles.{id}.signing.{key}"));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(rules) = root.get("rules").and_then(Item::as_array_of_tables) {
+        for (index, rule) in rules.iter().enumerate() {
+            for key in rule.iter().map(|(key, _)| key) {
+                if !KNOWN_RULE_KEYS.contains(&key) {
+                    unknown.push(format!("rules[{index}].{key}"));
+                }
+            }
+        }
+    }
+    unknown.sort();
+    unknown.dedup();
+    unknown
+}
+
+/// Scan the configuration file on disk for unknown keys.
+///
+/// A missing or unparseable file yields no findings here; both conditions are
+/// reported by the normal load path with clearer messages.
+pub fn scan_unknown_config_keys(path: impl AsRef<Path>) -> Vec<String> {
+    let Ok(input) = fs::read_to_string(path.as_ref()) else {
+        return Vec::new();
+    };
+    match input.parse::<DocumentMut>() {
+        Ok(document) => unknown_config_keys(&document),
+        Err(_) => Vec::new(),
     }
 }
 
@@ -1719,5 +1867,95 @@ priority = 1
             ..SshProfile::default()
         });
         assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn unknown_keys_are_reported_per_section_and_sorted() {
+        let document = r#"version = 1
+future_root = "keep"
+
+[behavior]
+auto_bind = true
+future_behavior = "keep"
+
+[profiles.work]
+host = "github.com"
+login = "alice"
+git_name = "Alice"
+git_email = "alice@example.test"
+future_profile = "keep"
+
+[profiles.work.ssh]
+mode = "external"
+future_ssh = "keep"
+
+[profiles.work.signing]
+enabled = false
+future_signing = "keep"
+
+[[rules]]
+id = "rule"
+profile = "work"
+future_rule = "keep"
+"#
+        .parse::<DocumentMut>()
+        .expect("document");
+        assert_eq!(
+            unknown_config_keys(&document),
+            vec![
+                "behavior.future_behavior",
+                "future_root",
+                "profiles.work.future_profile",
+                "profiles.work.signing.future_signing",
+                "profiles.work.ssh.future_ssh",
+                "rules[0].future_rule",
+            ]
+        );
+    }
+
+    #[test]
+    fn known_documents_report_no_unknown_keys() {
+        let mut config = Config::default();
+        config.profiles.insert("work".into(), profile());
+        config.rules.push(Rule {
+            id: "all".into(),
+            profile: "work".into(),
+            ..Rule::default()
+        });
+        let text = toml_edit::ser::to_string_pretty(&config).expect("serialize");
+        let document = text.parse::<DocumentMut>().expect("parse back");
+        assert!(unknown_config_keys(&document).is_empty());
+    }
+
+    #[test]
+    fn scanning_a_missing_or_invalid_file_reports_nothing() {
+        let dir = tempdir().unwrap();
+        assert!(scan_unknown_config_keys(dir.path().join("absent.toml")).is_empty());
+        let broken = dir.path().join("broken.toml");
+        fs::write(&broken, "not valid = [toml\n").unwrap();
+        assert!(scan_unknown_config_keys(&broken).is_empty());
+    }
+
+    #[test]
+    fn saving_preserves_unknown_keys_after_scanning() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "version = 1\nfuture_root = \"keep\"\n\n[behavior]\nfuture_behavior = \"keep\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            scan_unknown_config_keys(&path),
+            vec!["behavior.future_behavior", "future_root"]
+        );
+        let mut config = Config::load(&path).unwrap();
+        config.behavior.auto_bind = false;
+        config.save(&path).unwrap();
+        assert_eq!(
+            scan_unknown_config_keys(&path),
+            vec!["behavior.future_behavior", "future_root"]
+        );
+        assert_eq!(Config::load(path).unwrap(), config);
     }
 }

@@ -55,10 +55,18 @@ pub struct AppContext {
 }
 
 impl AppContext {
+    /// Load the application context for an optional explicit config file.
+    ///
+    /// When an explicit path is given (`--config`/`GHIS_CONFIG`) the file must
+    /// exist: silently continuing with defaults would resolve identities from
+    /// the wrong account set.  The default XDG location stays lenient so a
+    /// first run before any configuration exists keeps working.
     pub fn load(path: Option<&Path>) -> Result<Self> {
         let mut paths = ConfigPaths::discover()?;
         if let Some(path) = path {
             paths.set_config_file(path)?;
+            let config = Config::load_required(&paths.config_file)?;
+            return Self::from_config(paths, config, std::env::current_dir()?, None);
         }
         let config = Config::load(&paths.config_file)?;
         Self::from_config(paths, config, std::env::current_dir()?, None)
@@ -967,7 +975,13 @@ where
     if let Some(path) = config_path {
         paths.set_config_file(path)?;
     }
-    let config = Config::load(&paths.config_file)?;
+    let config = if config_path.is_some() {
+        // An explicitly selected file must exist; the default path stays
+        // lenient so first use before any configuration keeps working.
+        Config::load_required(&paths.config_file)?
+    } else {
+        Config::load(&paths.config_file)?
+    };
     let ctx = AppContext::from_config(paths, config, cwd, explicit)?;
     ctx.ensure_selection_available()?;
     let operation = resolve_git_operation(&ctx, args, cwd);
@@ -1472,7 +1486,13 @@ where
     if let Some(path) = config_path {
         paths.set_config_file(path)?;
     }
-    let config = Config::load(&paths.config_file)?;
+    let config = if config_path.is_some() {
+        // An explicitly selected file must exist; the default path stays
+        // lenient so first use before any configuration keeps working.
+        Config::load_required(&paths.config_file)?
+    } else {
+        Config::load(&paths.config_file)?
+    };
     let view = parse_gh_argument_view(args)?;
     let inherited_repo = std::env::var_os("GH_REPO");
     let target = gh_profile_target(&view, inherited_repo.as_deref())?;
