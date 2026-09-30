@@ -507,15 +507,13 @@ pub fn bind_repository(ctx: &AppContext, id: &str) -> Result<()> {
     let fragment = write_profile_fragment(&ctx.paths, id, profile)?;
     remove_managed_credential_helpers(repository)?;
     git::set_git_config(repository, PROFILE_CONFIG_KEY, id)?;
-    let include_key = profile_include_key(repository);
+    let include_keys = profile_include_keys(repository);
     for old_key in profile_include_cleanup_keys(repository) {
         unset_profile_include(repository, &old_key)?;
     }
-    repo::add_local_config(
-        repository,
-        &include_key,
-        fragment.to_string_lossy().as_ref(),
-    )?;
+    for include_key in &include_keys {
+        repo::add_local_config(repository, include_key, fragment.to_string_lossy().as_ref())?;
+    }
     let helper = credential_helper_command(&ctx.paths);
     git::install_credential_helper(repository, &profile.host, &helper)?;
     if git::supports_named_hooks() {
@@ -605,17 +603,30 @@ fn unset_profile_include(repository: &Repository, key: &str) -> Result<()> {
     Ok(())
 }
 
-fn profile_include_key(repository: &Repository) -> String {
-    let gitdir = fs::canonicalize(&repository.git_dir)
-        .unwrap_or_else(|_| repository.git_dir.clone())
+/// Conditions that expose the profile fragment to this repository.
+///
+/// A linked worktree's own git directory is `<common-dir>/worktrees/<name>`, so
+/// a condition matching only the common directory reaches the main worktree and
+/// nothing else. The glob form additionally matches every worktree gitdir
+/// beneath it. Both are written: the glob alone misses nothing on a normal
+/// repository, but the exact form is what a bare repository and any gitdir
+/// spelled without a trailing separator compare against, and dropping it would
+/// silently unbind those.
+fn profile_include_keys(repository: &Repository) -> Vec<String> {
+    let gitdir = fs::canonicalize(&repository.common_dir)
+        .unwrap_or_else(|_| repository.common_dir.clone())
         .to_string_lossy()
         .replace('\\', "/");
-    format!("includeIf.gitdir:{gitdir}.path")
+    let trailing = gitdir.trim_end_matches('/');
+    vec![
+        format!("includeIf.gitdir:{trailing}.path"),
+        format!("includeIf.gitdir:{trailing}/**.path"),
+    ]
 }
 
 fn profile_include_cleanup_keys(repository: &Repository) -> Vec<String> {
     let gitdir = repository.git_dir.to_string_lossy().replace('\\', "/");
-    let mut keys = vec![profile_include_key(repository)];
+    let mut keys = profile_include_keys(repository);
     for key in [
         format!("includeIf.gitdir:{gitdir}.path"),
         format!("includeIf.gitdir:{gitdir}/.path"),
@@ -2666,10 +2677,11 @@ fn repository_binding_needs_repair(ctx: &AppContext) -> Result<bool> {
     if fs::read_to_string(&fragment).ok().as_deref() != Some(expected_fragment.as_str()) {
         return Ok(true);
     }
-    let include_key = profile_include_key(repository);
-    let configured = repo::local_config(repository, &include_key)?;
-    if configured.as_deref() != Some(fragment.to_string_lossy().as_ref()) {
-        return Ok(true);
+    for include_key in profile_include_keys(repository) {
+        let configured = repo::local_config(repository, &include_key)?;
+        if configured.as_deref() != Some(fragment.to_string_lossy().as_ref()) {
+            return Ok(true);
+        }
     }
     let key = git::credential_helper_key(&profile.host);
     let expected = credential_helper_command(&ctx.paths);

@@ -261,3 +261,113 @@ git_email = "linked@example.test"
         );
     }
 }
+
+#[test]
+fn worktrees_created_after_binding_inherit_the_profile_fragment() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let main = temp.path().join("main");
+    assert!(
+        git(temp.path(), ["init", "-q", main.to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert!(
+        git(
+            &main,
+            [
+                "-c",
+                "user.name=Bootstrap",
+                "-c",
+                "user.email=bootstrap@example.test",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "initial",
+            ],
+        )
+        .status
+        .success()
+    );
+    assert!(
+        git(
+            &main,
+            [
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/acme/project.git",
+            ],
+        )
+        .status
+        .success()
+    );
+
+    let config = temp.path().join("identities.toml");
+    fs::write(
+        &config,
+        r#"version = 1
+
+[profiles.main]
+host = "github.com"
+login = "main-user"
+git_name = "Main Identity"
+git_email = "main@example.test"
+"#,
+    )
+    .expect("config");
+
+    // Bind before creating the worktree. `git worktree add` copies the main
+    // worktree's config.worktree verbatim, so a binding made afterwards never
+    // reaches the new worktree -- that ordering is the whole bug.
+    run_ghis(
+        &temp,
+        &config,
+        &["use", "main", "--repo", main.to_str().unwrap()],
+    )
+    .success();
+
+    let linked = temp.path().join("linked");
+    assert!(
+        git(
+            &main,
+            [
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "linked-branch",
+                linked.to_str().unwrap(),
+            ],
+        )
+        .status
+        .success()
+    );
+
+    for (worktree, label) in [(&main, "main"), (&linked, "linked")] {
+        let identity = git(worktree, ["config", "--includes", "--get", "user.email"]);
+        assert_eq!(
+            String::from_utf8_lossy(&identity.stdout).trim(),
+            "main@example.test",
+            "{label} worktree must resolve the profile fragment"
+        );
+    }
+
+    // The per-worktree helper and hooks survive by being copied into the new
+    // worktree's config.worktree; assert they are present exactly once.
+    if ghis::git::supports_named_hooks() {
+        let hook = git(
+            &linked,
+            [
+                "config",
+                "--worktree",
+                "--get",
+                "hook.ghis-pre-push.command",
+            ],
+        );
+        assert!(
+            hook.status.success(),
+            "linked worktree must keep the ghis pre-push hook"
+        );
+    }
+}
