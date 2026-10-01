@@ -12,7 +12,8 @@ fn enterprise_remote_port_participates_in_host_rule_resolution() {
         ..Rule::default()
     }];
     let context = RuleContext {
-        host: remote.host,
+        host: remote.host.clone(),
+        repository_host: remote.host,
         owner: remote.owner,
         repo: remote.repo,
         remote: Some(remote.url),

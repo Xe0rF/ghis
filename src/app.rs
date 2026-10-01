@@ -78,7 +78,7 @@ impl AppContext {
         cwd: impl AsRef<Path>,
         explicit: Option<&str>,
     ) -> Result<Self> {
-        Self::from_config_with_target(paths, config, cwd, explicit, None, true)
+        Self::from_config_with_target(paths, config, cwd, explicit, None, true, true)
     }
 
     /// Resolve the minimal prompt state without inspecting Git identities.
@@ -92,7 +92,7 @@ impl AppContext {
         cwd: impl AsRef<Path>,
         explicit: Option<&str>,
     ) -> Result<Self> {
-        Self::from_config_with_target(paths, config, cwd, explicit, None, false)
+        Self::from_config_with_target(paths, config, cwd, explicit, None, false, true)
     }
 
     fn from_config_for_gh(
@@ -102,7 +102,7 @@ impl AppContext {
         explicit: Option<&str>,
         target: Option<&GhProfileTarget>,
     ) -> Result<Self> {
-        Self::from_config_with_target(paths, config, cwd, explicit, target, true)
+        Self::from_config_with_target(paths, config, cwd, explicit, target, true, false)
     }
 
     fn from_config_with_target(
@@ -112,6 +112,7 @@ impl AppContext {
         explicit: Option<&str>,
         target: Option<&GhProfileTarget>,
         inspect_identities: bool,
+        constrain_default_profile: bool,
     ) -> Result<Self> {
         let cwd = std::path::absolute(cwd.as_ref())?;
         let mut warnings = Vec::new();
@@ -131,6 +132,17 @@ impl AppContext {
             (
                 RuleContext {
                     host: remote.host.clone(),
+                    // A `gh` invocation keeps the default profile host-agnostic on
+                    // purpose.  There an unrecognised repository host is a
+                    // cross-host request that `gh_target_policy` must refuse,
+                    // not a reason to drop the profile and let the command run
+                    // unscoped.  Only Git's own path drops it, so a repository
+                    // hosted on another forge simply keeps its Git config.
+                    repository_host: if constrain_default_profile {
+                        remote.host.clone()
+                    } else {
+                        None
+                    },
                     owner: remote.owner.clone(),
                     repo: remote.repo.clone(),
                     remote: Some(remote.url.clone()),

@@ -1055,6 +1055,11 @@ fn merge_item(destination: &mut Item, source: &Item) {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RuleContext {
     pub host: Option<String>,
+    /// Host of the forge the repository itself lives on, taken from its Git
+    /// remote.  Distinct from `host`, which a `gh --hostname` / `--repo` target
+    /// can also supply: that one describes where an operation is aimed, while
+    /// this one describes where the repository is kept.
+    pub repository_host: Option<String>,
     pub owner: Option<String>,
     pub repo: Option<String>,
     pub remote: Option<String>,
@@ -1073,6 +1078,7 @@ impl RuleContext {
     ) -> Self {
         Self {
             host: host.map(Into::into),
+            repository_host: None,
             owner: owner.map(Into::into),
             repo: repo.map(Into::into),
             remote: remote.map(Into::into),
@@ -1168,6 +1174,24 @@ pub fn rule_matches(rule: &Rule, context: &RuleContext) -> bool {
 
 fn glob_matches(pattern: &str, value: &str) -> bool {
     build_rule_glob(pattern).is_ok_and(|glob| glob.compile_matcher().is_match(value))
+}
+
+/// A default profile fills the gap left by rules that did not claim the
+/// repository; it does not claim every repository.  Falling back regardless of
+/// the remote would stamp a GitHub identity, signing key and credential policy
+/// onto a remote hosted elsewhere, so the fallback only applies when the forge
+/// hosting the repository is the one the profile targets.  A repository with
+/// no resolved host keeps the historical behaviour because nothing contradicts
+/// it.
+///
+/// Only `repository_host` is consulted.  A host that came from a `gh
+/// --hostname` target describes where an operation is aimed rather than where
+/// the repository lives; a mismatch there is a cross-host request the caller
+/// must reject loudly, not a reason to drop the profile silently.
+fn default_profile_applies(profile: &Profile, context: &RuleContext) -> bool {
+    context.repository_host.as_deref().is_none_or(|actual| {
+        crate::github::normalize_host(&profile.host) == crate::github::normalize_host(actual)
+    })
 }
 
 fn build_rule_glob(pattern: &str) -> Result<Glob, globset::Error> {
@@ -1297,15 +1321,23 @@ pub fn resolve_profile(
         };
     }
     if let Some(id) = config.behavior.default_profile.as_deref() {
-        if config.profiles.contains_key(id) {
-            return ProfileResolution {
-                profile: Some(id.to_owned()),
-                source: ResolutionSource::Default,
-                candidates: vec![id.to_owned()],
-                warnings,
-            };
+        if let Some(profile) = config.profiles.get(id) {
+            if default_profile_applies(profile, context) {
+                return ProfileResolution {
+                    profile: Some(id.to_owned()),
+                    source: ResolutionSource::Default,
+                    candidates: vec![id.to_owned()],
+                    warnings,
+                };
+            }
+            warnings.push(format!(
+                "default profile `{id}` not applied: repository host `{}` is not the profile host `{}`",
+                context.repository_host.as_deref().unwrap_or_default(),
+                profile.host
+            ));
+        } else {
+            warnings.push(format!("default profile `{id}` does not exist"));
         }
-        warnings.push(format!("default profile `{id}` does not exist"));
     }
     ProfileResolution {
         profile: None,
@@ -1553,6 +1585,105 @@ profile = "work"
         let binding = resolve_profile(&config, &context, None, Some("deleted"), None);
         assert_eq!(binding.profile, None);
         assert_eq!(binding.source, ResolutionSource::InvalidRepositoryBinding);
+    }
+
+    #[test]
+    fn default_profile_does_not_apply_to_a_remote_on_another_host() {
+        let mut config = Config::default();
+        config.profiles.insert("fallback".into(), profile());
+        config.behavior.default_profile = Some("fallback".into());
+        let mut context = RuleContext::new(
+            Some("git.example.com"),
+            Some("acme"),
+            Some("repo"),
+            Some("git@git.example.com:acme/repo.git"),
+            None::<PathBuf>,
+        );
+        context.repository_host = Some("git.example.com".into());
+
+        let resolution = resolve_profile(&config, &context, None, None, None);
+
+        assert_eq!(resolution.profile, None);
+        assert_eq!(resolution.source, ResolutionSource::Unresolved);
+        assert!(
+            resolution
+                .warnings
+                .iter()
+                .any(|warning| warning.contains("git.example.com")),
+            "warnings should name the skipped host: {:?}",
+            resolution.warnings
+        );
+    }
+
+    #[test]
+    fn a_gh_target_host_does_not_suppress_the_default_profile() {
+        let mut config = Config::default();
+        config.profiles.insert("fallback".into(), profile());
+        config.behavior.default_profile = Some("fallback".into());
+        // `gh --hostname other.example` sets `host`; the repository it runs in
+        // says nothing about the forge.  The profile must survive so the
+        // cross-host guard can reject the target instead of ghis quietly
+        // stepping aside and letting the request through unscoped.
+        let mut context = RuleContext::new(
+            Some("other.example"),
+            None::<String>,
+            None::<String>,
+            None::<String>,
+            None::<PathBuf>,
+        );
+        context.repository_host = None;
+
+        let resolution = resolve_profile(&config, &context, None, None, None);
+
+        assert_eq!(resolution.profile.as_deref(), Some("fallback"));
+        assert_eq!(resolution.source, ResolutionSource::Default);
+        assert!(resolution.warnings.is_empty());
+    }
+
+    #[test]
+    fn default_profile_still_applies_on_its_own_host_and_without_one() {
+        let mut config = Config::default();
+        config.profiles.insert("fallback".into(), profile());
+        config.behavior.default_profile = Some("fallback".into());
+
+        let mut github = RuleContext::new(
+            Some("GitHub.com"),
+            None::<String>,
+            None::<String>,
+            None::<String>,
+            None::<PathBuf>,
+        );
+        github.repository_host = Some("GitHub.com".into());
+        let resolution = resolve_profile(&config, &github, None, None, None);
+        assert_eq!(resolution.profile.as_deref(), Some("fallback"));
+        assert_eq!(resolution.source, ResolutionSource::Default);
+        assert!(resolution.warnings.is_empty());
+
+        let no_remote = RuleContext::default();
+        let resolution = resolve_profile(&config, &no_remote, None, None, None);
+        assert_eq!(resolution.profile.as_deref(), Some("fallback"));
+        assert_eq!(resolution.source, ResolutionSource::Default);
+    }
+
+    #[test]
+    fn explicit_and_rule_selected_profiles_still_supply_other_forges() {
+        let mut config = Config::default();
+        let mut gitlab = profile();
+        gitlab.host = "git.example.com".into();
+        gitlab.login = "acme".into();
+        config.profiles.insert("gitlab".into(), gitlab);
+        config.behavior.default_profile = Some("gitlab".into());
+        let context = RuleContext::new(
+            Some("git.example.com"),
+            Some("acme"),
+            Some("repo"),
+            None::<String>,
+            None::<PathBuf>,
+        );
+
+        let explicit = resolve_profile(&config, &context, Some("gitlab"), None, None);
+        assert_eq!(explicit.profile.as_deref(), Some("gitlab"));
+        assert_eq!(explicit.source, ResolutionSource::Explicit);
     }
 
     #[test]
