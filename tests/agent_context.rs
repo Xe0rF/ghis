@@ -193,9 +193,10 @@ fn json_identity_uses_forge_neutral_field_names() {
 
 #[test]
 fn schema_version_matches_the_constant_and_the_text_header() {
-    // Pin the value, not just its self-consistency: this payload renamed
-    // `github_host`/`github_login` to `host`/`login`, which is why it is 2.
-    assert_eq!(ghis::agent_context::AGENT_CONTEXT_SCHEMA_VERSION, 2);
+    // Pin the value, not just its self-consistency.  v2 renamed the identity
+    // fields; v3 renamed the `GithubLogin` selection source, which reaches both
+    // the JSON and the text output.
+    assert_eq!(ghis::agent_context::AGENT_CONTEXT_SCHEMA_VERSION, 3);
 
     let projected = AgentContext::from_app(&context(ResolutionSource::Explicit, Some("work")));
 
@@ -288,4 +289,27 @@ fn contract_text_reflects_the_active_forge_rather_than_only_github() {
             "{output}"
         );
     }
+}
+
+/// The selection source used to be reported as `github_login` even though the
+/// matcher is forge-agnostic: it compares the remote host and first path
+/// segment against every Profile, so it fires on any forge.
+#[test]
+fn unique_remote_login_source_is_reported_without_a_forge_name() {
+    let projected =
+        AgentContext::from_app(&context(ResolutionSource::UniqueRemoteLogin, Some("work")));
+    assert_eq!(
+        projected.selection.source.kind,
+        SelectionSourceKind::UniqueRemoteLogin
+    );
+    let json = projected.render_json().expect("json");
+    assert!(json.contains(r#""kind": "unique_remote_login""#), "{json}");
+    assert!(!json.contains("github_login"), "{json}");
+    assert!(
+        projected
+            .render_codex()
+            .contains("source=unique_remote_login"),
+        "{}",
+        projected.render_codex()
+    );
 }

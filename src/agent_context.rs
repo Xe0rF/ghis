@@ -10,7 +10,7 @@ use crate::config::ResolutionSource;
 use serde::Serialize;
 use std::fmt::Write as _;
 
-pub const AGENT_CONTEXT_SCHEMA_VERSION: u32 = 2;
+pub const AGENT_CONTEXT_SCHEMA_VERSION: u32 = 3;
 
 /// Rules that hold whatever forge the selected Profile targets.
 ///
@@ -114,7 +114,7 @@ pub enum SelectionSourceKind {
     Explicit,
     RepositoryBinding,
     Rule,
-    GithubLogin,
+    UniqueRemoteLogin,
     Default,
     Unresolved,
     Ambiguous,
@@ -329,7 +329,9 @@ impl From<&ResolutionSource> for SelectionSource {
                 rule_id: Some(id.clone()),
                 priority: Some(*priority),
             },
-            ResolutionSource::GithubLogin => Self::new(SelectionSourceKind::GithubLogin),
+            ResolutionSource::UniqueRemoteLogin => {
+                Self::new(SelectionSourceKind::UniqueRemoteLogin)
+            }
             ResolutionSource::Default => Self::new(SelectionSourceKind::Default),
             ResolutionSource::Unresolved => Self::new(SelectionSourceKind::Unresolved),
             ResolutionSource::Ambiguous => Self::new(SelectionSourceKind::Ambiguous),
@@ -384,7 +386,7 @@ impl SelectionSourceKind {
             Self::Explicit => "explicit",
             Self::RepositoryBinding => "repository_binding",
             Self::Rule => "rule",
-            Self::GithubLogin => "github_login",
+            Self::UniqueRemoteLogin => "unique_remote_login",
             Self::Default => "default",
             Self::Unresolved => "unresolved",
             Self::Ambiguous => "ambiguous",

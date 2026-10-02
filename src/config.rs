@@ -1343,7 +1343,7 @@ pub enum ResolutionSource {
     RepositoryBinding,
     InvalidRepositoryBinding,
     Rule { id: String, priority: i32 },
-    GithubLogin,
+    UniqueRemoteLogin,
     Default,
     Unresolved,
     Ambiguous,
@@ -1366,7 +1366,7 @@ pub fn resolve_profile(
     context: &RuleContext,
     explicit: Option<&str>,
     repository_binding: Option<&str>,
-    github_login_match: Option<&str>,
+    remote_login_match: Option<&str>,
 ) -> ProfileResolution {
     let mut warnings = Vec::new();
     if let Some(id) = explicit {
@@ -1432,12 +1432,12 @@ pub fn resolve_profile(
         }
         RuleResolution::None => {}
     }
-    if let Some(id) = github_login_match
+    if let Some(id) = remote_login_match
         && config.profiles.contains_key(id)
     {
         return ProfileResolution {
             profile: Some(id.to_owned()),
-            source: ResolutionSource::GithubLogin,
+            source: ResolutionSource::UniqueRemoteLogin,
             candidates: vec![id.to_owned()],
             warnings,
         };

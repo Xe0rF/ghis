@@ -165,7 +165,7 @@ impl AppContext {
             .map(|target| target.context.clone())
             .unwrap_or(repository_context);
         context.cwd = Some(cwd);
-        let github_match = if target.is_some() {
+        let remote_login_match = if target.is_some() {
             unique_profile_for_target(&config, context.host.as_deref(), context.owner.as_deref())
         } else {
             repository_match
@@ -177,7 +177,7 @@ impl AppContext {
             &context,
             explicit,
             target.is_none().then_some(binding.as_deref()).flatten(),
-            github_match.as_deref(),
+            remote_login_match.as_deref(),
         );
         warnings.extend(resolution.warnings.clone());
         if matches!(
@@ -952,7 +952,7 @@ fn resolution_source_name(source: &ResolutionSource) -> String {
         ResolutionSource::RepositoryBinding => "repository-binding",
         ResolutionSource::InvalidRepositoryBinding => "invalid-repository-binding",
         ResolutionSource::Rule { .. } => "rule",
-        ResolutionSource::GithubLogin => "github-login",
+        ResolutionSource::UniqueRemoteLogin => "unique-remote-login",
         ResolutionSource::Default => "default",
         ResolutionSource::Unresolved => "unresolved",
         ResolutionSource::Ambiguous => "ambiguous",
