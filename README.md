@@ -4,7 +4,33 @@
 
 默认使用 HTTPS。ghis 不调用 `gh auth switch`，不保存 GitHub token，不改写 remote，也不修改全局 `user.name` 或 `user.email`。
 
-身份、凭据或签名策略无法确认时，操作会停止，不会静默切换账号。完整边界见 [Wiki：安全边界](https://github.com/Xe0rF/ghis/wiki/Security-Boundaries)。
+身份、凭据或签名策略无法确认时，操作会停止，不会静默切换账号。Profile 可以把凭据交给 ghis 管理，也可以声明由用户自己负责。完整边界见 [Wiki：安全边界](https://github.com/Xe0rF/ghis/wiki/Security-Boundaries)。
+
+## 凭据模式
+
+`credential_mode` 决定 HTTPS 传输的凭据由谁提供。身份与签名不受它影响，三种模式下都由 ghis 管理。
+
+| 模式 | ghis 写入凭据配置 | token 来源 | 适用 |
+| --- | --- | --- | --- |
+| `manage`（默认） | 写入，并先清空继承链 | `gh auth token` | GitHub 与 GitHub Enterprise |
+| `passthrough` | 不写入，保留继承链 | 不参与 | 传输层交给 SSH 或你自己的 helper |
+| `command` | 写入，并先清空继承链 | 你指定的命令 | 其他 forge，或同一 forge 的多账号 |
+
+省略该字段等同于 `manage`，配置文件不会因此多出一行。
+
+`passthrough` 是一次显式的责任转移：该仓库的凭据由你负责，`ghis` 不参与，也不会因为取不到凭据而中止。它会在联网操作前提示一次。
+
+`command` 模式的命令以 argv 形式给出，不经过 shell：
+
+```sh
+ghis profile add gitlab \
+  --host git.example.test --login frez79 --name frez79 --email you@example.test \
+  --credential-mode command \
+  --credential-command 'op,read,op://Private/GitLab/frez79/credential' \
+  --credential-username oauth2
+```
+
+命令输出即 token，去除首尾空白后由 ghis 配上 username 返回给 Git。命令失败或无输出时，ghis 与 `manage` 一样停止凭据查询，不会回退到终端提示。命令中不要写入 token 本身，它属于外部凭据存储。
 
 ## 安装
 
