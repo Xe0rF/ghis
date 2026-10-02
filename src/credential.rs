@@ -160,7 +160,10 @@ pub struct CredentialProfile {
 }
 
 impl CredentialProfile {
-    /// The `gh`-backed profile every existing configuration describes.
+    /// The `manage` profile: ghis resolves the token through `gh`.
+    ///
+    /// `host` is still free-form; a GHES instance uses this just like
+    /// github.com does.
     pub fn gh(host: String, login: String) -> Self {
         Self {
             username: login.clone(),

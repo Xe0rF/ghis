@@ -397,7 +397,10 @@ pub enum CredentialMode {
     Command,
 }
 
-/// A GitHub/Git commit identity.
+/// A commit identity, plus the forge settings a repository on that forge needs.
+///
+/// `host` is not limited to GitHub: a Profile may target any forge, and the
+/// `credential_mode` field decides how that forge's transport is authenticated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Profile {
@@ -1300,11 +1303,11 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
 
 /// A default profile fills the gap left by rules that did not claim the
 /// repository; it does not claim every repository.  Falling back regardless of
-/// the remote would stamp a GitHub identity, signing key and credential policy
-/// onto a remote hosted elsewhere, so the fallback only applies when the forge
-/// hosting the repository is the one the profile targets.  A repository with
-/// no resolved host keeps the historical behaviour because nothing contradicts
-/// it.
+/// the remote would stamp one forge's identity, signing key and credential
+/// policy onto a repository hosted elsewhere, so the fallback applies only when
+/// the forge hosting the repository is the one the profile targets.  A
+/// repository with no resolved host keeps the historical behaviour because
+/// nothing contradicts it.
 ///
 /// Only `repository_host` is consulted.  A host that came from a `gh
 /// --hostname` target describes where an operation is aimed rather than where
@@ -1360,7 +1363,7 @@ pub struct ProfileResolution {
 }
 
 /// Apply the documented precedence: explicit, repository binding, rule,
-/// unique GitHub login, then default profile.
+/// unique remote login, then default profile.
 pub fn resolve_profile(
     config: &Config,
     context: &RuleContext,

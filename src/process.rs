@@ -269,7 +269,7 @@ pub enum ProcessError {
     Wait { command: String, source: io::Error },
 }
 
-/// Abstraction used by app, GitHub and credential code.
+/// Abstraction used by the app, the gh adapter, and credential commands.
 pub trait CommandRunner: Send + Sync {
     /// Capture stdout/stderr and return even for non-zero statuses.
     fn run(&self, command: &CommandSpec) -> Result<CommandOutput, ProcessError>;

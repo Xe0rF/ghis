@@ -182,8 +182,12 @@ pub fn discover(path: impl AsRef<Path>) -> Result<Repository> {
     })
 }
 
-/// A parsed remote URL.  `owner` and `repo` are populated for the normal
-/// GitHub `owner/repository` shape and left `None` for other providers.
+/// A parsed remote URL.
+///
+/// `owner` and `repo` come from the first two path segments, which is the
+/// `owner/repository` shape every major forge uses.  They are populated for
+/// non-GitHub remotes too; a URL with fewer than two segments leaves them
+/// `None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Remote {
     pub name: String,
@@ -1092,7 +1096,7 @@ pub fn parse_remote(name: impl Into<String>, url: impl Into<String>) -> Remote {
     let name = name.into();
     let url = url.into();
     let (transport, host, path) = parse_url_parts(&url);
-    let (owner, repo) = github_path_parts(path.as_deref());
+    let (owner, repo) = remote_path_parts(path.as_deref());
     Remote {
         name,
         url,
@@ -1175,7 +1179,7 @@ fn split_scp_remote(url: &str) -> Option<(&str, &str)> {
     url.split_once(':')
 }
 
-fn github_path_parts(path: Option<&str>) -> (Option<String>, Option<String>) {
+fn remote_path_parts(path: Option<&str>) -> (Option<String>, Option<String>) {
     let path = path.unwrap_or_default().trim_matches('/');
     let mut it = path.split('/').filter(|part| !part.is_empty());
     let owner = it.next().map(str::to_owned);
