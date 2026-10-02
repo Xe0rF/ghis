@@ -697,10 +697,14 @@ esac
         .expect("git config diagnostics");
 
     assert!(diagnostics.iter().all(|item| item["key"] != "user.name"));
+    // The identity is now read with the selected Profile's fragment applied, so
+    // an unbound repository no longer looks like a conflict.  Reporting one
+    // would be the old bug: comparing against an identity no commit carries.
     assert!(
         diagnostics
             .iter()
-            .any(|item| item["key"] == "effective.author")
+            .all(|item| item["key"] != "effective.author"),
+        "doctor reported a conflict against an identity git would not use: {diagnostics:?}"
     );
 
     let helpers = diagnostics

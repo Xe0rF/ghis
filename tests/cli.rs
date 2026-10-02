@@ -4791,3 +4791,104 @@ fn credential_mode_flags_round_trip_through_the_config_file() {
         "a rejected edit must not partially apply: {written}"
     );
 }
+
+/// `ghis status` exists to answer "which identity will my commit carry".
+/// Reading the identity without the Profile's fragment answered a different
+/// question: an unbound repository reported `~/.gitconfig` while its commits
+/// used the Profile.  Cover both sides so they cannot drift apart again.
+#[test]
+fn status_reports_the_identity_an_unbound_commit_would_carry() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let config_home = temp.path().join("config");
+    let ghis_config = config_home.join("ghis/config.toml");
+    fs::create_dir_all(ghis_config.parent().expect("config parent")).expect("config directory");
+    fs::write(
+        &ghis_config,
+        r#"version = 1
+
+[behavior]
+default_profile = "flowecho"
+
+[profiles.flowecho]
+host = "git.example.test"
+login = "worker"
+git_name = "Flowecho Identity"
+git_email = "35-worker@users.noreply.git.example.test"
+credential_mode = "passthrough"
+"#,
+    )
+    .expect("ghis config");
+
+    let repository = temp.path().join("repo");
+    fs::create_dir_all(&repository).expect("repository");
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .arg(&repository)
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "git@git.example.test:worker/repo.git"
+            ])
+            .current_dir(&repository)
+            .status()
+            .unwrap()
+            .success()
+    );
+    // A global identity that disagrees with the Profile, so reading it would
+    // be visible.
+    let global = temp.path().join("global.gitconfig");
+    fs::write(
+        &global,
+        "[user]\n\tname = Global Identity\n\temail = global@example.test\n",
+    )
+    .expect("global config");
+
+    let run = |args: &[&str]| {
+        let mut command = isolated_ghis_command();
+        command
+            .current_dir(&repository)
+            .args(args)
+            .env("GIT_CONFIG_GLOBAL", &global)
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0");
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.output().expect("run ghis")
+    };
+
+    let status = run(&["status", "--json"]);
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&status.stdout).expect("status JSON");
+    assert_eq!(report["profile"], "flowecho");
+    assert_eq!(report["author"]["name"], "Flowecho Identity");
+    assert_eq!(
+        report["author"]["email"],
+        "35-worker@users.noreply.git.example.test"
+    );
+
+    // The commit identity ghis would use, read back through the wrapper.
+    let ident = run(&["git", "--", "var", "GIT_AUTHOR_IDENT"]);
+    assert!(
+        ident.status.success(),
+        "{}",
+        String::from_utf8_lossy(&ident.stderr)
+    );
+    let ident = String::from_utf8_lossy(&ident.stdout);
+    assert!(
+        ident.contains("Flowecho Identity <35-worker@users.noreply.git.example.test>"),
+        "status and the commit identity disagree: {ident}"
+    );
+}

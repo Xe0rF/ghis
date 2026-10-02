@@ -116,16 +116,13 @@ impl AppContext {
     ) -> Result<Self> {
         let cwd = std::path::absolute(cwd.as_ref())?;
         let mut warnings = Vec::new();
-        let (repository, remote, binding, identities) = match repo::discover(&cwd) {
+        let (repository, remote, binding) = match repo::discover(&cwd) {
             Ok(repository) => {
                 let remote = repo::primary_remote(&repository)?;
                 let binding = repo::local_config(&repository, PROFILE_CONFIG_KEY)?;
-                let identities = inspect_identities
-                    .then(|| git::effective_identities(&repository).ok())
-                    .flatten();
-                (Some(repository), remote, binding, identities)
+                (Some(repository), remote, binding)
             }
-            Err(RepoError::NotRepository { .. }) => (None, None, None, None),
+            Err(RepoError::NotRepository { .. }) => (None, None, None),
             Err(error) => return Err(error.into()),
         };
         let (repository_context, repository_match) = if let Some(remote) = remote.as_ref() {
@@ -203,6 +200,21 @@ impl AppContext {
             .profile
             .as_deref()
             .and_then(|id| config.profiles.get(id).cloned());
+        // Read the identities only now that the Profile is known.  An unbound
+        // repository has no fragment on disk, so without the `-c include.path`
+        // the wrapper would use, this would report the global identity instead
+        // of the one a commit would actually carry.
+        let identities = match (inspect_identities, repository.as_ref(), &profile) {
+            (true, Some(repository), Some(profile)) => {
+                let overrides = resolution
+                    .profile
+                    .as_deref()
+                    .map(|id| identity_overrides(&paths, id, profile, binding.is_some()))
+                    .unwrap_or_default();
+                git::effective_identities(repository, &overrides).ok()
+            }
+            _ => None,
+        };
         Ok(Self {
             paths,
             config,
@@ -297,6 +309,28 @@ fn unique_profile_for_target(
         .map(|(id, _)| id.clone());
     let first = matches.next()?;
     matches.next().is_none().then_some(first)
+}
+
+/// The `-c` overrides that make Git resolve the same identity the wrapper
+/// would use for the next command.
+///
+/// A bound repository already carries `includeIf.gitdir` pointing at its
+/// fragment, so it needs nothing.  An unbound one gets the fragment the same
+/// way `run_git` does.  If the fragment cannot be produced, fall back to no
+/// override rather than reporting an identity no commit would carry.
+fn identity_overrides(
+    paths: &ConfigPaths,
+    profile_id: &str,
+    profile: &Profile,
+    bound: bool,
+) -> Vec<String> {
+    if bound {
+        return Vec::new();
+    }
+    match write_profile_fragment(paths, profile_id, profile) {
+        Ok(fragment) => vec![format!("include.path={}", fragment.display())],
+        Err(_) => Vec::new(),
+    }
 }
 
 pub fn profile_fragment_path(paths: &ConfigPaths, profile_id: &str) -> PathBuf {

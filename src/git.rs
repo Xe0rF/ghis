@@ -120,14 +120,34 @@ impl EffectiveIdentities {
 
 /// Read the identity Git will actually use, including environment and `-c`
 /// overrides.  This is preferable to inspecting config files directly.
-pub fn effective_identities(repository: &Repository) -> Result<EffectiveIdentities> {
-    let author = identity_from_git_var(repository, "GIT_AUTHOR_IDENT")?;
-    let committer = identity_from_git_var(repository, "GIT_COMMITTER_IDENT")?;
+/// Read the identities Git would use, applying the same `-c` overrides the
+/// wrapper applies to the command it forwards.
+///
+/// Without them an unbound repository reports whatever `~/.gitconfig` holds
+/// while its commits actually use the Profile's fragment, so `ghis status`
+/// would answer a different question than the one the user is asking.
+pub fn effective_identities(
+    repository: &Repository,
+    overrides: &[String],
+) -> Result<EffectiveIdentities> {
+    let author = identity_from_git_var(repository, "GIT_AUTHOR_IDENT", overrides)?;
+    let committer = identity_from_git_var(repository, "GIT_COMMITTER_IDENT", overrides)?;
     Ok(EffectiveIdentities { author, committer })
 }
 
-pub fn identity_from_git_var(repository: &Repository, variable: &str) -> Result<GitIdentity> {
-    let out = run_git(repository.command_dir(), ["var", variable])?;
+pub fn identity_from_git_var(
+    repository: &Repository,
+    variable: &str,
+    overrides: &[String],
+) -> Result<GitIdentity> {
+    let mut args: Vec<String> = Vec::with_capacity(overrides.len() * 2 + 2);
+    for item in overrides {
+        args.push("-c".into());
+        args.push(item.clone());
+    }
+    args.push("var".into());
+    args.push(variable.into());
+    let out = run_git(repository.command_dir(), &args)?;
     if !out.status.success() {
         return Err(command_error(format!("var {variable}"), &out));
     }
