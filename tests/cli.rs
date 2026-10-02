@@ -4688,3 +4688,100 @@ printf 'fallback-secret\n'
         "缺失显式配置时 credential helper 不得调用 gh"
     );
 }
+
+#[test]
+fn credential_mode_flags_round_trip_through_the_config_file() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let config_directory = temp.path().join("config/ghis");
+    fs::create_dir_all(&config_directory).expect("config directory");
+    let config_file = config_directory.join("config.toml");
+    fs::write(&config_file, "version = 1\n").expect("config");
+
+    let mut add = isolated_ghis_command();
+    add.args([
+        "profile",
+        "add",
+        "gitlab",
+        "--host",
+        "git.example.test",
+        "--login",
+        "frez79",
+        "--name",
+        "frez79",
+        "--email",
+        "frez79@example.test",
+        "--credential-mode",
+        "passthrough",
+    ]);
+    for (key, value) in xdg_environment(&temp) {
+        add.env(key, value);
+    }
+    add.assert().success();
+
+    let written = fs::read_to_string(&config_file).expect("read config");
+    assert!(
+        written.contains(r#"credential_mode = "passthrough""#),
+        "{written}"
+    );
+    assert!(
+        !written.contains("credential_command"),
+        "passthrough must not gain a command: {written}"
+    );
+
+    let mut edit = isolated_ghis_command();
+    edit.args([
+        "profile",
+        "edit",
+        "gitlab",
+        "--credential-mode",
+        "command",
+        "--credential-command",
+        "op,read,op://Private/GitLab/frez79/credential",
+        "--credential-username",
+        "oauth2",
+    ]);
+    for (key, value) in xdg_environment(&temp) {
+        edit.env(key, value);
+    }
+    edit.assert().success();
+
+    let written = fs::read_to_string(&config_file).expect("read config");
+    assert!(
+        written.contains(r#"credential_mode = "command""#),
+        "{written}"
+    );
+    assert!(
+        written.contains("op://Private/GitLab/frez79/credential"),
+        "{written}"
+    );
+    assert!(
+        written.contains(r#"credential_username = "oauth2""#),
+        "{written}"
+    );
+
+    let mut show = isolated_ghis_command();
+    show.args(["profile", "show", "gitlab"]);
+    for (key, value) in xdg_environment(&temp) {
+        show.env(key, value);
+    }
+    show.assert()
+        .success()
+        .stdout(predicate::str::contains("凭据模式：command"))
+        .stdout(predicate::str::contains(
+            "取件命令：op read op://Private/GitLab/frez79/credential",
+        ));
+
+    let mut clear = isolated_ghis_command();
+    clear.args(["profile", "edit", "gitlab", "--clear-credential-command"]);
+    for (key, value) in xdg_environment(&temp) {
+        clear.env(key, value);
+    }
+    // The command is gone while the mode still says `command`, so validation
+    // must refuse rather than save a profile that cannot resolve anything.
+    clear.assert().failure();
+    let written = fs::read_to_string(&config_file).expect("read config");
+    assert!(
+        written.contains(r#"credential_mode = "command""#),
+        "a rejected edit must not partially apply: {written}"
+    );
+}

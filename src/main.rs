@@ -3,8 +3,9 @@ use fd_lock::RwLock;
 use ghis::agent_context::{AgentContext, AgentContextFormat};
 use ghis::app::{self, AppContext};
 use ghis::config::{
-    Config, ConfigPaths, CredentialFailurePolicy, DisplayIdentity, Profile, ResolutionSource, Rule,
-    SigningProfile, SigningTransport, SshMode, SshProfile, SshUnmanagedPolicy, UnresolvedPolicy,
+    Config, ConfigPaths, CredentialFailurePolicy, CredentialMode, DisplayIdentity, Profile,
+    ResolutionSource, Rule, SigningProfile, SigningTransport, SshMode, SshProfile,
+    SshUnmanagedPolicy, UnresolvedPolicy,
 };
 use ghis::{credential, diagnostics, github, platform, shell, signing};
 use serde::Serialize;
@@ -408,6 +409,15 @@ struct ProfileArgs {
     /// SSH signing agent source; forwarded-agent uses only SSH_AUTH_SOCK.
     #[arg(long, value_enum, default_value_t = SigningTransportArg::LocalAgent)]
     signing_transport: SigningTransportArg,
+    /// Who supplies the HTTPS credential: manage、passthrough 或 command。
+    #[arg(long, value_enum, default_value_t = CredentialModeArg::Manage)]
+    credential_mode: CredentialModeArg,
+    /// 取得 token 的命令，逗号分隔的 argv；仅 `command` 模式使用
+    #[arg(long = "credential-command", value_delimiter = ',')]
+    credential_command: Option<Vec<String>>,
+    /// HTTP Basic 使用的 username；缺省使用 login
+    #[arg(long)]
+    credential_username: Option<String>,
 }
 
 #[derive(Debug, Args)]
@@ -479,6 +489,35 @@ struct ProfileEditArgs {
     /// SSH signing agent source; forwarded-agent uses only SSH_AUTH_SOCK.
     #[arg(long, value_enum)]
     signing_transport: Option<SigningTransportArg>,
+    /// Who supplies the HTTPS credential: manage、passthrough 或 command。
+    #[arg(long, value_enum)]
+    credential_mode: Option<CredentialModeArg>,
+    /// 取得 token 的命令，逗号分隔的 argv；仅 `command` 模式使用
+    #[arg(long = "credential-command", value_delimiter = ',')]
+    credential_command: Option<Vec<String>>,
+    /// 清除 credential_command
+    #[arg(long, conflicts_with = "credential_command")]
+    clear_credential_command: bool,
+    /// HTTP Basic 使用的 username；缺省使用 login
+    #[arg(long)]
+    credential_username: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CredentialModeArg {
+    Manage,
+    Passthrough,
+    Command,
+}
+
+impl From<CredentialModeArg> for CredentialMode {
+    fn from(value: CredentialModeArg) -> Self {
+        match value {
+            CredentialModeArg::Manage => CredentialMode::Manage,
+            CredentialModeArg::Passthrough => CredentialMode::Passthrough,
+            CredentialModeArg::Command => CredentialMode::Command,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum, Default)]
@@ -1567,6 +1606,22 @@ fn profile_details(id: &str, profile: &Profile) -> String {
             }
         ));
     }
+    let credential_mode = profile.credential_mode();
+    if credential_mode != CredentialMode::Manage {
+        lines.push(format!(
+            "凭据模式：{}",
+            match credential_mode {
+                CredentialMode::Manage => "manage",
+                CredentialMode::Passthrough => "passthrough",
+                CredentialMode::Command => "command",
+            }
+        ));
+    }
+    if credential_mode == CredentialMode::Command
+        && let Some(command) = profile.credential_command.as_ref()
+    {
+        lines.push(format!("取件命令：{}", command.join(" ")));
+    }
     lines.join("\n")
 }
 
@@ -1630,9 +1685,10 @@ fn profile_from_args(args: ProfileArgs, git_email: String) -> Profile {
             fingerprint: args.signing_fingerprint,
             program: args.signing_program,
         },
-        credential_mode: None,
-        credential_command: None,
-        credential_username: None,
+        credential_mode: (args.credential_mode != CredentialModeArg::Manage)
+            .then(|| CredentialMode::from(args.credential_mode)),
+        credential_command: args.credential_command,
+        credential_username: args.credential_username,
     }
 }
 
@@ -1704,6 +1760,19 @@ fn update_profile_from_args(profile: &mut Profile, args: ProfileEditArgs) {
     }
     if let Some(transport) = args.signing_transport {
         profile.signing.transport = transport.into();
+    }
+
+    if let Some(mode) = args.credential_mode {
+        profile.credential_mode =
+            (mode != CredentialModeArg::Manage).then(|| CredentialMode::from(mode));
+    }
+    if args.clear_credential_command {
+        profile.credential_command = None;
+    } else if let Some(command) = args.credential_command {
+        profile.credential_command = Some(command);
+    }
+    if let Some(username) = args.credential_username {
+        profile.credential_username = Some(username);
     }
 }
 
