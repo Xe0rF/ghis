@@ -151,33 +151,57 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stdout_is_trimmed_before_becoming_the_token() {
-        let dir = tempfile::tempdir().expect("temp dir");
-        let script = dir.path().join("token.sh");
-        std::fs::write(&script, "#!/bin/sh\nprintf '  secret-token\\n'\n").expect("write");
+    /// Write a stub that emits `stdout` and `stderr`, then exits with `status`,
+    /// and return the argv that runs it.
+    ///
+    /// Windows cannot execute a shebang script, so the stub is a `.cmd` file
+    /// launched through `cmd /c`; both spellings emit the same bytes. Callers
+    /// keep the argv opaque so the credential path stays argv-only here too.
+    /// Payloads must stay free of quotes and `%`, which neither shell reads
+    /// literally out of the assignment.
+    fn stub(dir: &std::path::Path, stdout: &str, stderr: &str, status: i32) -> Vec<String> {
+        #[cfg(unix)]
+        let (name, body) = (
+            "stub.sh",
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{stdout}'\nprintf '%s' '{stderr}' >&2\nexit {status}\n"
+            ),
+        );
+        #[cfg(windows)]
+        let (name, body) = (
+            "stub.cmd",
+            format!(
+                "@echo off\r\n<nul set /p \"={stdout}\"\r\n<nul set /p \"={stderr}\" 1>&2\r\nexit /b {status}\r\n"
+            ),
+        );
+        let path = dir.join(name);
+        std::fs::write(&path, body).expect("write stub");
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
         }
-        let token = run(&[script.to_string_lossy().into_owned()]).expect("token");
+        let program = path.to_string_lossy().into_owned();
+        // Windows cannot run the stub as a bare program, so it goes through
+        // the interpreter the way a user's own `credential_command` would.
+        #[cfg(windows)]
+        let argv = vec!["cmd".to_string(), "/c".to_string(), program];
+        #[cfg(unix)]
+        let argv = vec![program];
+        argv
+    }
+
+    #[test]
+    fn stdout_is_trimmed_before_becoming_the_token() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let token = run(&stub(dir.path(), "  secret-token", "", 0)).expect("token");
         assert_eq!(token.as_str(), Some("secret-token"));
     }
 
     #[test]
     fn a_failing_command_reports_its_status_and_stderr() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let script = dir.path().join("fail.sh");
-        std::fs::write(&script, "#!/bin/sh\necho boom >&2\nexit 7\n").expect("write");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-        }
-        let error = run(&[script.to_string_lossy().into_owned()]).expect_err("must fail");
+        let error = run(&stub(dir.path(), "", "boom", 7)).expect_err("must fail");
         let rendered = error.to_string();
         assert!(rendered.contains("boom"), "{rendered}");
         assert!(!rendered.contains("secret"), "{rendered}");
@@ -186,15 +210,7 @@ mod tests {
     #[test]
     fn silent_output_is_not_a_valid_token() {
         let dir = tempfile::tempdir().expect("temp dir");
-        let script = dir.path().join("empty.sh");
-        std::fs::write(&script, "#!/bin/sh\nexit 0\n").expect("write");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
-                .expect("chmod");
-        }
-        let error = run(&[script.to_string_lossy().into_owned()]).expect_err("must fail");
+        let error = run(&stub(dir.path(), "", "", 0)).expect_err("must fail");
         assert!(matches!(error, CommandError::EmptyOutput { .. }), "{error}");
     }
 }
