@@ -3893,6 +3893,10 @@ mod tests {
         );
     }
 
+    // Binds a real repository through the same fragment and credential-helper
+    // path as the worktree and fragment tests around it, so it shares their
+    // platform scope.
+    #[cfg(unix)]
     #[test]
     fn a_passthrough_binding_writes_no_credential_helper() {
         let temp = tempdir().expect("temporary directory");

@@ -365,7 +365,6 @@ impl Lookup for ProfileLookup {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use std::io::Cursor;
 
     struct FakeLookup;
@@ -472,6 +471,7 @@ mod tests {
     /// Write an executable POSIX script and return its path as an argv element.
     #[cfg(unix)]
     fn script(dir: &std::path::Path, name: &str, body: &str) -> String {
+        use std::fs;
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join(name);
         fs::write(&path, body).expect("write script");
