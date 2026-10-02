@@ -848,7 +848,7 @@ pub struct StatusReport {
     pub resolution_source: String,
     pub author: Option<IdentityReport>,
     pub committer: Option<IdentityReport>,
-    pub github: Option<GithubReport>,
+    pub forge: Option<ForgeReport>,
     pub transport: Option<String>,
     pub signing: Option<SigningReport>,
     pub warnings: Vec<String>,
@@ -861,7 +861,7 @@ pub struct IdentityReport {
 }
 
 #[derive(Debug, Clone, Serialize)]
-pub struct GithubReport {
+pub struct ForgeReport {
     pub host: String,
     pub login: String,
 }
@@ -898,8 +898,8 @@ impl StatusReport {
                 )
             })
             .unwrap_or((None, None));
-        let github = ctx.profile.as_ref().map(|profile| GithubReport {
-            host: profile.host.clone(),
+        let forge = ctx.profile.as_ref().map(|profile| ForgeReport {
+            host: crate::git::normalize_host(&profile.host),
             login: profile.login.clone(),
         });
         let signing = ctx.profile.as_ref().map(|profile| SigningReport {
@@ -918,7 +918,7 @@ impl StatusReport {
             resolution_source: resolution_source_name(&ctx.resolution.source),
             author,
             committer,
-            github,
+            forge,
             transport: ctx
                 .remote
                 .as_ref()

@@ -23,7 +23,7 @@ pub mod shell;
 pub mod signing;
 pub mod state;
 
-pub const SCHEMA_VERSION: u32 = 1;
+pub const SCHEMA_VERSION: u32 = 2;
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 pub const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),

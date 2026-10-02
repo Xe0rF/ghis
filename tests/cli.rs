@@ -465,8 +465,14 @@ fn status_redacted_json_preserves_shape_and_identity_but_hides_paths_and_control
     assert_same_json_shape(&default, &redacted_value);
     assert_eq!(redacted_value["schema_version"], default["schema_version"]);
     assert_eq!(redacted_value["profile"], "personal");
-    assert_eq!(redacted_value["github"]["host"], "github.com");
-    assert_eq!(redacted_value["github"]["login"], "alice");
+    assert_eq!(redacted_value["forge"]["host"], "github.com");
+    assert_eq!(redacted_value["forge"]["login"], "alice");
+    // The report names the forge a Profile targets, which may not be GitHub;
+    // a key called `github` would be wrong for every other host.
+    assert!(
+        redacted_value.get("github").is_none(),
+        "the GitHub-only key came back: {redacted_value}"
+    );
     assert_eq!(redacted_value["repository"], "<路径已隐藏>");
 }
 
