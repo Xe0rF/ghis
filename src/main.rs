@@ -7,7 +7,7 @@ use ghis::config::{
     ResolutionSource, Rule, SigningProfile, SigningTransport, SshMode, SshProfile,
     SshUnmanagedPolicy, UnresolvedPolicy,
 };
-use ghis::{credential, diagnostics, github, platform, shell, signing};
+use ghis::{credential, diagnostics, git, github, platform, shell, signing};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -1272,7 +1272,7 @@ fn apply_onboarding(
     draft: ghis::onboarding::Draft,
 ) -> app::Result<i32> {
     let profile = Profile {
-        host: github::normalize_host(&draft.host),
+        host: git::normalize_host(&draft.host),
         login: draft.login.clone(),
         git_name: draft.git_name.clone(),
         git_email: draft.git_email.clone(),
@@ -1663,7 +1663,7 @@ fn profile_from_args(args: ProfileArgs, git_email: String) -> Profile {
         SshModeArg::Managed => SshMode::Managed,
     };
     Profile {
-        host: github::normalize_host(&args.host),
+        host: git::normalize_host(&args.host),
         login: args.login,
         git_name: args.git_name,
         git_email,
@@ -1694,7 +1694,7 @@ fn profile_from_args(args: ProfileArgs, git_email: String) -> Profile {
 
 fn update_profile_from_args(profile: &mut Profile, args: ProfileEditArgs) {
     if let Some(host) = args.host {
-        profile.host = github::normalize_host(&host);
+        profile.host = git::normalize_host(&host);
     }
     if let Some(login) = args.login {
         profile.login = login;

@@ -11,8 +11,8 @@
 //! produces an error; the caller turns that into `quit=true` so Git stops
 //! asking rather than falling through to an interactive prompt.
 
-use crate::github::SecretToken;
 use crate::process::{CommandRunner, CommandSpec, ProcessError, SystemCommandRunner};
+use crate::secret::SecretToken;
 use std::fmt;
 
 #[derive(Debug)]

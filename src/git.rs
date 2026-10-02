@@ -532,8 +532,47 @@ pub fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// Canonical form of a network host, used for every host comparison in ghis.
+///
+/// Forge-agnostic on purpose: profiles may target any host, so this must not
+/// live in the GitHub CLI adapter.
 pub fn normalize_host(host: &str) -> String {
-    crate::github::normalize_host(host)
+    let host = host.trim();
+    if let Some(address) = host.strip_prefix('[')
+        && let Some((address, suffix)) = address.split_once(']')
+    {
+        let address = address.to_ascii_lowercase();
+        return match normalized_port(suffix.strip_prefix(':')) {
+            Some(None) => format!("[{address}]"),
+            Some(Some(port)) => format!("[{address}]:{port}"),
+            None if suffix.is_empty() => format!("[{address}]"),
+            None => host.to_ascii_lowercase(),
+        };
+    }
+
+    // A colon inside the left side denotes an unbracketed IPv6 literal, not a
+    // hostname/port separator. URL authorities use brackets for IPv6 ports.
+    if let Some((hostname, port)) = host.rsplit_once(':')
+        && !hostname.contains(':')
+        && let Some(port) = normalized_port(Some(port))
+    {
+        let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
+        return port.map_or(hostname.clone(), |port| format!("{hostname}:{port}"));
+    }
+
+    if host.contains(':') {
+        host.to_ascii_lowercase()
+    } else {
+        host.trim_end_matches('.').to_ascii_lowercase()
+    }
+}
+
+/// `None` means the suffix is not a valid numeric port. `Some(None)` is the
+/// canonical HTTPS port and is therefore omitted from host identity keys.
+fn normalized_port(port: Option<&str>) -> Option<Option<u16>> {
+    let port = port?;
+    let port = port.parse::<u16>().ok()?;
+    Some((port != 443).then_some(port))
 }
 
 pub fn run_git<I, S>(dir: &Path, args: I) -> std::io::Result<Output>

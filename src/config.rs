@@ -1264,7 +1264,7 @@ pub fn resolve_rule(rules: &[Rule], context: &RuleContext) -> RuleResolution {
 pub fn rule_matches(rule: &Rule, context: &RuleContext) -> bool {
     rule.host.as_deref().is_none_or(|wanted| {
         context.host.as_deref().is_some_and(|actual| {
-            crate::github::normalize_host(wanted) == crate::github::normalize_host(actual)
+            crate::git::normalize_host(wanted) == crate::git::normalize_host(actual)
         })
     }) && rule.owner.as_deref().is_none_or(|wanted| {
         context
@@ -1312,7 +1312,7 @@ fn glob_matches(pattern: &str, value: &str) -> bool {
 /// must reject loudly, not a reason to drop the profile silently.
 fn default_profile_applies(profile: &Profile, context: &RuleContext) -> bool {
     context.repository_host.as_deref().is_none_or(|actual| {
-        crate::github::normalize_host(&profile.host) == crate::github::normalize_host(actual)
+        crate::git::normalize_host(&profile.host) == crate::git::normalize_host(actual)
     })
 }
 

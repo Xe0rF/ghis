@@ -5,7 +5,8 @@
 //! `erase` are no-ops so Git cannot persist a token outside gh's own keyring.
 
 use crate::config;
-use crate::github::{self, GhError, SecretToken};
+use crate::github::{self, GhError};
+use crate::secret::SecretToken;
 use std::fmt;
 use std::io::{self, BufRead, Write};
 use zeroize::Zeroizing;
@@ -134,7 +135,7 @@ impl CredentialRequest {
     }
 
     pub fn normalized_host(&self) -> Option<String> {
-        self.host.as_deref().map(github::normalize_host)
+        self.host.as_deref().map(crate::git::normalize_host)
     }
 }
 
@@ -246,7 +247,7 @@ pub fn matches_profile(request: &CredentialRequest, profile: &CredentialProfile)
     let Some(host) = request.normalized_host() else {
         return false;
     };
-    if host != github::normalize_host(&profile.host) {
+    if host != crate::git::normalize_host(&profile.host) {
         return false;
     }
     request

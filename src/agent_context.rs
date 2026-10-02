@@ -189,7 +189,7 @@ impl AgentContext {
         let source = SelectionSource::from(&context.resolution.source);
         let state = SelectionState::from(&context.resolution.source);
         let identity = context.profile.as_ref().map(|profile| AgentIdentity {
-            host: crate::github::normalize_host(&profile.host),
+            host: crate::git::normalize_host(&profile.host),
             login: profile.login.clone(),
             git_name: profile.git_name.clone(),
             git_email: profile.git_email.clone(),

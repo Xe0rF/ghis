@@ -291,7 +291,7 @@ fn unique_profile_for_target(
         .profiles
         .iter()
         .filter(|(_, profile)| {
-            github::normalize_host(&profile.host) == github::normalize_host(host)
+            git::normalize_host(&profile.host) == git::normalize_host(host)
                 && profile.login.eq_ignore_ascii_case(owner)
         })
         .map(|(id, _)| id.clone());
@@ -2572,8 +2572,8 @@ fn validate_gh_issue_relation_hosts(profile_host: &str, value: &str) -> Result<(
 }
 
 fn ensure_gh_gist_host_matches(profile_host: &str, target_host: &str) -> Result<()> {
-    let expected = github::normalize_host(profile_host);
-    let actual = github::normalize_host(target_host);
+    let expected = git::normalize_host(profile_host);
+    let actual = git::normalize_host(target_host);
     let api_host = actual.strip_prefix("gist.").unwrap_or(&actual);
     if network_hosts_match(&actual, &expected) || network_hosts_match(api_host, &expected) {
         return Ok(());
@@ -2584,8 +2584,8 @@ fn ensure_gh_gist_host_matches(profile_host: &str, target_host: &str) -> Result<
 }
 
 fn ensure_gh_host_matches(profile_host: &str, target_host: &str, source: &str) -> Result<()> {
-    let expected = github::normalize_host(profile_host);
-    let actual = github::normalize_host(target_host);
+    let expected = git::normalize_host(profile_host);
+    let actual = git::normalize_host(target_host);
     if network_hosts_match(&actual, &expected) {
         return Ok(());
     }
@@ -2596,7 +2596,7 @@ fn ensure_gh_host_matches(profile_host: &str, target_host: &str, source: &str) -
 
 fn network_hosts_match(left: &str, right: &str) -> bool {
     fn comparable(host: &str) -> String {
-        let host = github::normalize_host(host);
+        let host = git::normalize_host(host);
         host.strip_suffix(":443").unwrap_or(&host).to_owned()
     }
     comparable(left) == comparable(right)

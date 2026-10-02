@@ -18,6 +18,7 @@ pub mod onboarding;
 pub mod platform;
 pub mod process;
 pub mod repo;
+pub mod secret;
 pub mod shell;
 pub mod signing;
 pub mod state;

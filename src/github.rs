@@ -5,6 +5,8 @@
 //! selected account's token is requested for one child process and injected
 //! only into that child.
 
+use crate::git::normalize_host;
+use crate::secret::SecretToken;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt;
@@ -13,7 +15,6 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::process::{Command, Output};
 use tempfile::NamedTempFile;
-use zeroize::Zeroizing;
 
 const DISCOVERY_CACHE_VERSION: u32 = 1;
 const MAX_COMMAND_ERROR_CHARS: usize = 2_048;
@@ -76,37 +77,6 @@ impl From<std::io::Error> for GhError {
 }
 
 pub type Result<T> = std::result::Result<T, GhError>;
-
-#[derive(Clone, PartialEq, Eq)]
-pub struct SecretToken(Zeroizing<Vec<u8>>);
-
-impl SecretToken {
-    pub fn new(value: impl Into<Vec<u8>>) -> Self {
-        Self(Zeroizing::new(value.into()))
-    }
-
-    pub fn as_bytes(&self) -> &[u8] {
-        self.0.as_slice()
-    }
-
-    pub fn as_str(&self) -> Option<&str> {
-        std::str::from_utf8(self.0.as_slice()).ok()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    pub fn into_bytes(mut self) -> Zeroizing<Vec<u8>> {
-        Zeroizing::new(std::mem::take(&mut *self.0))
-    }
-}
-
-impl fmt::Debug for SecretToken {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("SecretToken([redacted])")
-    }
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -500,45 +470,6 @@ fn api_json_with_options(host: &str, login: &str, endpoint: &str, paginate: bool
     }
     drop(selected);
     serde_json::from_slice(&output.stdout).map_err(|err| GhError::Json(err.to_string()))
-}
-
-pub fn normalize_host(host: &str) -> String {
-    let host = host.trim();
-    if let Some(address) = host.strip_prefix('[')
-        && let Some((address, suffix)) = address.split_once(']')
-    {
-        let address = address.to_ascii_lowercase();
-        return match normalized_port(suffix.strip_prefix(':')) {
-            Some(None) => format!("[{address}]"),
-            Some(Some(port)) => format!("[{address}]:{port}"),
-            None if suffix.is_empty() => format!("[{address}]"),
-            None => host.to_ascii_lowercase(),
-        };
-    }
-
-    // A colon inside the left side denotes an unbracketed IPv6 literal, not a
-    // hostname/port separator. URL authorities use brackets for IPv6 ports.
-    if let Some((hostname, port)) = host.rsplit_once(':')
-        && !hostname.contains(':')
-        && let Some(port) = normalized_port(Some(port))
-    {
-        let hostname = hostname.trim_end_matches('.').to_ascii_lowercase();
-        return port.map_or(hostname.clone(), |port| format!("{hostname}:{port}"));
-    }
-
-    if host.contains(':') {
-        host.to_ascii_lowercase()
-    } else {
-        host.trim_end_matches('.').to_ascii_lowercase()
-    }
-}
-
-/// `None` means the suffix is not a valid numeric port. `Some(None)` is the
-/// canonical HTTPS port and is therefore omitted from host identity keys.
-fn normalized_port(port: Option<&str>) -> Option<Option<u16>> {
-    let port = port?;
-    let port = port.parse::<u16>().ok()?;
-    Some((port != 443).then_some(port))
 }
 
 /// Environment variable expected by gh for the selected GitHub host.

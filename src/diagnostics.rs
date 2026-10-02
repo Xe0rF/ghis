@@ -688,12 +688,12 @@ fn entry_applies_to_host(
     } else {
         None
     };
-    let profile_host = profile.map(|profile| crate::github::normalize_host(&profile.host));
+    let profile_host = profile.map(|profile| crate::git::normalize_host(&profile.host));
     let remote_host = remote
         .and_then(|remote| remote.host.as_deref())
-        .map(crate::github::normalize_host);
+        .map(crate::git::normalize_host);
     scoped_host.is_some_and(|host| {
-        let host = crate::github::normalize_host(&host);
+        let host = crate::git::normalize_host(&host);
         profile_host
             .iter()
             .chain(remote_host.iter())

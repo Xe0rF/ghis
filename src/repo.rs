@@ -768,7 +768,7 @@ pub fn gh_remote_context(repository: &Repository, target_host: &str) -> Result<G
         return Err(command_error("remote -v", &out));
     }
 
-    let target_host = crate::github::normalize_host(target_host);
+    let target_host = crate::git::normalize_host(target_host);
     let mut candidates = BTreeMap::new();
     for line in String::from_utf8_lossy(&out.stdout).lines() {
         let Some((name, value)) = line.split_once('\t') else {
@@ -795,7 +795,7 @@ pub fn gh_remote_context(repository: &Repository, target_host: &str) -> Result<G
         remote
             .host
             .as_deref()
-            .is_some_and(|host| crate::github::normalize_host(host) == target_host)
+            .is_some_and(|host| crate::git::normalize_host(host) == target_host)
     }) {
         return Ok(GhRemoteContext::Matched(remote.clone()));
     }
@@ -1133,7 +1133,7 @@ fn parse_url_parts(url: &str) -> (Transport, Option<String>, Option<String>) {
         let host = left.rsplit_once('@').map_or(left, |(_, h)| h);
         return (
             Transport::Ssh,
-            Some(crate::github::normalize_host(host)),
+            Some(crate::git::normalize_host(host)),
             Some(right.to_owned()),
         );
     }
@@ -1163,7 +1163,7 @@ fn split_authority_path(
         .unwrap_or_default();
     (
         transport,
-        (!host.is_empty()).then(|| crate::github::normalize_host(host)),
+        (!host.is_empty()).then(|| crate::git::normalize_host(host)),
         Some(path.to_owned()),
     )
 }

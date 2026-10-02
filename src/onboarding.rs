@@ -558,7 +558,7 @@ impl<'a> Wizard<'a> {
     where
         F: FnMut(&str, &str) -> Result<Vec<EmailCandidate>, String>,
     {
-        self.host = crate::github::normalize_host(&host);
+        self.host = crate::git::normalize_host(&host);
         self.login = login.trim().to_owned();
         if self.profile_id.is_empty() {
             self.profile_id = self.login.to_ascii_lowercase();
@@ -877,7 +877,7 @@ where
     writeln!(
         writer,
         "\n确认配置：{id}，{login}@{}，{git_name} <{git_email}>",
-        crate::github::normalize_host(&host)
+        crate::git::normalize_host(&host)
     )?;
     if !answer!(line_confirm(
         &mut reader,
@@ -890,7 +890,7 @@ where
     }
     Ok(FlowResult::Complete(Draft {
         id,
-        host: crate::github::normalize_host(&host),
+        host: crate::git::normalize_host(&host),
         login,
         git_name,
         git_email,
