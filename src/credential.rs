@@ -4,6 +4,7 @@
 //! HTTPS host and profile selected for the current repository.  `store` and
 //! `erase` are no-ops so Git cannot persist a token outside gh's own keyring.
 
+use crate::config;
 use crate::github::{self, GhError, SecretToken};
 use std::fmt;
 use std::io::{self, BufRead, Write};
@@ -13,8 +14,11 @@ use zeroize::Zeroizing;
 pub enum CredentialError {
     Io(io::Error),
     Gh(GhError),
+    Command(crate::credential_command::CommandError),
     InvalidRequest(String),
     InvalidAction(String),
+    /// A lookup that matched but had no credential source to draw on.
+    Lookup(String),
 }
 
 impl fmt::Display for CredentialError {
@@ -22,9 +26,17 @@ impl fmt::Display for CredentialError {
         match self {
             Self::Io(err) => write!(f, "credential helper: {err}"),
             Self::Gh(err) => err.fmt(f),
+            Self::Command(err) => err.fmt(f),
             Self::InvalidRequest(err) => write!(f, "invalid credential request: {err}"),
             Self::InvalidAction(action) => write!(f, "unknown credential action: {action}"),
+            Self::Lookup(reason) => write!(f, "credential lookup: {reason}"),
         }
+    }
+}
+
+impl From<crate::credential_command::CommandError> for CredentialError {
+    fn from(error: crate::credential_command::CommandError) -> Self {
+        Self::Command(error)
     }
 }
 
@@ -136,6 +148,27 @@ pub struct Credential {
 pub struct CredentialProfile {
     pub host: String,
     pub login: String,
+    /// Username emitted next to the token, and the only one a request that
+    /// carries a username may claim: Git echoes back whatever we emitted, so
+    /// `Command` profiles with a `credential_username` other than `login` would
+    /// otherwise stop matching their own responses.
+    pub username: String,
+    pub mode: config::CredentialMode,
+    /// argv used only in `Command` mode.
+    pub command: Vec<String>,
+}
+
+impl CredentialProfile {
+    /// The `gh`-backed profile every existing configuration describes.
+    pub fn gh(host: String, login: String) -> Self {
+        Self {
+            username: login.clone(),
+            host,
+            login,
+            mode: config::CredentialMode::Manage,
+            command: Vec::new(),
+        }
+    }
 }
 
 /// Parse the line-oriented protocol.  Git terminates a request with an empty
@@ -204,8 +237,8 @@ pub fn format_response(request: &CredentialRequest, credential: &Credential) -> 
     output
 }
 
-/// Match a request to a profile without querying gh.  Matching is exact on
-/// protocol and host; an explicit username must agree with the profile.
+/// Match a request to a profile without resolving a token.  Matching is exact
+/// on protocol and host; an explicit username must agree with the profile.
 pub fn matches_profile(request: &CredentialRequest, profile: &CredentialProfile) -> bool {
     if !request.is_https() {
         return false;
@@ -219,11 +252,12 @@ pub fn matches_profile(request: &CredentialRequest, profile: &CredentialProfile)
     request
         .username
         .as_deref()
-        .is_none_or(|username| username == profile.login)
+        .is_none_or(|username| username == profile.username)
 }
 
-/// Resolve a matching profile through gh's keyring.  No token is cached by
-/// this helper and `store`/`erase` remain no-ops.
+/// Resolve a matching profile.  `Manage` reads gh's keyring, `Command` runs the
+/// profile's argv.  No token is cached by this helper and `store`/`erase`
+/// remain no-ops.
 pub fn get_for_profile(
     request: &CredentialRequest,
     profile: &CredentialProfile,
@@ -231,9 +265,21 @@ pub fn get_for_profile(
     if !matches_profile(request, profile) {
         return Ok(None);
     }
-    let password = github::token(&profile.host, &profile.login)?;
+    let password = match profile.mode {
+        config::CredentialMode::Manage => github::token(&profile.host, &profile.login)?,
+        config::CredentialMode::Command => crate::credential_command::run(&profile.command)?,
+        // A passthrough profile never has this helper installed, so reaching
+        // here would mean something installed it anyway.  Refuse rather than
+        // resolve: falling through to gh would apply a GitHub token the profile
+        // explicitly declined to use.
+        config::CredentialMode::Passthrough => {
+            return Err(CredentialError::Lookup(
+                "credential helper ran for a passthrough profile".into(),
+            ));
+        }
+    };
     Ok(Some(Credential {
-        username: profile.login.clone(),
+        username: profile.username.clone(),
         password,
     }))
 }
@@ -315,6 +361,7 @@ impl Lookup for ProfileLookup {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Cursor;
 
     struct FakeLookup;
@@ -323,10 +370,7 @@ mod tests {
         fn get(&mut self, request: &CredentialRequest) -> Result<Option<Credential>> {
             Ok(matches_profile(
                 request,
-                &CredentialProfile {
-                    host: "github.com".into(),
-                    login: "alice".into(),
-                },
+                &CredentialProfile::gh("github.com".into(), "alice".into()),
             )
             .then(|| Credential {
                 username: "alice".into(),
@@ -361,10 +405,7 @@ mod tests {
 
     #[test]
     fn matching_requires_exact_https_host_and_login() {
-        let profile = CredentialProfile {
-            host: "github.com".into(),
-            login: "alice".into(),
-        };
+        let profile = CredentialProfile::gh("github.com".into(), "alice".into());
         let request = parse_request("protocol=https\nhost=github.com\nusername=alice\n\n").unwrap();
         assert!(matches_profile(&request, &profile));
         let wrong = parse_request("protocol=https\nhost=github.com\nusername=bob\n\n").unwrap();
@@ -375,18 +416,13 @@ mod tests {
 
     #[test]
     fn matching_canonicalizes_default_https_port_and_preserves_other_ports() {
-        let profile = CredentialProfile {
-            host: "Git.Example.Test.".into(),
-            login: "alice".into(),
-        };
+        let profile = CredentialProfile::gh("Git.Example.Test.".into(), "alice".into());
         let default_port =
             parse_request("protocol=HTTPS\nhost=git.example.test:443\nusername=alice\n\n").unwrap();
         assert!(matches_profile(&default_port, &profile));
 
-        let enterprise_profile = CredentialProfile {
-            host: "git.example.test:8443".into(),
-            login: "alice".into(),
-        };
+        let enterprise_profile =
+            CredentialProfile::gh("git.example.test:8443".into(), "alice".into());
         let enterprise = parse_request("protocol=https\nhost=GIT.EXAMPLE.TEST.:8443\n\n").unwrap();
         assert!(matches_profile(&enterprise, &enterprise_profile));
         assert!(!matches_profile(&default_port, &enterprise_profile));
@@ -394,10 +430,7 @@ mod tests {
 
     #[test]
     fn matching_supports_bracketed_ipv6_hosts() {
-        let profile = CredentialProfile {
-            host: "[2001:db8::1]".into(),
-            login: "alice".into(),
-        };
+        let profile = CredentialProfile::gh("[2001:db8::1]".into(), "alice".into());
         let request = parse_request("protocol=https\nhost=[2001:DB8::1]:443\n\n").unwrap();
         assert!(matches_profile(&request, &profile));
     }
@@ -406,10 +439,7 @@ mod tests {
     fn unmatched_request_stops_the_helper_chain() {
         let input = Cursor::new("protocol=https\nhost=other.test\n\n");
         let mut output = Vec::new();
-        let profile = CredentialProfile {
-            host: "github.com".into(),
-            login: "alice".into(),
-        };
+        let profile = CredentialProfile::gh("github.com".into(), "alice".into());
         handle(Action::Get, input, &mut output, ProfileLookup { profile }).unwrap();
         assert_eq!(output, b"quit=true\n\n");
     }
@@ -433,5 +463,119 @@ mod tests {
             handle(Action::Get, input, &mut output, FailingLookup).expect_err("lookup must fail");
         assert!(error.to_string().contains("lookup failed"));
         assert_eq!(output, b"quit=true\n\n");
+    }
+
+    /// Write an executable POSIX script and return its path as an argv element.
+    #[cfg(unix)]
+    fn script(dir: &std::path::Path, name: &str, body: &str) -> String {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join(name);
+        fs::write(&path, body).expect("write script");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("chmod");
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_credential_username_other_than_login_still_matches_its_own_response() {
+        let profile = CredentialProfile {
+            username: "oauth2".into(),
+            command: Vec::new(),
+            mode: config::CredentialMode::Command,
+            host: "git.example.test".into(),
+            login: "alice".into(),
+        };
+        // Git echoes back whatever the helper emitted, so the second request
+        // carries `oauth2` rather than `login`.
+        let request =
+            parse_request("protocol=https\nhost=git.example.test\nusername=oauth2\n\n").unwrap();
+        assert!(matches_profile(&request, &profile));
+
+        let other =
+            parse_request("protocol=https\nhost=git.example.test\nusername=bob\n\n").unwrap();
+        assert!(!matches_profile(&other, &profile));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn command_mode_answers_with_the_command_output_and_the_declared_username() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let argv = vec![script(
+            dir.path(),
+            "token.sh",
+            "#!/bin/sh\nprintf 'gitlab-token\\n'\n",
+        )];
+        let profile = CredentialProfile {
+            username: "oauth2".into(),
+            command: argv,
+            mode: config::CredentialMode::Command,
+            host: "git.example.test".into(),
+            login: "alice".into(),
+        };
+
+        let credential = get_for_profile(
+            &parse_request("protocol=https\nhost=git.example.test\n\n").unwrap(),
+            &profile,
+        )
+        .expect("lookup succeeds")
+        .expect("credential present");
+
+        assert_eq!(credential.username, "oauth2");
+        assert_eq!(credential.password.as_str(), Some("gitlab-token"));
+
+        let input = Cursor::new("protocol=https\nhost=git.example.test\n\n");
+        let mut output = Vec::new();
+        handle(Action::Get, input, &mut output, ProfileLookup { profile }).expect("helper answers");
+        assert_eq!(
+            output,
+            b"protocol=https\nhost=git.example.test\nusername=oauth2\npassword=gitlab-token\n\n"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_failing_command_stops_the_helper_chain_with_quit() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let profile = CredentialProfile {
+            username: "oauth2".into(),
+            command: vec![script(
+                dir.path(),
+                "broken.sh",
+                "#!/bin/sh\necho vault locked >&2\nexit 4\n",
+            )],
+            mode: config::CredentialMode::Command,
+            host: "git.example.test".into(),
+            login: "alice".into(),
+        };
+
+        let input = Cursor::new("protocol=https\nhost=git.example.test\n\n");
+        let mut output = Vec::new();
+        let error = handle(Action::Get, input, &mut output, ProfileLookup { profile })
+            .expect_err("a failing command must fail the lookup");
+
+        assert_eq!(output, b"quit=true\n\n");
+        assert!(error.to_string().contains("vault locked"), "{error}");
+    }
+
+    #[test]
+    fn a_passthrough_profile_refuses_to_resolve_anything() {
+        let profile = CredentialProfile {
+            username: "alice".into(),
+            command: Vec::new(),
+            mode: config::CredentialMode::Passthrough,
+            host: "git.example.test".into(),
+            login: "alice".into(),
+        };
+        let request = parse_request("protocol=https\nhost=git.example.test\n\n").unwrap();
+
+        let error = get_for_profile(&request, &profile).expect_err("must not resolve");
+        assert!(matches!(error, CredentialError::Lookup(_)), "{error:?}");
+
+        let input = Cursor::new("protocol=https\nhost=git.example.test\n\n");
+        let mut output = Vec::new();
+        let error = handle(Action::Get, input, &mut output, ProfileLookup { profile })
+            .expect_err("must not resolve");
+        assert_eq!(output, b"quit=true\n\n");
+        assert!(error.to_string().contains("passthrough"), "{error}");
     }
 }

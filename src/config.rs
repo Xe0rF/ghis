@@ -285,6 +285,70 @@ fn managed_proxy_jump_is_valid(value: &str) -> bool {
         })
 }
 
+const CREDENTIAL_COMMAND_MAX_ARGUMENTS: usize = 8;
+
+/// One argv element of `credential_command`.  Control characters are rejected so
+/// the value stays renderable in `doctor` diagnostics.  Nothing else is
+/// restricted: the argv never reaches a shell, and the whole value comes from
+/// the user's own configuration file.
+fn credential_command_argument_is_valid(value: &str) -> bool {
+    !value.is_empty() && value.len() <= 255 && !value.chars().any(char::is_control)
+}
+
+/// The program to run.  A leading `-` is rejected because it cannot name a
+/// program; arguments may start with `-` so ordinary commands keep working.
+fn credential_command_program_is_valid(value: &str) -> bool {
+    !value.starts_with('-') && credential_command_argument_is_valid(value)
+}
+
+fn validate_credential_settings(id: &str, profile: &Profile) -> Result<(), String> {
+    let command = profile.credential_command.as_deref();
+    if profile.credential_mode() == CredentialMode::Command {
+        let Some(command) = command.filter(|arguments| !arguments.is_empty()) else {
+            return Err(format!(
+                "profile `{id}` uses credential_mode `command` and needs a non-empty credential_command"
+            ));
+        };
+        if command.len() > CREDENTIAL_COMMAND_MAX_ARGUMENTS {
+            return Err(format!(
+                "profile `{id}` credential_command has {} arguments, at most {CREDENTIAL_COMMAND_MAX_ARGUMENTS} are allowed",
+                command.len()
+            ));
+        }
+        if !credential_command_program_is_valid(&command[0]) {
+            return Err(format!(
+                "profile `{id}` credential_command program {:?} is empty, starts with `-`, exceeds 255 bytes, or contains a control character",
+                command[0]
+            ));
+        }
+        if let Some(argument) = command
+            .iter()
+            .skip(1)
+            .find(|argument| !credential_command_argument_is_valid(argument))
+        {
+            return Err(format!(
+                "profile `{id}` credential_command argument {argument:?} is empty, exceeds 255 bytes, or contains a control character"
+            ));
+        }
+    } else if command.is_some() {
+        // Reject rather than ignore: a command that never runs is a silent
+        // misconfiguration, and the profile would still look credential-managed.
+        return Err(format!(
+            "profile `{id}` sets credential_command but its credential_mode is not `command`"
+        ));
+    }
+    if profile
+        .credential_username
+        .as_deref()
+        .is_some_and(str::is_empty)
+    {
+        return Err(format!(
+            "profile `{id}` credential_username cannot be empty"
+        ));
+    }
+    Ok(())
+}
+
 /// How a profile's SSH connection is supplied.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "kebab-case")]
@@ -317,6 +381,22 @@ pub struct SigningProfile {
     pub program: Option<PathBuf>,
 }
 
+/// Who supplies the HTTPS credential for a profile's transport.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CredentialMode {
+    /// ghis installs its helper and resolves the token through `gh`.
+    #[default]
+    Manage,
+    /// ghis writes no credential configuration; the repository keeps whatever
+    /// helper chain the user configured.  The repository's inherited chain is
+    /// deliberately left intact, so the user becomes responsible for it.
+    Passthrough,
+    /// ghis installs its helper and resolves the token by running
+    /// `credential_command`, still failing closed when that command fails.
+    Command,
+}
+
 /// A GitHub/Git commit identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -329,6 +409,36 @@ pub struct Profile {
     pub description: Option<String>,
     pub ssh: Option<SshProfile>,
     pub signing: SigningProfile,
+    /// Absent means `Manage`, so existing configuration files stay byte for byte
+    /// identical until the user opts in.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_mode: Option<CredentialMode>,
+    /// argv, not a shell string: `git.rs` never feeds profile data to `sh -c`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_command: Option<Vec<String>>,
+    /// HTTP Basic username for `Command` mode; defaults to `login`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credential_username: Option<String>,
+}
+
+impl Profile {
+    /// The effective credential mode.  An unset field means `Manage`.
+    pub fn credential_mode(&self) -> CredentialMode {
+        self.credential_mode.unwrap_or_default()
+    }
+
+    /// Whether ghis writes credential configuration for this profile.  Only
+    /// `Passthrough` declines, and it declines by writing nothing at all — not
+    /// even the empty helper value that `Manage` uses to cut the inherited
+    /// chain, because the inherited chain is exactly what the user keeps.
+    pub fn manages_credentials(&self) -> bool {
+        self.credential_mode() != CredentialMode::Passthrough
+    }
+
+    /// The HTTP Basic username paired with the resolved token.
+    pub fn credential_username(&self) -> &str {
+        self.credential_username.as_deref().unwrap_or(&self.login)
+    }
 }
 
 impl Default for Profile {
@@ -341,6 +451,9 @@ impl Default for Profile {
             description: None,
             ssh: None,
             signing: SigningProfile::default(),
+            credential_mode: None,
+            credential_command: None,
+            credential_username: None,
         }
     }
 }
@@ -605,6 +718,9 @@ impl Config {
                     "profile `{id}` with forwarded-agent signing needs signing_key, signing fingerprint, or SSH public_key"
                 )));
             }
+            if let Err(error) = validate_credential_settings(id, profile) {
+                return Err(ConfigError::Validation(error));
+            }
         }
         for rule in &self.rules {
             if rule.id.trim().is_empty() {
@@ -685,6 +801,9 @@ const KNOWN_PROFILE_KEYS: &[&str] = &[
     "description",
     "ssh",
     "signing",
+    "credential_mode",
+    "credential_command",
+    "credential_username",
 ];
 const KNOWN_SSH_KEYS: &[&str] = &[
     "mode",
@@ -970,6 +1089,9 @@ fn merge_profile(destination: &mut Item, source: &Item) {
             "description",
             "ssh",
             "signing",
+            "credential_mode",
+            "credential_command",
+            "credential_username",
         ],
     );
     let Item::Table(destination) = destination else {
@@ -1378,6 +1500,140 @@ mod tests {
         let mut invalid = profile();
         invalid.description = Some("字".repeat(201));
         config.profiles.insert("work".into(), invalid);
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn credential_modes_round_trip_and_absent_means_manage() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        fs::write(
+            &path,
+            "version = 1\n\n[profiles.work]\nhost = \"github.com\"\nlogin = \"alice\"\ngit_name = \"Alice\"\ngit_email = \"alice@example.com\"\ncredential_mode = \"passthrough\"\n",
+        )
+        .unwrap();
+        let config = Config::load(&path).expect("passthrough loads");
+        assert_eq!(
+            config.profiles["work"].credential_mode(),
+            CredentialMode::Passthrough
+        );
+
+        let command = "version = 1\n\n[profiles.work]\nhost = \"git.example.test\"\nlogin = \"alice\"\ngit_name = \"Alice\"\ngit_email = \"alice@example.com\"\ncredential_mode = \"command\"\ncredential_command = [\"op\", \"read\", \"op://item\"]\ncredential_username = \"oauth2\"\n";
+        fs::write(&path, command).unwrap();
+        let config = Config::load(&path).expect("command loads");
+        let work = &config.profiles["work"];
+        assert_eq!(work.credential_mode(), CredentialMode::Command);
+        assert_eq!(
+            work.credential_command.as_deref(),
+            Some(["op".to_owned(), "read".to_owned(), "op://item".to_owned()].as_slice())
+        );
+        assert_eq!(work.credential_username(), "oauth2");
+
+        // A profile that never mentions the field keeps its bytes: absent means
+        // `manage`, and saving must not add a line to unrelated profiles.
+        fs::write(
+            &path,
+            "version = 1\n\n[profiles.work]\nhost = \"github.com\"\nlogin = \"alice\"\ngit_name = \"Alice\"\ngit_email = \"alice@example.com\"\n",
+        )
+        .unwrap();
+        let config = Config::load(&path).expect("plain loads");
+        assert_eq!(
+            config.profiles["work"].credential_mode(),
+            CredentialMode::Manage
+        );
+        config.save(&path).expect("save");
+        let saved = fs::read_to_string(&path).unwrap();
+        for key in [
+            "credential_mode",
+            "credential_command",
+            "credential_username",
+        ] {
+            assert!(
+                !saved.contains(key),
+                "an unset credential field must not be written back: {saved}"
+            );
+        }
+    }
+
+    #[test]
+    fn command_mode_requires_a_command_and_other_modes_forbid_one() {
+        let mut config = Config::default();
+        let mut work = profile();
+        work.credential_mode = Some(CredentialMode::Command);
+        config.profiles.insert("work".into(), work);
+        assert!(config.validate().is_err(), "command mode needs a command");
+
+        let mut work = profile();
+        work.credential_mode = Some(CredentialMode::Command);
+        work.credential_command = Some(Vec::new());
+        config.profiles.insert("work".into(), work);
+        assert!(config.validate().is_err(), "an empty argv is not a command");
+
+        let mut work = profile();
+        work.credential_mode = Some(CredentialMode::Command);
+        work.credential_command = Some(vec!["op".into(), "read".into()]);
+        config.profiles.insert("work".into(), work);
+        config
+            .validate()
+            .expect("a complete command profile is valid");
+
+        let mut work = profile();
+        work.credential_mode = Some(CredentialMode::Passthrough);
+        work.credential_command = Some(vec!["op".into()]);
+        config.profiles.insert("work".into(), work);
+        assert!(
+            config.validate().is_err(),
+            "a command that never runs is a silent misconfiguration"
+        );
+    }
+
+    #[test]
+    fn credential_command_rejects_only_what_an_argv_cannot_express() {
+        let mut config = Config::default();
+        // Arguments may start with `-`: `sh -c` and `--format` are ordinary
+        // commands, and nothing here reaches a shell.
+        let mut work = profile();
+        work.credential_mode = Some(CredentialMode::Command);
+        work.credential_command = Some(vec!["sh".into(), "-c".into(), "printf token".into()]);
+        config.profiles.insert("work".into(), work);
+        config
+            .validate()
+            .expect("an ordinary option argument is allowed");
+
+        for argument in ["", &"x".repeat(256), "ok\u{1b}"] {
+            let mut work = profile();
+            work.credential_mode = Some(CredentialMode::Command);
+            work.credential_command = Some(vec!["op".into(), argument.into()]);
+            config.profiles.insert("work".into(), work);
+            assert!(
+                config.validate().is_err(),
+                "accepted credential_command argument {argument:?}"
+            );
+        }
+
+        // The program itself may not look like an option.
+        let mut work = profile();
+        work.credential_mode = Some(CredentialMode::Command);
+        work.credential_command = Some(vec!["-oProxyCommand=evil".into(), "read".into()]);
+        config.profiles.insert("work".into(), work);
+        assert!(
+            config.validate().is_err(),
+            "accepted an option as the program"
+        );
+
+        let mut work = profile();
+        work.credential_mode = Some(CredentialMode::Command);
+        work.credential_command = Some(vec!["op".into(); CREDENTIAL_COMMAND_MAX_ARGUMENTS + 1]);
+        config.profiles.insert("work".into(), work);
+        assert!(config.validate().is_err(), "accepted too many arguments");
+    }
+
+    #[test]
+    fn credential_username_must_not_be_empty() {
+        let mut config = Config::default();
+        let mut work = profile();
+        work.credential_username = Some(String::new());
+        config.profiles.insert("work".into(), work);
         assert!(config.validate().is_err());
     }
 

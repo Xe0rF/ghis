@@ -1240,6 +1240,9 @@ fn apply_onboarding(
         description: draft.description.clone(),
         ssh: Some(SshProfile::default()),
         signing: SigningProfile::default(),
+        credential_mode: None,
+        credential_command: None,
+        credential_username: None,
     };
     let previous_default = Config::load(&paths.config_file)?.behavior.default_profile;
     let previous_binding = if draft.bind_repository {
@@ -1627,6 +1630,9 @@ fn profile_from_args(args: ProfileArgs, git_email: String) -> Profile {
             fingerprint: args.signing_fingerprint,
             program: args.signing_program,
         },
+        credential_mode: None,
+        credential_command: None,
+        credential_username: None,
     }
 }
 
@@ -3445,6 +3451,9 @@ fn credential_helper(
         BufReader::new(io::stdin()),
         io::stdout(),
         credential::CredentialProfile {
+            username: profile.credential_username().to_owned(),
+            command: profile.credential_command.clone().unwrap_or_default(),
+            mode: profile.credential_mode(),
             host: profile.host,
             login: profile.login,
         },

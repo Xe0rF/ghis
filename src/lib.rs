@@ -9,6 +9,7 @@ pub mod agent_context;
 pub mod app;
 pub mod config;
 pub mod credential;
+pub mod credential_command;
 pub mod diagnostics;
 pub mod git;
 pub mod github;

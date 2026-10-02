@@ -608,3 +608,242 @@ git_email = "personal@example.test"
         "!user-helper\n\n!user-helper-after-reset\n"
     );
 }
+
+#[test]
+fn passthrough_permits_a_helper_override_that_command_mode_still_refuses() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let root = temporary.path();
+    let repository = init_repository(root);
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("bin directory");
+    let override_trace = root.join("override.trace");
+    let token_script = root.join("token.sh");
+    executable(&token_script, "#!/bin/sh\nprintf 'gitlab-token\\n'\n");
+    executable(
+        &bin.join("wrong-helper"),
+        &format!(
+            "#!/bin/sh\nprintf 'called\\n' > {:?}\nprintf 'username=someone\\npassword=other\\n\\n'\n",
+            override_trace
+        ),
+    );
+    assert!(
+        Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://git.example.test/alice/project.git",
+            ])
+            .current_dir(&repository)
+            .status()
+            .expect("add remote")
+            .success()
+    );
+
+    let directory = root.join("config/ghis");
+    fs::create_dir_all(&directory).expect("config directory");
+    let config = directory.join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"version = 1
+
+[behavior]
+default_profile = "gitlab"
+
+[profiles.gitlab]
+host = "git.example.test"
+login = "alice"
+git_name = "Alice Example"
+git_email = "alice@example.test"
+credential_mode = "{passthrough}"
+
+[profiles.command]
+host = "git.example.test"
+login = "alice"
+git_name = "Alice Example"
+git_email = "alice@example.test"
+credential_mode = "command"
+credential_command = [{token_script:?}]
+credential_username = "oauth2"
+"#,
+            passthrough = "passthrough",
+            token_script = token_script.to_string_lossy(),
+        ),
+    )
+    .expect("config");
+
+    for (profile, expect_refusal) in [("gitlab", false), ("command", true)] {
+        let _ = fs::remove_file(&override_trace);
+        let mut bind = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+        bind.args([
+            "--config",
+            config.to_str().expect("UTF-8 config path"),
+            "use",
+            profile,
+            "--repo",
+            repository.to_str().expect("UTF-8 repository path"),
+        ])
+        .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        apply_environment(&mut bind, root);
+        bind.assert().success();
+
+        let mut override_command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+        override_command
+            .current_dir(&repository)
+            .args([
+                "git",
+                "--",
+                "-c",
+                "credential.helper=!wrong-helper",
+                "credential",
+                "fill",
+            ])
+            .write_stdin("protocol=https\nhost=git.example.test\n\n")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_TERMINAL_PROMPT", "0")
+            .env("PATH", {
+                let mut value = std::env::var("PATH").unwrap_or_default();
+                value.insert_str(0, &format!("{}:", bin.display()));
+                value
+            });
+        apply_environment(&mut override_command, root);
+
+        if expect_refusal {
+            override_command
+                .assert()
+                .failure()
+                .stderr(predicate::str::contains("credential helper 覆盖"));
+            assert!(
+                !override_trace.exists(),
+                "a refused override must not reach the helper"
+            );
+        } else {
+            override_command.assert().success();
+            assert!(
+                override_trace.exists(),
+                "passthrough must let the user configure their own helper"
+            );
+        }
+
+        let mut unbind = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+        unbind
+            .args([
+                "--config",
+                config.to_str().expect("UTF-8 config path"),
+                "unbind",
+                "--repo",
+                repository.to_str().expect("UTF-8 repository path"),
+            ])
+            .env("GIT_CONFIG_GLOBAL", "/dev/null");
+        apply_environment(&mut unbind, root);
+        unbind.assert().success();
+    }
+}
+
+#[test]
+fn command_mode_resolves_the_token_without_asking_gh() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let root = temporary.path();
+    let repository = init_repository(root);
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).expect("bin directory");
+    let gh_trace = root.join("gh.trace");
+    let token_script = root.join("token.sh");
+    executable(&token_script, "#!/bin/sh\nprintf '  gitlab-token\\n'\n");
+    executable(
+        &bin.join("gh"),
+        &format!(
+            "#!/bin/sh\nprintf 'called %s\\n' \"$*\" >> {:?}\nprintf 'github-token\\n'\n",
+            gh_trace
+        ),
+    );
+    assert!(
+        Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://git.example.test/alice/project.git",
+            ])
+            .current_dir(&repository)
+            .status()
+            .expect("add remote")
+            .success()
+    );
+
+    let directory = root.join("config/ghis");
+    fs::create_dir_all(&directory).expect("config directory");
+    let config = directory.join("config.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"version = 1
+
+[behavior]
+default_profile = "gitlab"
+
+[profiles.gitlab]
+host = "git.example.test"
+login = "alice"
+git_name = "Alice Example"
+git_email = "alice@example.test"
+credential_mode = "command"
+credential_command = [{token_script:?}]
+credential_username = "oauth2"
+"#,
+            token_script = token_script.to_string_lossy(),
+        ),
+    )
+    .expect("config");
+
+    let mut bind = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    bind.args([
+        "--config",
+        config.to_str().expect("UTF-8 config path"),
+        "use",
+        "gitlab",
+        "--repo",
+        repository.to_str().expect("UTF-8 repository path"),
+    ])
+    .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    apply_environment(&mut bind, root);
+    bind.assert().success();
+
+    // The bound repository installs the same helper string as `manage`, so the
+    // install path needs no separate case.
+    let helper = Command::new("git")
+        .args([
+            "config",
+            "--worktree",
+            "--get-all",
+            "credential.https://git.example.test.helper",
+        ])
+        .current_dir(&repository)
+        .output()
+        .expect("read helper");
+    let helper = String::from_utf8_lossy(&helper.stdout).into_owned();
+    assert!(helper.contains("credential-helper"), "{helper}");
+    assert!(
+        helper.starts_with('\n'),
+        "the empty reset must come first: {helper}"
+    );
+
+    let mut fill = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    fill.current_dir(&repository)
+        .args(["git", "--", "credential", "fill"])
+        .write_stdin("protocol=https\nhost=git.example.test\n\n")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("PATH", {
+            let mut value = std::env::var("PATH").unwrap_or_default();
+            value.insert_str(0, &format!("{}:", bin.display()));
+            value
+        });
+    apply_environment(&mut fill, root);
+    let output = fill.assert().success().get_output().stdout.clone();
+    let output = String::from_utf8_lossy(&output);
+    assert!(output.contains("username=oauth2"), "{output}");
+    assert!(output.contains("password=gitlab-token"), "{output}");
+    assert!(!gh_trace.exists(), "command mode must not consult gh");
+}

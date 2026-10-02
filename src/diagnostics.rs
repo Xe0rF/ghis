@@ -416,10 +416,14 @@ fn inspect_credential_helper(
 ) {
     let managed = is_ghis_helper(&entry.value);
     let applies = entry_applies_to_host(entry, profile, remote);
+    // A `passthrough` profile installs nothing, so whatever helper is here came
+    // from the user.  Reporting it as an unmarked entry keeps doctor honest
+    // about who wrote it.
+    let passthrough = profile.is_some_and(|profile| !profile.manages_credentials());
     diagnostics.push(finding(
         if managed || ghis_reset {
             Severity::Info
-        } else if applies {
+        } else if applies && !passthrough {
             Severity::Warning
         } else {
             Severity::Info
@@ -429,11 +433,15 @@ fn inspect_credential_helper(
             "这是 ghis 安装的专用 credential helper；它会按当前 Profile 选择凭据"
         } else if ghis_reset {
             "这是 ghis helper 前的空值重置；它会清除继承的 helper，避免账号串用"
+        } else if passthrough {
+            "当前 Profile 的 credential_mode 为 passthrough，ghis 未写入凭据配置；该 helper 由用户维护"
         } else {
             "credential helper 参与凭据查找；错误的链顺序可能让 Git 尝试另一个账号"
         },
         if managed || ghis_reset {
             "确认它前面的空值重置和 helper 链顺序没有被其他配置覆盖"
+        } else if passthrough {
+            "passthrough 模式保留继承链；请自行确认该 helper 指向预期的账号"
         } else {
             "检查 helper 的作用域和顺序；绑定仓库会为 Profile 主机安装专用 helper"
         },

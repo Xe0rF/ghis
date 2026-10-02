@@ -526,8 +526,10 @@ pub fn bind_repository(ctx: &AppContext, id: &str) -> Result<()> {
     for include_key in &include_keys {
         repo::add_local_config(repository, include_key, fragment.to_string_lossy().as_ref())?;
     }
-    let helper = credential_helper_command(&ctx.paths);
-    git::install_credential_helper(repository, &profile.host, &helper)?;
+    if profile.manages_credentials() {
+        let helper = credential_helper_command(&ctx.paths);
+        git::install_credential_helper(repository, &profile.host, &helper)?;
+    }
     if git::supports_named_hooks() {
         let binary = current_binary();
         git::install_named_hooks_with_config(repository, &binary, Some(&ctx.paths.config_file))?;
@@ -1044,6 +1046,9 @@ where
     if let Some(warning) = identity_override.as_deref() {
         eprintln!("{warning}");
     }
+    if let Some(warning) = passthrough_credential_notice(&ctx, &operation) {
+        eprintln!("{warning}");
+    }
     // Keep the caller's working directory for the real Git invocation.  In
     // particular, forwarding `git -C relative/path` after changing into that
     // path would make Git apply the relative path a second time.
@@ -1079,13 +1084,18 @@ where
     if let Some(profile) = ctx.profile.as_ref() {
         // Restrict the fail-closed helper to this Profile's GitHub host. Other
         // HTTPS services and cross-host submodules keep their own helper chain.
-        let helper = credential_helper_command(&ctx.paths);
-        let helper_key = git::credential_helper_key(&profile.host);
-        command = command
-            .arg("-c")
-            .arg(format!("{helper_key}="))
-            .arg("-c")
-            .arg(format!("{helper_key}={helper}"));
+        // A `passthrough` profile writes nothing here: its inherited chain is
+        // the one the user asked to keep, so even the empty reset value would
+        // remove what the mode is for.
+        if profile.manages_credentials() {
+            let helper = credential_helper_command(&ctx.paths);
+            let helper_key = git::credential_helper_key(&profile.host);
+            command = command
+                .arg("-c")
+                .arg(format!("{helper_key}="))
+                .arg("-c")
+                .arg(format!("{helper_key}={helper}"));
+        }
     }
     if config_path.is_some() {
         // Pass the resolved absolute path so hooks and nested wrappers keep
@@ -2696,8 +2706,14 @@ fn repository_binding_needs_repair(ctx: &AppContext) -> Result<bool> {
         }
     }
     let key = git::credential_helper_key(&profile.host);
-    let expected = credential_helper_command(&ctx.paths);
-    let expected_values = vec![String::new(), expected];
+    // `passthrough` must leave the key absent.  If a previous bind installed it,
+    // the repository still needs repair so the leftover helper stops shadowing
+    // whatever the user configured for that host.
+    let expected_values = if profile.manages_credentials() {
+        vec![String::new(), credential_helper_command(&ctx.paths)]
+    } else {
+        Vec::new()
+    };
     if repo::local_config_values(repository, &key)? != expected_values {
         return Ok(true);
     }
@@ -2823,12 +2839,21 @@ impl GitOperation {
     }
 
     fn may_contact_remote(&self) -> bool {
-        if self.conservative_sensitive
-            || matches!(
-                self.name.as_str(),
-                "push" | "pull" | "fetch" | "clone" | "submodule" | "ls-remote"
-            )
-        {
+        self.conservative_sensitive || self.contacts_network()
+    }
+
+    /// Whether this operation is a known Git command that reaches the network.
+    ///
+    /// Unlike [`Self::may_contact_remote`] this ignores `conservative_sensitive`.
+    /// That flag exists so an unrecognised subcommand still fails closed on
+    /// authentication checks, where a wrong answer lets a credential escape.
+    /// Advisory output wants the opposite trade: report only when the operation
+    /// is known to contact a remote, so unknown commands stay quiet.
+    fn contacts_network(&self) -> bool {
+        if matches!(
+            self.name.as_str(),
+            "push" | "pull" | "fetch" | "clone" | "submodule" | "ls-remote"
+        ) {
             return true;
         }
         let arguments = git_subcommand_index(&self.arguments)
@@ -3211,6 +3236,20 @@ fn git_boolean_is_enabled(value: &str) -> bool {
     )
 }
 
+/// A `passthrough` profile applies the Profile's identity but leaves the
+/// transport alone.  Say so on every networked operation, so a failed push
+/// points at the mode rather than at an unexplained authentication error.
+fn passthrough_credential_notice(ctx: &AppContext, operation: &GitOperation) -> Option<String> {
+    let profile = ctx.profile.as_ref()?;
+    if profile.manages_credentials() || !operation.contacts_network() {
+        return None;
+    }
+    Some(format!(
+        "ghis: Profile `{}` 的 credential_mode 为 passthrough，ghis 未写入凭据配置；Git 使用现有凭据来源",
+        ctx.profile_id().unwrap_or_default()
+    ))
+}
+
 fn validate_git_auth_safety(
     ctx: &AppContext,
     args: &[String],
@@ -3230,6 +3269,13 @@ fn validate_git_auth_safety(
     overrides.extend(command_line_git_config(&operation.arguments));
     for item in &overrides {
         if is_credential_helper_key(&item.key) {
+            // A `passthrough` profile installs no helper and injects no
+            // credential configuration, so there is nothing for a command-line
+            // override to bypass.  Refusing it would only stop the user from
+            // configuring credentials they explicitly took responsibility for.
+            if !profile.manages_credentials() {
+                continue;
+            }
             return Err(AppError::Message(
                 "检测到命令行 credential helper 覆盖；它会绕过所选 Profile，已停止操作。确需自行管理凭据时请使用 GHIS_BYPASS=1"
                     .into(),
@@ -3810,6 +3856,86 @@ mod tests {
             )
             .expect("config")
             .is_none()
+        );
+    }
+
+    #[test]
+    fn a_passthrough_binding_writes_no_credential_helper() {
+        let temp = tempdir().expect("temporary directory");
+        let repository_path = temp.path().join("repository");
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .arg(&repository_path)
+                .status()
+                .expect("git init")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://git.example.test/alice/example.git",
+                ])
+                .current_dir(&repository_path)
+                .status()
+                .expect("git remote")
+                .success()
+        );
+
+        let paths = ConfigPaths::from_bases(
+            temp.path().join("config"),
+            temp.path().join("cache"),
+            temp.path().join("state"),
+        );
+        let mut config = Config::default();
+        let mut passthrough = profile();
+        passthrough.host = "git.example.test".into();
+        passthrough.login = "alice".into();
+        passthrough.credential_mode = Some(config::CredentialMode::Passthrough);
+        config.profiles.insert("gitlab".into(), passthrough);
+        let context = AppContext::from_config(paths, config, &repository_path, Some("gitlab"))
+            .expect("context");
+        bind_repository(&context, "gitlab").expect("bind");
+
+        let repository = context.repository.as_ref().expect("repository");
+        // Not one value, not even the empty reset: the inherited chain is what
+        // this mode exists to keep.
+        assert_eq!(
+            repo::local_config_values(repository, &git::credential_helper_key("git.example.test"))
+                .expect("read helper"),
+            Vec::<String>::new(),
+            "passthrough must leave the helper key absent"
+        );
+        assert!(
+            !repository_binding_needs_repair(&context).expect("complete binding"),
+            "an absent helper is the expected state for passthrough"
+        );
+
+        // Identity still applies, which is the whole point of the mode.
+        let name = Command::new("git")
+            .args(["config", "--includes", "--get", "user.name"])
+            .current_dir(&repository_path)
+            .output()
+            .expect("read identity");
+        assert_eq!(
+            String::from_utf8_lossy(&name.stdout).trim(),
+            "Alice Example"
+        );
+
+        // A leftover helper from an earlier `manage` bind must still be removed.
+        let helper = credential_helper_command(&context.paths);
+        git::install_credential_helper(repository, "git.example.test", &helper)
+            .expect("simulate a previous manage bind");
+        assert!(repository_binding_needs_repair(&context).expect("stale helper"));
+        bind_repository(&context, "gitlab").expect("repair");
+        assert_eq!(
+            repo::local_config_values(repository, &git::credential_helper_key("git.example.test"))
+                .expect("read helper"),
+            Vec::<String>::new(),
+            "re-binding a passthrough profile removes the previous helper"
         );
     }
 
