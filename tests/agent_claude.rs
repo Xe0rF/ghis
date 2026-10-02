@@ -97,3 +97,52 @@ fn settings_merge_preserves_unknown_and_uninstall_is_idempotent() {
             .any(|entry| entry["hooks"][0]["command"] == "other")
     );
 }
+
+/// A hook written by an older build must still be recognised as ghis-managed.
+/// `setup` replaces a managed entry in place; an unrecognised marker would
+/// leave the old one behind and add a second copy, so bumping
+/// `SETTINGS_MARKER` is only safe while this holds.
+#[test]
+fn setup_replaces_a_hook_written_by_an_older_build() {
+    let dir = tempdir().unwrap();
+    let path = dir.path().join("settings.json");
+    fs::write(
+        &path,
+        serde_json::to_vec_pretty(&json!({
+            "hooks": {
+                "SessionStart": [
+                    {
+                        "matcher": "x",
+                        "hooks": [{
+                            "type": "command",
+                            "command": "/old/path/ghis hook claude",
+                            "statusMessage": "ghis-agent-context-v1"
+                        }]
+                    }
+                ]
+            }
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    claude::setup_settings(&path, std::path::Path::new("/bin/ghis"), None).expect("setup");
+
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let entries = value["hooks"]["SessionStart"].as_array().unwrap();
+    let managed: Vec<_> = entries
+        .iter()
+        .filter(|entry| entry["hooks"][0]["statusMessage"] == SETTINGS_MARKER)
+        .collect();
+    assert_eq!(
+        managed.len(),
+        1,
+        "setup must replace the old managed hook, not append beside it: {value}"
+    );
+    assert!(
+        !serde_json::to_string(&value)
+            .unwrap()
+            .contains("ghis-agent-context-v1"),
+        "the stale marker survived: {value}"
+    );
+}

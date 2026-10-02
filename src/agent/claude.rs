@@ -12,7 +12,12 @@ use thiserror::Error;
 use super::{AgentError, AgentKind, ContextProvider, launcher_spec, resolved_context};
 use crate::process::CommandSpec;
 
-pub const SETTINGS_MARKER: &str = "ghis-agent-context-v1";
+pub const SETTINGS_MARKER: &str = "ghis-agent-context-v2";
+/// Every marker ghis has ever written.  An exact match on the current marker
+/// would make a future bump orphan hooks installed by an older build, and
+/// `setup` would append a second copy instead of replacing it.  The marker
+/// only records ownership, so matching the family is enough.
+const SETTINGS_MARKER_FAMILY: &str = "ghis-agent-context-v";
 pub const MAX_HOOK_INPUT_BYTES: usize = 1024 * 1024;
 pub const MAX_ADDITIONAL_CONTEXT_BYTES: usize = 64 * 1024;
 const HOOK_EVENTS: [&str; 3] = ["SessionStart", "UserPromptSubmit", "SubagentStart"];
@@ -256,7 +261,9 @@ fn is_managed_entry(value: &Value) -> bool {
         .and_then(Value::as_array)
         .is_some_and(|hooks| {
             hooks.iter().any(|hook| {
-                hook.get("statusMessage").and_then(Value::as_str) == Some(SETTINGS_MARKER)
+                hook.get("statusMessage")
+                    .and_then(Value::as_str)
+                    .is_some_and(|marker| marker.starts_with(SETTINGS_MARKER_FAMILY))
             })
         })
 }

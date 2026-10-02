@@ -10,12 +10,34 @@ use crate::config::ResolutionSource;
 use serde::Serialize;
 use std::fmt::Write as _;
 
-pub const AGENT_CONTEXT_SCHEMA_VERSION: u32 = 1;
-pub const AGENT_CONTEXT_CONTRACT: [&str; 3] = [
-    "Use ordinary git and gh from PATH.",
-    "Do not run gh auth switch.",
+pub const AGENT_CONTEXT_SCHEMA_VERSION: u32 = 2;
+
+/// Rules that hold whatever forge the selected Profile targets.
+///
+/// None of these may name a CLI: ghis manages identity for hosts other than
+/// GitHub, and the agent has to be told which host it is on instead of being
+/// told to reach for `gh`.  `contract_for` adds that host.
+const AGENT_CONTEXT_CONTRACT: [&str; 3] = [
+    "Use ordinary git from PATH.",
+    "Do not switch the selected account globally (`gh auth switch` and equivalents).",
     "Do not output or persist tokens, keys, or other credentials.",
 ];
+
+fn contract_for(host: Option<&str>) -> Vec<String> {
+    let mut contract: Vec<String> = AGENT_CONTEXT_CONTRACT
+        .iter()
+        .map(|item| (*item).to_owned())
+        .collect();
+    if let Some(host) = host {
+        contract.insert(
+            1,
+            format!(
+                "The repository host is `{host}`; use that host's own CLI for API and merge-request operations."
+            ),
+        );
+    }
+    contract
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentContext {
@@ -24,7 +46,7 @@ pub struct AgentContext {
     pub selection: AgentSelection,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub identity: Option<AgentIdentity>,
-    pub contract: [&'static str; 3],
+    pub contract: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -102,8 +124,11 @@ pub enum SelectionSourceKind {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct AgentIdentity {
-    pub github_host: String,
-    pub github_login: String,
+    /// Forge the Profile targets, normalised the same way every cross-host
+    /// guard compares it.  An agent told one spelling of a host while ghis
+    /// enforces another would reach the wrong conclusions.
+    pub host: String,
+    pub login: String,
     pub git_name: String,
     pub git_email: String,
     pub signing_enabled: bool,
@@ -164,8 +189,8 @@ impl AgentContext {
         let source = SelectionSource::from(&context.resolution.source);
         let state = SelectionState::from(&context.resolution.source);
         let identity = context.profile.as_ref().map(|profile| AgentIdentity {
-            github_host: profile.host.clone(),
-            github_login: profile.login.clone(),
+            host: crate::github::normalize_host(&profile.host),
+            login: profile.login.clone(),
             git_name: profile.git_name.clone(),
             git_email: profile.git_email.clone(),
             signing_enabled: profile.signing.enabled,
@@ -179,8 +204,8 @@ impl AgentContext {
                 source,
                 candidates: context.resolution.candidates.clone(),
             },
+            contract: contract_for(identity.as_ref().map(|identity| identity.host.as_str())),
             identity,
-            contract: AGENT_CONTEXT_CONTRACT,
         }
     }
 
@@ -215,7 +240,9 @@ impl AgentContext {
     }
 
     fn render_text(&self) -> String {
-        let mut output = String::from("ghis session context (schema v1)\n");
+        // Interpolated rather than hardcoded: a literal "schema v1" silently
+        // desynced from the constant every time the payload changed shape.
+        let mut output = format!("ghis session context (schema v{})\n", self.schema_version);
         writeln!(
             output,
             "repository: state={} root={} owner={} name={} transport={}",
@@ -250,8 +277,8 @@ impl AgentContext {
             writeln!(
                 output,
                 "identity: {}/{}; {} <{}>; signing={}",
-                identity.github_host,
-                identity.github_login,
+                identity.host,
+                identity.login,
                 identity.git_name,
                 identity.git_email,
                 if identity.signing_enabled {
@@ -264,7 +291,7 @@ impl AgentContext {
         } else {
             writeln!(output, "identity: none").expect("write to string");
         }
-        for item in self.contract {
+        for item in &self.contract {
             writeln!(output, "contract: {item}").expect("write to string");
         }
         output.trim_end().to_owned()

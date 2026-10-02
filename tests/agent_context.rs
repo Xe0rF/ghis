@@ -163,3 +163,129 @@ fn default_profile_context_explains_fallback_scope() {
     let bound = AgentContext::from_app(&context(ResolutionSource::RepositoryBinding, Some("work")));
     assert!(!bound.render_codex().contains("context note:"));
 }
+
+/// Build the same fixture with a profile host that is not already normalised.
+/// `Profile.host` is only normalised when the CLI writes it, so a hand-edited
+/// or imported configuration can still carry odd spellings.
+fn context_with_profile_host(source: ResolutionSource, host: &str) -> AppContext {
+    let mut app = context(source, Some("work"));
+    app.profile.as_mut().expect("profile").host = host.into();
+    app
+}
+
+#[test]
+fn json_identity_uses_forge_neutral_field_names() {
+    let projected = AgentContext::from_app(&context(ResolutionSource::Explicit, Some("work")));
+    let json = projected.render_json().expect("json");
+
+    assert!(
+        json.contains(r#""host": "github.example.test""#),
+        "missing neutral host key: {json}"
+    );
+    assert!(json.contains(r#""login": "alice""#), "{json}");
+    for stale in ["github_host", "github_login"] {
+        assert!(
+            !json.contains(stale),
+            "the GitHub-only key `{stale}` is still in the payload: {json}"
+        );
+    }
+}
+
+#[test]
+fn schema_version_matches_the_constant_and_the_text_header() {
+    // Pin the value, not just its self-consistency: this payload renamed
+    // `github_host`/`github_login` to `host`/`login`, which is why it is 2.
+    assert_eq!(ghis::agent_context::AGENT_CONTEXT_SCHEMA_VERSION, 2);
+
+    let projected = AgentContext::from_app(&context(ResolutionSource::Explicit, Some("work")));
+
+    assert_eq!(
+        projected.schema_version,
+        ghis::agent_context::AGENT_CONTEXT_SCHEMA_VERSION
+    );
+    let json = projected.render_json().expect("json");
+    assert!(
+        json.contains(&format!(
+            r#""schema_version": {json_version}"#,
+            json_version = projected.schema_version
+        )),
+        "{json}"
+    );
+
+    // The header used to be a hardcoded "schema v1" literal that silently
+    // desynced from the constant.  Pin them together.
+    let header = projected.render_codex();
+    assert!(
+        header.starts_with(&format!(
+            "ghis session context (schema v{version})",
+            version = projected.schema_version
+        )),
+        "text header disagrees with schema_version: {header}"
+    );
+}
+
+#[test]
+fn reported_identity_host_is_normalised_like_cross_host_guards() {
+    // ghis compares hosts through `github::normalize_host` everywhere it makes
+    // an authorisation decision.  The agent context used to copy `Profile.host`
+    // verbatim, so an agent could be told a host string that no guard would
+    // ever match.
+    let projected = AgentContext::from_app(&context_with_profile_host(
+        ResolutionSource::Explicit,
+        "Git.Example.Test.:443",
+    ));
+    let json = projected.render_json().expect("json");
+
+    assert!(
+        json.contains(r#""host": "git.example.test""#),
+        "identity host was not normalised: {json}"
+    );
+    assert!(!json.contains("Git.Example.Test"), "{json}");
+}
+
+#[test]
+fn contract_text_reflects_the_active_forge_rather_than_only_github() {
+    let gitlab = AgentContext::from_app(&context_with_profile_host(
+        ResolutionSource::Explicit,
+        "Git.Example.Test.",
+    ));
+    let contract = gitlab.contract.join("\n");
+    let lowered = contract.to_lowercase();
+
+    // The agent has to be told which host it is on; otherwise a GitLab
+    // repository reads "use gh" and the agent reaches for the wrong CLI.
+    assert!(
+        lowered.contains("the repository host is `git.example.test`"),
+        "the contract must name the active host: {contract}"
+    );
+    assert!(
+        !lowered.contains("use ordinary git and gh"),
+        "no rule may name one CLI as universal: {contract}"
+    );
+    assert!(
+        !contract.contains("gitlab") && !contract.contains("glab"),
+        "the contract must not hard-code one forge: {contract}"
+    );
+    for rule in [
+        "use ordinary git from path",
+        "do not switch the selected account globally",
+        "do not output or persist tokens",
+    ] {
+        assert!(lowered.contains(rule), "missing rule {rule}: {contract}");
+    }
+
+    // The contract lines reach the agent verbatim, so every format must carry
+    // them.
+    for output in [
+        gitlab.render_json().expect("json"),
+        gitlab.render_codex(),
+        gitlab.render_claude(),
+    ] {
+        assert!(
+            output
+                .to_lowercase()
+                .contains("the repository host is `git.example.test`"),
+            "{output}"
+        );
+    }
+}
