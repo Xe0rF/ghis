@@ -151,7 +151,7 @@ git_email = "linked@example.test"
             "config",
             "--local",
             "--get-regexp",
-            r"^(ghis\.profile|includeIf\.|credential\.https://github\.com\.helper|hook\.ghis-)",
+            r"^(ghis\.profile|include\.|credential\.https://github\.com\.helper|hook\.ghis-)",
         ],
     );
     assert_eq!(shared.status.code(), Some(1));
