@@ -314,9 +314,9 @@ fn unique_profile_for_target(
 /// The `-c` overrides that make Git resolve the same identity the wrapper
 /// would use for the next command.
 ///
-/// A bound repository already carries `includeIf.gitdir` pointing at its
-/// fragment, so it needs nothing.  An unbound one gets the fragment the same
-/// way `run_git` does.  If the fragment cannot be produced, fall back to no
+/// A bound repository already carries `include.path` pointing at its fragment,
+/// so it needs nothing.  An unbound one gets the fragment the same way
+/// `run_git` does.  If the fragment cannot be produced, fall back to no
 /// override rather than reporting an identity no commit would carry.
 fn identity_overrides(
     paths: &ConfigPaths,
@@ -553,7 +553,7 @@ pub fn bind_repository(ctx: &AppContext, id: &str) -> Result<()> {
     let fragment = write_profile_fragment(&ctx.paths, id, profile)?;
     remove_managed_credential_helpers(repository)?;
     git::set_git_config(repository, PROFILE_CONFIG_KEY, id)?;
-    let include_keys = profile_include_keys(repository);
+    let include_keys = profile_include_keys();
     for old_key in profile_include_cleanup_keys(repository) {
         unset_profile_include(repository, &old_key)?;
     }
@@ -651,30 +651,42 @@ fn unset_profile_include(repository: &Repository, key: &str) -> Result<()> {
     Ok(())
 }
 
-/// Conditions that expose the profile fragment to this repository.
+/// The key that exposes the profile fragment to this repository.
 ///
-/// A linked worktree's own git directory is `<common-dir>/worktrees/<name>`, so
-/// a condition matching only the common directory reaches the main worktree and
-/// nothing else. The glob form additionally matches every worktree gitdir
-/// beneath it. Both are written: the glob alone misses nothing on a normal
-/// repository, but the exact form is what a bare repository and any gitdir
-/// spelled without a trailing separator compare against, and dropping it would
-/// silently unbind those.
-fn profile_include_keys(repository: &Repository) -> Vec<String> {
-    let gitdir = fs::canonicalize(&repository.common_dir)
+/// This is deliberately unconditional.  A linked worktree's own git directory
+/// is `<common-dir>/worktrees/<name>`, which is why the conditional form needed
+/// two spellings to reach both the main worktree and every worktree beneath it,
+/// but the condition never decided the fragment's reach.  The reach came from
+/// *which file* the key was written into: a repository's own config is only
+/// read while git operates on that repository, and a linked worktree reads its
+/// common config too.  Both spellings covered the main worktree and all of its
+/// worktrees; so does one unconditional `include.path`.
+///
+/// The condition is gone for the tooling it blocked.  A repository config
+/// carrying `includeIf` is refused outright by anything that must decide which
+/// filter drivers a checkout would load, so Claude Code's `EnterWorktree` aborts
+/// with "the filter drivers a checkout would load cannot be determined", and
+/// ghis was blocking its own repository from being worked on.
+fn profile_include_keys() -> Vec<String> {
+    vec!["include.path".to_string()]
+}
+
+/// The `includeIf` spellings earlier versions wrote.
+///
+/// Kept only so bind and unbind can erase them.  A repository bound by an older
+/// ghis reports no `include.path`, so `repository_binding_needs_repair` sends it
+/// through `bind_repository`, which clears these before writing the new key.
+fn legacy_profile_include_keys(repository: &Repository) -> Vec<String> {
+    let common = fs::canonicalize(&repository.common_dir)
         .unwrap_or_else(|_| repository.common_dir.clone())
         .to_string_lossy()
         .replace('\\', "/");
-    let trailing = gitdir.trim_end_matches('/');
-    vec![
+    let trailing = common.trim_end_matches('/');
+    let gitdir = repository.git_dir.to_string_lossy().replace('\\', "/");
+    let mut keys = vec![
         format!("includeIf.gitdir:{trailing}.path"),
         format!("includeIf.gitdir:{trailing}/**.path"),
-    ]
-}
-
-fn profile_include_cleanup_keys(repository: &Repository) -> Vec<String> {
-    let gitdir = repository.git_dir.to_string_lossy().replace('\\', "/");
-    let mut keys = profile_include_keys(repository);
+    ];
     for key in [
         format!("includeIf.gitdir:{gitdir}.path"),
         format!("includeIf.gitdir:{gitdir}/.path"),
@@ -683,6 +695,12 @@ fn profile_include_cleanup_keys(repository: &Repository) -> Vec<String> {
             keys.push(key);
         }
     }
+    keys
+}
+
+fn profile_include_cleanup_keys(repository: &Repository) -> Vec<String> {
+    let mut keys = profile_include_keys();
+    keys.extend(legacy_profile_include_keys(repository));
     keys
 }
 
@@ -2733,7 +2751,7 @@ fn repository_binding_needs_repair(ctx: &AppContext) -> Result<bool> {
     if fs::read_to_string(&fragment).ok().as_deref() != Some(expected_fragment.as_str()) {
         return Ok(true);
     }
-    for include_key in profile_include_keys(repository) {
+    for include_key in profile_include_keys() {
         let configured = repo::local_config(repository, &include_key)?;
         if configured.as_deref() != Some(fragment.to_string_lossy().as_ref()) {
             return Ok(true);
@@ -3748,6 +3766,97 @@ mod tests {
         }
     }
 
+    /// A repository config carrying `includeIf` is refused outright by anything
+    /// that has to decide which filter drivers a checkout would load.  Claude
+    /// Code's `EnterWorktree` aborts with "the filter drivers a checkout would
+    /// load cannot be determined", which left every bound repository, ghis
+    /// included, impossible to open a worktree in.  Binding must leave no
+    /// `includeIf` behind, in any scope.
+    #[test]
+    fn binding_writes_no_conditional_include_and_clears_older_ones() {
+        let temp = tempdir().expect("temporary directory");
+        let repository_path = temp.path().join("repository");
+        assert!(
+            Command::new("git")
+                .args(["init", "-q"])
+                .arg(&repository_path)
+                .status()
+                .expect("git init")
+                .success()
+        );
+        assert!(
+            Command::new("git")
+                .args([
+                    "remote",
+                    "add",
+                    "origin",
+                    "https://github.com/alice/example.git"
+                ])
+                .current_dir(&repository_path)
+                .status()
+                .expect("git remote")
+                .success()
+        );
+
+        // Seed what an older ghis wrote, so the migration is covered rather
+        // than just the fresh-bind case.
+        let common =
+            fs::canonicalize(repository_path.join(".git")).expect("canonical Git directory");
+        let condition = common.to_string_lossy().replace('\\', "/");
+        for key in [
+            format!("includeIf.gitdir:{condition}.path"),
+            format!("includeIf.gitdir:{condition}/**.path"),
+        ] {
+            assert!(
+                Command::new("git")
+                    .args(["config", "--local", &key, "/nonexistent/legacy.gitconfig"])
+                    .current_dir(&repository_path)
+                    .status()
+                    .expect("seed legacy include")
+                    .success()
+            );
+        }
+
+        let paths = ConfigPaths::from_bases(
+            temp.path().join("config"),
+            temp.path().join("cache"),
+            temp.path().join("state"),
+        );
+        let mut config = Config::default();
+        config.profiles.insert("personal".into(), profile());
+        let context = AppContext::from_config(paths, config, &repository_path, Some("personal"))
+            .expect("context");
+        bind_repository(&context, "personal").expect("bind");
+
+        for scope in ["--local", "--worktree"] {
+            let mut args = vec!["config"];
+            args.push(scope);
+            args.extend(["--get-regexp", r"^includeIf\."]);
+            let out = Command::new("git")
+                .args(&args)
+                .current_dir(&repository_path)
+                .output()
+                .expect("scan for conditional includes");
+            assert_eq!(
+                out.status.code(),
+                Some(1),
+                "ghis left an includeIf behind in scope {scope:?}: {}",
+                String::from_utf8_lossy(&out.stdout)
+            );
+        }
+
+        // The fragment still reaches the repository, unconditionally.
+        let email = Command::new("git")
+            .args(["config", "--includes", "--get", "user.email"])
+            .current_dir(&repository_path)
+            .output()
+            .expect("read identity");
+        assert_eq!(
+            String::from_utf8_lossy(&email.stdout).trim(),
+            "alice@example.test"
+        );
+    }
+
     #[cfg(unix)]
     #[test]
     fn binding_uses_fragment_without_global_identity_changes() {
@@ -4078,7 +4187,7 @@ mod tests {
             .expect("read shared profile marker");
         assert_eq!(shared_marker.status.code(), Some(1));
         let shared_include = Command::new("git")
-            .args(["config", "--local", "--get-regexp", r"^includeIf\."])
+            .args(["config", "--local", "--get-regexp", r"^include"])
             .current_dir(&main)
             .output()
             .expect("read shared profile includes");
@@ -4102,7 +4211,7 @@ mod tests {
                 .expect("read config.worktree marker");
             assert_eq!(String::from_utf8_lossy(&marker.stdout).trim(), expected_id);
             let include = Command::new("git")
-                .args(["config", "--worktree", "--get-regexp", r"^includeIf\."])
+                .args(["config", "--worktree", "--get-regexp", r"^include\.path$"])
                 .current_dir(repository.command_dir())
                 .output()
                 .expect("read config.worktree include");
@@ -4129,7 +4238,7 @@ mod tests {
             .is_none()
         );
         let removed_include = Command::new("git")
-            .args(["config", "--worktree", "--get-regexp", r"^includeIf\."])
+            .args(["config", "--worktree", "--get-regexp", r"^include\.path$"])
             .current_dir(&first_worktree)
             .output()
             .expect("read removed first include");
