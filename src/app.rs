@@ -7,7 +7,7 @@ use crate::config::{
 use crate::git::{self, EffectiveIdentities, FragmentOptions};
 use crate::github;
 use crate::process::{CommandRunner, CommandSpec, ProcessError, SystemCommandRunner};
-use crate::repo::{self, Remote, RepoError, Repository, Transport};
+use crate::repo::{self, Remote, RepoError, Repository};
 use crate::signing;
 use crate::state::{self, AuditAction, RepositoryBindingRecord};
 use fd_lock::RwLock;
@@ -48,6 +48,10 @@ pub struct AppContext {
     pub config: Config,
     pub repository: Option<Repository>,
     pub remote: Option<Remote>,
+    /// Remote resolved from a `clone` / `ls-remote` URL operand.  When set,
+    /// `repository` is only the enclosing directory: it supplies aliases and
+    /// signing context, but it is never bound or registered for this command.
+    pub url_target: Option<Remote>,
     pub resolution: ProfileResolution,
     pub profile: Option<Profile>,
     pub identities: Option<EffectiveIdentities>,
@@ -102,7 +106,33 @@ impl AppContext {
         explicit: Option<&str>,
         target: Option<&GhProfileTarget>,
     ) -> Result<Self> {
-        Self::from_config_with_target(paths, config, cwd, explicit, target, true, false)
+        Self::from_config_with_target(
+            paths,
+            config,
+            cwd,
+            explicit,
+            target.map(ProfileTarget::Gh),
+            true,
+            false,
+        )
+    }
+
+    fn from_config_for_git(
+        paths: ConfigPaths,
+        config: Config,
+        cwd: impl AsRef<Path>,
+        explicit: Option<&str>,
+        target: Option<&GitUrlTarget>,
+    ) -> Result<Self> {
+        Self::from_config_with_target(
+            paths,
+            config,
+            cwd,
+            explicit,
+            target.map(ProfileTarget::GitUrl),
+            true,
+            true,
+        )
     }
 
     fn from_config_with_target(
@@ -110,7 +140,7 @@ impl AppContext {
         config: Config,
         cwd: impl AsRef<Path>,
         explicit: Option<&str>,
-        target: Option<&GhProfileTarget>,
+        target: Option<ProfileTarget<'_>>,
         inspect_identities: bool,
         constrain_default_profile: bool,
     ) -> Result<Self> {
@@ -124,6 +154,40 @@ impl AppContext {
             }
             Err(RepoError::NotRepository { .. }) => (None, None, None),
             Err(error) => return Err(error.into()),
+        };
+        let mut url_target = None;
+        let target_context = match target {
+            Some(ProfileTarget::Gh(target)) => Some(target.context.clone()),
+            // A repository operand only selects the identity where the URL is
+            // the repository being created (`clone`) or where no binding exists
+            // to protect (`ls-remote` outside a repository).
+            Some(ProfileTarget::GitUrl(target))
+                if !(target.outside_repository_only && repository.is_some()) =>
+            {
+                match repo::url_target_remote(&target.url) {
+                    Ok(Some(remote)) => {
+                        url_target = Some(remote.clone());
+                        Some(RuleContext {
+                            host: remote.host.clone(),
+                            repository_host: if constrain_default_profile {
+                                remote.host.clone()
+                            } else {
+                                None
+                            },
+                            owner: remote.owner.clone(),
+                            repo: remote.repo.clone(),
+                            remote: Some(remote.url.clone()),
+                            gitdir: None,
+                            cwd: Some(cwd.clone()),
+                        })
+                    }
+                    // An operand Git would not contact, or one ghis cannot
+                    // inspect, keeps exactly the resolution that ran before
+                    // URLs participated.
+                    Ok(None) | Err(_) => None,
+                }
+            }
+            _ => None,
         };
         let (repository_context, repository_match) = if let Some(remote) = remote.as_ref() {
             (
@@ -158,11 +222,10 @@ impl AppContext {
                 None,
             )
         };
-        let mut context = target
-            .map(|target| target.context.clone())
-            .unwrap_or(repository_context);
+        let target_applied = target_context.is_some();
+        let mut context = target_context.unwrap_or(repository_context);
         context.cwd = Some(cwd);
-        let remote_login_match = if target.is_some() {
+        let remote_login_match = if target_applied {
             unique_profile_for_target(&config, context.host.as_deref(), context.owner.as_deref())
         } else {
             repository_match
@@ -173,27 +236,34 @@ impl AppContext {
             &config,
             &context,
             explicit,
-            target.is_none().then_some(binding.as_deref()).flatten(),
+            (!target_applied).then_some(binding.as_deref()).flatten(),
             remote_login_match.as_deref(),
         );
         warnings.extend(resolution.warnings.clone());
-        if matches!(
-            resolution.source,
-            ResolutionSource::Unresolved
-                | ResolutionSource::Ambiguous
-                | ResolutionSource::InvalidExplicit
-                | ResolutionSource::InvalidRepositoryBinding
-        ) && repository.is_some()
+        if (repository.is_some() || url_target.is_some())
+            && matches!(
+                resolution.source,
+                ResolutionSource::Unresolved
+                    | ResolutionSource::Ambiguous
+                    | ResolutionSource::InvalidExplicit
+                    | ResolutionSource::InvalidRepositoryBinding
+            )
         {
-            warnings.push(match resolution.source {
-                ResolutionSource::Ambiguous => "仓库身份规则存在歧义，未自动选择账号".into(),
-                ResolutionSource::InvalidExplicit => {
+            warnings.push(match (&resolution.source, url_target.is_some()) {
+                (ResolutionSource::Ambiguous, true) => {
+                    "目标仓库 URL 的身份规则存在歧义，未自动选择账号".into()
+                }
+                (ResolutionSource::Ambiguous, false) => {
+                    "仓库身份规则存在歧义，未自动选择账号".into()
+                }
+                (ResolutionSource::InvalidExplicit, _) => {
                     "显式指定的 Profile 不存在，拒绝回退到其他身份".into()
                 }
-                ResolutionSource::InvalidRepositoryBinding => {
+                (ResolutionSource::InvalidRepositoryBinding, _) => {
                     "仓库绑定的 Profile 已失效，拒绝回退到其他身份".into()
                 }
-                _ => "仓库尚未绑定 ghis profile，将继续使用现有 Git 配置".into(),
+                (_, true) => "目标仓库 URL 未匹配任何 Profile，将继续使用现有 Git 配置".into(),
+                (_, false) => "仓库尚未绑定 ghis profile，将继续使用现有 Git 配置".into(),
             });
         }
         let profile = resolution
@@ -203,9 +273,16 @@ impl AppContext {
         // Read the identities only now that the Profile is known.  An unbound
         // repository has no fragment on disk, so without the `-c include.path`
         // the wrapper would use, this would report the global identity instead
-        // of the one a commit would actually carry.
-        let identities = match (inspect_identities, repository.as_ref(), &profile) {
-            (true, Some(repository), Some(profile)) => {
+        // of the one a commit would actually carry.  A URL target describes a
+        // repository that does not exist yet, so the enclosing identity would
+        // be misleading.
+        let identities = match (
+            inspect_identities,
+            url_target.is_some(),
+            repository.as_ref(),
+            &profile,
+        ) {
+            (true, false, Some(repository), Some(profile)) => {
                 let overrides = resolution
                     .profile
                     .as_deref()
@@ -220,6 +297,7 @@ impl AppContext {
             config,
             repository,
             remote,
+            url_target,
             resolution,
             profile,
             identities,
@@ -309,6 +387,32 @@ fn unique_profile_for_target(
         .map(|(id, _)| id.clone());
     let first = matches.next()?;
     matches.next().is_none().then_some(first)
+}
+
+/// Profiles that answer HTTPS credentials for hosts other than `current`'s.
+///
+/// Only hosts with exactly one credential-managing Profile qualify; a host
+/// shared by several Profiles stays with the inherited helper chain, and the
+/// current Profile's host always keeps its existing semantics (including a
+/// passthrough chain).  The result is sorted by normalized host so injected
+/// argv is deterministic.
+pub fn credential_routes<'a>(
+    config: &'a Config,
+    current: Option<&Profile>,
+) -> Vec<(&'a str, &'a Profile)> {
+    if config.behavior.credential_routing != config::CredentialRouting::PerHost {
+        return Vec::new();
+    }
+    let current_host = current.map(|profile| git::normalize_host(&profile.host));
+    config
+        .credential_routes()
+        .into_iter()
+        .filter(|(host, _)| current_host.as_deref() != Some(host.as_str()))
+        .filter_map(|(_, id)| {
+            let profile = config.profiles.get(&id)?;
+            Some((profile.host.as_str(), profile))
+        })
+        .collect()
 }
 
 /// The `-c` overrides that make Git resolve the same identity the wrapper
@@ -1059,7 +1163,8 @@ where
     } else {
         Config::load(&paths.config_file)?
     };
-    let ctx = AppContext::from_config(paths, config, cwd, explicit)?;
+    let url_target = git_url_target(args);
+    let ctx = AppContext::from_config_for_git(paths, config, cwd, explicit, url_target.as_ref())?;
     ctx.ensure_selection_available()?;
     let operation = resolve_git_operation(&ctx, args, cwd);
     if ctx.profile.is_none()
@@ -1076,6 +1181,7 @@ where
     let repository_binding = matches!(ctx.resolution.source, ResolutionSource::RepositoryBinding);
     let binding_needs_repair = repository_binding && repository_binding_needs_repair(&ctx)?;
     let should_auto_bind = ctx.repository.is_some()
+        && ctx.url_target.is_none()
         && ctx.config.behavior.auto_bind
         && matches!(ctx.resolution.source, ResolutionSource::Rule { .. });
     if should_auto_bind || binding_needs_repair {
@@ -1142,6 +1248,28 @@ where
         if profile.manages_credentials() {
             let helper = credential_helper_command(&ctx.paths);
             let helper_key = git::credential_helper_key(&profile.host);
+            command = command
+                .arg("-c")
+                .arg(format!("{helper_key}="))
+                .arg("-c")
+                .arg(format!("{helper_key}={helper}"));
+        }
+    }
+    // Route other hosts that have exactly one credential-managing Profile.
+    // This is runtime-only: nothing is written to the repository, and the
+    // helper string stays identical to the current Profile's.  A command-line
+    // helper override is the user's explicit choice, so routing stays out of
+    // its way (with a credential-managing Profile that override was already
+    // refused).
+    let routes = credential_routes(&ctx.config, ctx.profile.as_ref());
+    if !routes.is_empty()
+        && !command_line_config_overrides(args, &operation)
+            .iter()
+            .any(|item| is_credential_helper_key(&item.key))
+    {
+        let helper = credential_helper_command(&ctx.paths);
+        for (host, _) in routes {
+            let helper_key = git::credential_helper_key(host);
             command = command
                 .arg("-c")
                 .arg(format!("{helper_key}="))
@@ -1423,7 +1551,7 @@ fn validate_profile_operation(
             || target
                 .remotes()
                 .iter()
-                .any(|remote| remote.transport == Transport::Ssh)
+                .any(|remote| remote.transport.may_use_ssh())
     });
     if may_use_remote && target_may_use_ssh {
         match profile.ssh.as_ref() {
@@ -1673,6 +1801,22 @@ struct GhTargetPolicy {
 #[derive(Debug, Clone, Default)]
 struct GhProfileTarget {
     context: RuleContext,
+}
+
+/// A repository URL taken from the command line of `git clone` or, outside a
+/// repository, `git ls-remote`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitUrlTarget {
+    url: String,
+    /// `ls-remote` keeps the repository binding authoritative, so its URL only
+    /// participates when the working directory is not inside a repository.
+    outside_repository_only: bool,
+}
+
+#[derive(Clone, Copy)]
+enum ProfileTarget<'a> {
+    Gh(&'a GhProfileTarget),
+    GitUrl(&'a GitUrlTarget),
 }
 
 fn gh_profile_target(
@@ -2852,6 +2996,62 @@ fn git_policy_insertion_index(args: &[String]) -> usize {
     }
 }
 
+/// Whether a configuration key is a Git URL rewrite rule.
+fn is_url_rewrite_key(key: &str) -> bool {
+    let Some(rest) = key.strip_prefix("url.") else {
+        return false;
+    };
+    let Some((_, suffix)) = rest.rsplit_once('.') else {
+        return false;
+    };
+    matches!(suffix, "insteadof" | "pushinsteadof")
+}
+
+/// Derive a Profile target from the repository URL of a literal `clone` or
+/// `ls-remote` subcommand.
+///
+/// Only literal subcommands participate: an alias is not expanded here, so an
+/// alias that happens to run `clone` keeps the ordinary resolution.  The parser
+/// declines whenever Git could contact a URL ghis did not see: an explicit
+/// `--git-dir`, `GIT_DIR` in the environment, or URL rewrite rules given on the
+/// command line or through clone's own `-c` values.
+fn git_url_target(args: &[String]) -> Option<GitUrlTarget> {
+    let index = git_subcommand_index(args)?;
+    let operation = args.get(index)?.as_str();
+    let outside_repository_only = match operation {
+        "clone" => false,
+        "ls-remote" => true,
+        _ => return None,
+    };
+    if std::env::var_os("GIT_DIR").is_some()
+        || args[..index]
+            .iter()
+            .any(|argument| argument == "--git-dir" || argument.starts_with("--git-dir="))
+    {
+        return None;
+    }
+    if command_line_git_config(args)
+        .iter()
+        .any(|item| is_url_rewrite_key(&item.key))
+    {
+        return None;
+    }
+    let operand = repo::repository_operand(operation, &args[index + 1..])?;
+    if operand.config.iter().any(|assignment| {
+        let key = assignment
+            .split_once('=')
+            .map_or(assignment.as_str(), |(key, _)| key)
+            .to_ascii_lowercase();
+        is_url_rewrite_key(&key)
+    }) {
+        return None;
+    }
+    Some(GitUrlTarget {
+        url: operand.url,
+        outside_repository_only,
+    })
+}
+
 #[derive(Debug, Clone)]
 struct GitOperation {
     name: String,
@@ -3199,6 +3399,25 @@ fn push_config_override(values: &mut Vec<GitConfigOverride>, assignment: &str, s
     });
 }
 
+/// Every configuration override on the command line, including the ones
+/// `git clone` applies to the new repository before its fetch.
+fn command_line_config_overrides(
+    args: &[String],
+    operation: &GitOperation,
+) -> Vec<GitConfigOverride> {
+    let mut overrides = command_line_git_config(args);
+    overrides.extend(command_line_git_config(&operation.arguments));
+    if let Some(operand) = repo::repository_operand(
+        &operation.name,
+        operation.arguments.get(1..).unwrap_or_default(),
+    ) {
+        for assignment in &operand.config {
+            push_config_override(&mut overrides, assignment, "git clone -c");
+        }
+    }
+    overrides
+}
+
 fn validate_commit_signing_argv(
     ctx: &AppContext,
     args: &[String],
@@ -3317,8 +3536,7 @@ fn validate_git_auth_safety(
         ));
     }
 
-    let mut overrides = command_line_git_config(args);
-    overrides.extend(command_line_git_config(&operation.arguments));
+    let overrides = command_line_config_overrides(args, operation);
     for item in &overrides {
         if is_credential_helper_key(&item.key) {
             // A `passthrough` profile installs no helper and injects no
@@ -3343,6 +3561,11 @@ fn validate_git_auth_safety(
         .chain(operation.arguments.iter())
         .any(|argument| contains_https_password_for_host(argument, Some(&profile.host)))
         || ctx.remote.as_ref().is_some_and(|remote| {
+            contains_https_password_for_host(&remote.url, Some(&profile.host))
+        })
+        || ctx.url_target.as_ref().is_some_and(|remote| {
+            // The URL target holds the effective URL after `insteadOf`
+            // rewrites, which is what Git will actually contact.
             contains_https_password_for_host(&remote.url, Some(&profile.host))
         })
     {
@@ -3460,17 +3683,20 @@ fn find_http_scheme(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
 }
 
 fn inspect_repository_auth_config(ctx: &AppContext) -> Result<()> {
-    let (Some(repository), Some(profile)) = (ctx.repository.as_ref(), ctx.profile.as_ref()) else {
+    let Some(profile) = ctx.profile.as_ref() else {
         return Ok(());
     };
-    let output = git::run_git(
-        repository.command_dir(),
-        [
-            "config",
-            "--get-regexp",
-            r"^(remote\..*\.(url|pushurl)|url\..*\.(insteadof|pushinsteadof)|http(\..*)?\.extraheader)$",
-        ],
-    )?;
+    const QUERY: &str = r"^(remote\..*\.(url|pushurl)|url\..*\.(insteadof|pushinsteadof)|http(\..*)?\.extraheader)$";
+    let output = if ctx.url_target.is_some() {
+        // A clone reads only global, system and command-scope configuration,
+        // not the local configuration of the enclosing repository.
+        repo::git_config_outside_repository(["config", "--get-regexp", QUERY])?
+    } else {
+        let Some(repository) = ctx.repository.as_ref() else {
+            return Ok(());
+        };
+        git::run_git(repository.command_dir(), ["config", "--get-regexp", QUERY])?
+    };
     if !output.status.success() {
         if output.status.code() == Some(1) {
             return Ok(());
@@ -3670,6 +3896,7 @@ mod tests {
             config,
             repository: None,
             remote: None,
+            url_target: None,
             resolution: ProfileResolution {
                 profile: Some("personal".into()),
                 source: ResolutionSource::Explicit,
@@ -3688,6 +3915,35 @@ mod tests {
             email: email.into(),
             raw: format!("{name} <{email}> 0 +0000"),
         }
+    }
+
+    #[test]
+    fn credential_routes_exclude_the_current_host_and_honour_the_setting() {
+        let mut config = Config::default();
+        let mut current = profile();
+        current.host = "github.com".into();
+        config.profiles.insert("current".into(), current);
+        let mut other = profile();
+        other.host = "git.example.test".into();
+        other.login = "flowecho".into();
+        config.profiles.insert("other".into(), other);
+        let current_profile = config.profiles.get("current").unwrap();
+
+        let routes = credential_routes(&config, Some(current_profile));
+        assert_eq!(
+            routes.iter().map(|(host, _)| *host).collect::<Vec<_>>(),
+            vec!["git.example.test"]
+        );
+
+        // Without a resolved Profile every unique host is routable.
+        let routes = credential_routes(&config, None);
+        assert_eq!(
+            routes.iter().map(|(host, _)| *host).collect::<Vec<_>>(),
+            vec!["git.example.test", "github.com"]
+        );
+
+        config.behavior.credential_routing = config::CredentialRouting::CurrentProfile;
+        assert!(credential_routes(&config, Some(current_profile)).is_empty());
     }
 
     #[test]
@@ -4801,6 +5057,58 @@ mod tests {
         let fragment =
             fs::read_to_string(profile_fragment_path(&paths, "personal")).expect("read fragment");
         assert!(fragment.contains("current@example.test"));
+    }
+
+    #[test]
+    fn git_url_target_accepts_literal_clone_and_outside_ls_remote() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let clone = git_url_target(&args(&[
+            "-C",
+            "/tmp",
+            "-c",
+            "a=b",
+            "clone",
+            "-b",
+            "main",
+            "https://git.example.test/acme/tool.git",
+        ]))
+        .unwrap();
+        assert_eq!(clone.url, "https://git.example.test/acme/tool.git");
+        assert!(!clone.outside_repository_only);
+
+        let ls_remote = git_url_target(&args(&["ls-remote", "--heads", "origin"])).unwrap();
+        assert_eq!(ls_remote.url, "origin");
+        assert!(ls_remote.outside_repository_only);
+    }
+
+    #[test]
+    fn git_url_target_declines_unseen_targets() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(git_url_target(&args(&["clone", "--unknown", "url"])).is_none());
+        assert!(
+            git_url_target(&args(&[
+                "-c",
+                "url.https://git.example.test/.insteadOf=gx:",
+                "clone",
+                "gx:a/b",
+            ]))
+            .is_none()
+        );
+        assert!(git_url_target(&args(&["clone", "-c", "url.x.insteadOf=y", "url"])).is_none());
+        assert!(git_url_target(&args(&["--git-dir", "/tmp/x", "clone", "url"])).is_none());
+        assert!(git_url_target(&args(&["fetch", "origin"])).is_none());
     }
 
     #[test]

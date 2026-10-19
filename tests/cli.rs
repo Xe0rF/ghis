@@ -4066,7 +4066,14 @@ fn config_commands_list_and_update_behavior_with_short_keys() {
     let output = list.output().expect("list behavior settings");
     assert!(output.status.success());
     let settings: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(settings.as_array().unwrap().len(), 7);
+    assert_eq!(settings.as_array().unwrap().len(), 8);
+    assert!(
+        settings
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|setting| { setting[0] == "credential_routing" && setting[1] == "per-host" })
+    );
 
     let mut set = isolated_ghis_command();
     set.args(["config", "set", "display-identity", "never"]);

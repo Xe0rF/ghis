@@ -214,6 +214,21 @@ pub enum DisplayIdentity {
     Never,
 }
 
+/// How `ghis git` answers HTTPS credentials for hosts other than the current
+/// Profile's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum CredentialRouting {
+    /// Answer every host that has exactly one credential-managing Profile.
+    #[serde(alias = "per_host")]
+    #[default]
+    PerHost,
+    /// Only answer the current Profile's host; leave other hosts to the
+    /// inherited helper chain.
+    #[serde(alias = "current_profile")]
+    CurrentProfile,
+}
+
 /// Behavior settings that do not belong to a particular profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
@@ -222,6 +237,7 @@ pub struct Behavior {
     pub auto_bind: bool,
     pub unresolved: UnresolvedPolicy,
     pub credential_failure: CredentialFailurePolicy,
+    pub credential_routing: CredentialRouting,
     pub ssh_unmanaged: SshUnmanagedPolicy,
     pub display_identity: DisplayIdentity,
     pub display_profile_on_chpwd: bool,
@@ -234,6 +250,7 @@ impl Default for Behavior {
             auto_bind: true,
             unresolved: UnresolvedPolicy::default(),
             credential_failure: CredentialFailurePolicy::default(),
+            credential_routing: CredentialRouting::default(),
             ssh_unmanaged: SshUnmanagedPolicy::default(),
             display_identity: DisplayIdentity::default(),
             display_profile_on_chpwd: false,
@@ -612,6 +629,33 @@ impl Config {
         Self::save(self, ConfigPaths::discover()?.config_file)
     }
 
+    /// Hosts whose HTTPS credentials this configuration answers by itself.
+    ///
+    /// A host is routable only when exactly one Profile is configured on it and
+    /// that Profile manages credentials.  Hosts with several Profiles are
+    /// ambiguous and are deliberately left to the current Profile's helper
+    /// chain; nothing here picks an account.
+    pub fn credential_routes(&self) -> BTreeMap<String, String> {
+        let mut by_host: BTreeMap<String, (usize, Option<&str>)> = BTreeMap::new();
+        for (id, profile) in &self.profiles {
+            let host = crate::git::normalize_host(&profile.host);
+            if host.is_empty() {
+                continue;
+            }
+            let entry = by_host.entry(host).or_insert((0, None));
+            entry.0 += 1;
+            entry.1 = Some(id);
+        }
+        by_host
+            .into_iter()
+            .filter_map(|(host, (count, id))| {
+                let id = id?;
+                let profile = self.profiles.get(id)?;
+                (count == 1 && profile.manages_credentials()).then(|| (host, id.to_owned()))
+            })
+            .collect()
+    }
+
     /// Validate references and invariants before writing or using the config.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.version == 0 || self.version > CONFIG_VERSION {
@@ -792,6 +836,7 @@ const KNOWN_BEHAVIOR_TABLE_KEYS: &[&str] = &[
     "auto_bind",
     "unresolved",
     "credential_failure",
+    "credential_routing",
     "ssh_unmanaged",
     "display_identity",
     "display_profile_on_chpwd",
@@ -1007,6 +1052,7 @@ fn merge_document(dst: &mut DocumentMut, src: &DocumentMut) {
                         "auto_bind",
                         "unresolved",
                         "credential_failure",
+                        "credential_routing",
                         "ssh_unmanaged",
                         "display_identity",
                         "display_profile_on_chpwd",
@@ -1487,6 +1533,49 @@ mod tests {
             git_email: "alice@example.com".into(),
             ..Profile::default()
         }
+    }
+
+    #[test]
+    fn credential_routes_require_a_single_managing_profile_per_host() {
+        let mut config = Config::default();
+        let mut flowecho = profile();
+        flowecho.host = "git.example.test".into();
+        flowecho.login = "flowecho".into();
+        flowecho.credential_mode = Some(CredentialMode::Command);
+        flowecho.credential_command = Some(vec!["printf".into(), "token".into()]);
+        config.profiles.insert("flowecho".into(), flowecho);
+
+        let mut passthrough = profile();
+        passthrough.host = "pass.example.test".into();
+        passthrough.credential_mode = Some(CredentialMode::Passthrough);
+        config.profiles.insert("pass".into(), passthrough);
+
+        let mut shared_one = profile();
+        shared_one.host = "shared.example.test".into();
+        shared_one.login = "one".into();
+        config.profiles.insert("one".into(), shared_one);
+        let mut shared_two = profile();
+        shared_two.host = "Shared.Example.Test".into();
+        shared_two.login = "two".into();
+        config.profiles.insert("two".into(), shared_two);
+
+        let mut enterprise = profile();
+        enterprise.host = "port.example.test:8443".into();
+        enterprise.login = "enterprise".into();
+        config.profiles.insert("enterprise".into(), enterprise);
+
+        let routes = config.credential_routes();
+        assert_eq!(
+            routes.get("git.example.test").map(String::as_str),
+            Some("flowecho")
+        );
+        assert!(!routes.contains_key("pass.example.test"));
+        assert!(!routes.contains_key("shared.example.test"));
+        assert_eq!(
+            routes.get("port.example.test:8443").map(String::as_str),
+            Some("enterprise")
+        );
+        assert_eq!(routes.len(), 2);
     }
 
     #[test]

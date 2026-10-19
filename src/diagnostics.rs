@@ -394,7 +394,7 @@ fn inspect_ssh_command(
     let managed = profile
         .and_then(|profile| profile.ssh.as_ref())
         .is_some_and(|ssh| matches!(ssh.mode, SshMode::OnePassword | SshMode::Managed));
-    let ssh_remote = remote.is_some_and(|remote| remote.transport.is_ssh());
+    let ssh_remote = remote.is_some_and(|remote| remote.transport.may_use_ssh());
     diagnostics.push(finding(
         if managed || ssh_remote {
             Severity::Warning

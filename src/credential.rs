@@ -173,6 +173,17 @@ impl CredentialProfile {
             command: Vec::new(),
         }
     }
+
+    /// Project a configuration Profile into the helper view.
+    pub fn from_profile(profile: &config::Profile) -> Self {
+        Self {
+            username: profile.credential_username().to_owned(),
+            command: profile.credential_command.clone().unwrap_or_default(),
+            mode: profile.credential_mode(),
+            host: profile.host.clone(),
+            login: profile.login.clone(),
+        }
+    }
 }
 
 /// Parse the line-oriented protocol.  Git terminates a request with an empty
@@ -244,19 +255,22 @@ pub fn format_response(request: &CredentialRequest, credential: &Credential) -> 
 /// Match a request to a profile without resolving a token.  Matching is exact
 /// on protocol and host; an explicit username must agree with the profile.
 pub fn matches_profile(request: &CredentialRequest, profile: &CredentialProfile) -> bool {
+    host_matches(request, profile)
+        && request
+            .username
+            .as_deref()
+            .is_none_or(|username| username == profile.username)
+}
+
+/// Whether the request targets the profile's host, ignoring the username.
+fn host_matches(request: &CredentialRequest, profile: &CredentialProfile) -> bool {
     if !request.is_https() {
         return false;
     }
     let Some(host) = request.normalized_host() else {
         return false;
     };
-    if host != crate::git::normalize_host(&profile.host) {
-        return false;
-    }
-    request
-        .username
-        .as_deref()
-        .is_none_or(|username| username == profile.username)
+    host == crate::git::normalize_host(&profile.host)
 }
 
 /// Resolve a matching profile.  `Manage` reads gh's keyring, `Command` runs the
@@ -345,17 +359,68 @@ where
     R: BufRead,
     W: Write,
 {
+    serve_routed(args, reader, writer, Some(profile), Vec::new())
+}
+
+/// Serve one helper action with a primary Profile and additional routed
+/// Profiles.
+///
+/// The primary Profile owns its host: a request for that host is answered by it
+/// even when the username does not match (then it quits), and it never falls
+/// back to a route.  Every other host is answered only by a route configured
+/// for the same host.
+pub fn serve_routed<R, W>(
+    args: &[String],
+    reader: R,
+    writer: W,
+    primary: Option<CredentialProfile>,
+    routes: Vec<CredentialProfile>,
+) -> Result<()>
+where
+    R: BufRead,
+    W: Write,
+{
     let action = args
         .first()
         .ok_or_else(|| CredentialError::InvalidAction("missing action".into()))
         .and_then(|value| Action::parse(value))?;
-    handle(action, reader, writer, ProfileLookup { profile })
+    handle(action, reader, writer, RoutedLookup { primary, routes })
 }
 
+struct RoutedLookup {
+    primary: Option<CredentialProfile>,
+    routes: Vec<CredentialProfile>,
+}
+
+impl Lookup for RoutedLookup {
+    fn get(&mut self, request: &CredentialRequest) -> Result<Option<Credential>> {
+        if let Some(primary) = self.primary.as_ref()
+            && host_matches(request, primary)
+        {
+            return get_for_profile(request, primary);
+        }
+        for route in &self.routes {
+            if matches_profile(request, route) {
+                return get_for_profile(request, route);
+            }
+        }
+        if self.primary.is_some() {
+            // The selected Profile is authoritative for every other host too:
+            // stop the chain instead of letting another account answer.
+            return Ok(None);
+        }
+        Err(CredentialError::Lookup(
+            "credential helper 无法解析当前仓库 Profile".into(),
+        ))
+    }
+}
+
+#[cfg(test)]
 struct ProfileLookup {
     profile: CredentialProfile,
 }
 
+#[cfg(test)]
 impl Lookup for ProfileLookup {
     fn get(&mut self, request: &CredentialRequest) -> Result<Option<Credential>> {
         get_for_profile(request, &self.profile)
@@ -581,5 +646,117 @@ mod tests {
             .expect_err("must not resolve");
         assert_eq!(output, b"quit=true\n\n");
         assert!(error.to_string().contains("passthrough"), "{error}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn routed_lookup_answers_only_its_own_host() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let primary = CredentialProfile {
+            username: "alice".into(),
+            command: vec![script(
+                dir.path(),
+                "primary.sh",
+                "#!/bin/sh\nprintf 'primary-token\\n'\n",
+            )],
+            mode: config::CredentialMode::Command,
+            host: "github.com".into(),
+            login: "alice".into(),
+        };
+        let route = CredentialProfile {
+            username: "oauth2".into(),
+            command: vec![script(
+                dir.path(),
+                "route.sh",
+                "#!/bin/sh\nprintf 'route-token\\n'\n",
+            )],
+            mode: config::CredentialMode::Command,
+            host: "git.example.test".into(),
+            login: "flowecho".into(),
+        };
+        let args = vec!["get".to_owned()];
+
+        let mut output = Vec::new();
+        serve_routed(
+            &args,
+            Cursor::new("protocol=https\nhost=git.example.test\n\n"),
+            &mut output,
+            Some(primary.clone()),
+            vec![route.clone()],
+        )
+        .expect("route answers");
+        assert_eq!(
+            output,
+            b"protocol=https\nhost=git.example.test\nusername=oauth2\npassword=route-token\n\n"
+        );
+
+        // The primary's host never falls back to a route, even for a username
+        // it does not serve.
+        let mut output = Vec::new();
+        serve_routed(
+            &args,
+            Cursor::new("protocol=https\nhost=github.com\nusername=oauth2\n\n"),
+            &mut output,
+            Some(primary.clone()),
+            vec![route.clone()],
+        )
+        .expect("quit");
+        assert_eq!(output, b"quit=true\n\n");
+
+        // An unrelated host stops the chain when a Profile is selected.
+        let mut output = Vec::new();
+        serve_routed(
+            &args,
+            Cursor::new("protocol=https\nhost=other.example.test\n\n"),
+            &mut output,
+            Some(primary),
+            vec![route],
+        )
+        .expect("quit");
+        assert_eq!(output, b"quit=true\n\n");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn routed_lookup_without_a_primary_requires_a_route() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let route = CredentialProfile {
+            username: "oauth2".into(),
+            command: vec![script(
+                dir.path(),
+                "route.sh",
+                "#!/bin/sh\nprintf 'route-token\\n'\n",
+            )],
+            mode: config::CredentialMode::Command,
+            host: "git.example.test".into(),
+            login: "flowecho".into(),
+        };
+        let args = vec!["get".to_owned()];
+
+        let mut output = Vec::new();
+        serve_routed(
+            &args,
+            Cursor::new("protocol=https\nhost=git.example.test\n\n"),
+            &mut output,
+            None,
+            vec![route.clone()],
+        )
+        .expect("route answers");
+        assert_eq!(
+            output,
+            b"protocol=https\nhost=git.example.test\nusername=oauth2\npassword=route-token\n\n"
+        );
+
+        let mut output = Vec::new();
+        let error = serve_routed(
+            &args,
+            Cursor::new("protocol=https\nhost=unknown.example.test\n\n"),
+            &mut output,
+            None,
+            vec![route],
+        )
+        .expect_err("no route must fail closed");
+        assert_eq!(output, b"quit=true\n\n");
+        assert!(error.to_string().contains("无法解析"), "{error}");
     }
 }

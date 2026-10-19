@@ -56,6 +56,7 @@ fn context(source: ResolutionSource, profile_id: Option<&str>) -> AppContext {
             owner: Some("acme".into()),
             repo: Some("widget".into()),
         }),
+        url_target: None,
         resolution: ProfileResolution {
             profile: profile_id.map(str::to_owned),
             source,

@@ -3,9 +3,9 @@ use fd_lock::RwLock;
 use ghis::agent_context::{AgentContext, AgentContextFormat};
 use ghis::app::{self, AppContext};
 use ghis::config::{
-    Config, ConfigPaths, CredentialFailurePolicy, CredentialMode, DisplayIdentity, Profile,
-    ResolutionSource, Rule, SigningProfile, SigningTransport, SshMode, SshProfile,
-    SshUnmanagedPolicy, UnresolvedPolicy,
+    Config, ConfigPaths, CredentialFailurePolicy, CredentialMode, CredentialRouting,
+    DisplayIdentity, Profile, ResolutionSource, Rule, SigningProfile, SigningTransport, SshMode,
+    SshProfile, SshUnmanagedPolicy, UnresolvedPolicy,
 };
 use ghis::{credential, diagnostics, git, github, platform, shell, signing};
 use serde::Serialize;
@@ -1944,6 +1944,10 @@ fn get_behavior(config: &Config, key: &str) -> app::Result<String> {
         "credential_failure" => match config.behavior.credential_failure {
             CredentialFailurePolicy::Fail => "fail".into(),
         },
+        "credential_routing" => match config.behavior.credential_routing {
+            CredentialRouting::PerHost => "per-host".into(),
+            CredentialRouting::CurrentProfile => "current-profile".into(),
+        },
         "ssh_unmanaged" => match config.behavior.ssh_unmanaged {
             SshUnmanagedPolicy::WarnAndContinue => "warn-and-continue".into(),
             SshUnmanagedPolicy::Fail => "fail".into(),
@@ -1986,6 +1990,17 @@ fn set_behavior(config: &mut Config, key: &str, value: &str) -> app::Result<()> 
             }
             config.behavior.credential_failure = CredentialFailurePolicy::Fail;
         }
+        "credential_routing" => {
+            config.behavior.credential_routing = match value {
+                "per-host" => CredentialRouting::PerHost,
+                "current-profile" => CredentialRouting::CurrentProfile,
+                _ => {
+                    return Err(app::AppError::Message(
+                        "credential_routing 只能是 per-host 或 current-profile".into(),
+                    ));
+                }
+            }
+        }
         "ssh_unmanaged" => {
             config.behavior.ssh_unmanaged = match value {
                 "warn-and-continue" => SshUnmanagedPolicy::WarnAndContinue,
@@ -2025,11 +2040,12 @@ fn behavior_settings(config: &Config) -> Vec<(&'static str, String)> {
         .expect("known behavior settings must be readable")
 }
 
-const KNOWN_BEHAVIOR_KEYS: [&str; 7] = [
+const KNOWN_BEHAVIOR_KEYS: [&str; 8] = [
     "default_profile",
     "auto_bind",
     "unresolved",
     "credential_failure",
+    "credential_routing",
     "ssh_unmanaged",
     "display_identity",
     "display_profile_on_chpwd",
@@ -3506,26 +3522,26 @@ fn credential_helper(
         stop_credential_chain(action)?;
         return Err(error);
     }
-    let profile = match ctx.profile {
-        Some(profile) => profile,
-        None => {
-            stop_credential_chain(action)?;
-            return Err(app::AppError::Message(
-                "credential helper 无法解析当前仓库 Profile".into(),
-            ));
-        }
-    };
-    credential::serve(
+    let primary = ctx
+        .profile
+        .as_ref()
+        .map(credential::CredentialProfile::from_profile);
+    let routes = app::credential_routes(&ctx.config, ctx.profile.as_ref())
+        .into_iter()
+        .map(|(_, profile)| credential::CredentialProfile::from_profile(profile))
+        .collect::<Vec<_>>();
+    if primary.is_none() && routes.is_empty() {
+        stop_credential_chain(action)?;
+        return Err(app::AppError::Message(
+            "credential helper 无法解析当前仓库 Profile".into(),
+        ));
+    }
+    credential::serve_routed(
         &[action.to_owned()],
         BufReader::new(io::stdin()),
         io::stdout(),
-        credential::CredentialProfile {
-            username: profile.credential_username().to_owned(),
-            command: profile.credential_command.clone().unwrap_or_default(),
-            mode: profile.credential_mode(),
-            host: profile.host,
-            login: profile.login,
-        },
+        primary,
+        routes,
     )
     .map_err(|error| app::AppError::Message(error.to_string()))?;
     Ok(0)
@@ -3887,6 +3903,24 @@ mod tests {
             settings.iter().map(|(key, _)| *key).collect::<Vec<_>>(),
             KNOWN_BEHAVIOR_KEYS
         );
+    }
+
+    #[test]
+    fn credential_routing_accepts_only_documented_values() {
+        let mut config = Config::default();
+        assert_eq!(
+            get_behavior(&config, "credential_routing").unwrap(),
+            "per-host"
+        );
+        set_behavior(&mut config, "credential_routing", "current-profile").unwrap();
+        assert_eq!(
+            get_behavior(&config, "credential_routing").unwrap(),
+            "current-profile"
+        );
+        let error = set_behavior(&mut config, "credential_routing", "never")
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("per-host"), "{error}");
     }
 
     #[cfg(windows)]

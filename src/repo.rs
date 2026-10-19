@@ -212,6 +212,20 @@ impl Transport {
         matches!(self, Self::Ssh)
     }
 
+    /// Whether an SSH policy applies to this transport.
+    ///
+    /// Unknown `scheme://` URLs are handled by a remote helper ghis cannot
+    /// inspect, so they are treated as SSH for policy purposes. Before unknown
+    /// schemes were recognised explicitly they fell through the SCP-style
+    /// branch and reported `Ssh`, so this keeps the policy outcome unchanged.
+    pub fn may_use_ssh(&self) -> bool {
+        match self {
+            Self::Ssh => true,
+            Self::Other(scheme) => scheme != "http" && scheme != "unknown",
+            _ => false,
+        }
+    }
+
     pub fn is_https(&self) -> bool {
         matches!(self, Self::Https)
     }
@@ -401,11 +415,22 @@ fn select_explicit_operation_remote(
     // in an isolated repository so the result matches Git's actual target.
     let effective = effective_explicit_url(repository, direction, target)?;
     let remote = parse_remote("<explicit>", effective);
-    if remote.host.is_some() && !matches!(remote.transport, Transport::File | Transport::Other(_)) {
+    if is_routable_remote(&remote) {
         Ok(OperationRemote::Resolved(remote))
     } else {
         Ok(OperationRemote::Uncertain)
     }
+}
+
+/// Whether `remote` names a host ghis can inspect and route credentials for.
+/// Local paths, `file://` URLs and transports handled by an external remote
+/// helper are deliberately excluded.
+pub fn is_routable_remote(remote: &Remote) -> bool {
+    remote.host.is_some()
+        && matches!(
+            remote.transport,
+            Transport::Https | Transport::Ssh | Transport::Git
+        )
 }
 
 fn effective_explicit_url(
@@ -470,6 +495,87 @@ fn effective_explicit_url(
         return Err(command_error("resolve explicit remote URL", &output));
     }
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+/// Resolve the URL Git would fetch from for a repository operand, applying
+/// `url.<base>.insteadOf` rewrites without contacting the network.
+///
+/// `git ls-remote --get-url` performs the rewrite itself, so it matches what
+/// `git clone` and `git ls-remote` will actually contact while staying a single
+/// subprocess.
+pub fn effective_fetch_url(url: &str) -> Result<String> {
+    let scratch = tempdir()?;
+    effective_fetch_url_in(url, scratch.path(), &[])
+}
+
+/// Same as [`effective_fetch_url`] with an explicit scratch directory and
+/// extra environment, which lets tests isolate global configuration.
+fn effective_fetch_url_in(
+    url: &str,
+    scratch: &Path,
+    environment: &[(&str, &OsStr)],
+) -> Result<String> {
+    // `ls-remote` sets up the repository gently, so a scratch directory inside
+    // another repository would pick up that repository's local rewrite rules.
+    // Stopping discovery at the scratch directory's parent keeps the answer to
+    // what Git sees outside a repository, which is what a clone uses.
+    let ceiling = scratch.parent().unwrap_or(scratch);
+    let mut command = git_command();
+    command
+        .args(["ls-remote", "--get-url", "--", url])
+        .current_dir(scratch)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env("GIT_CEILING_DIRECTORIES", ceiling);
+    for (key, value) in environment {
+        command.env(key, value);
+    }
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(command_error("ls-remote --get-url", &output));
+    }
+    let effective = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+    if effective.is_empty() {
+        return Err(RepoError::InvalidOutput {
+            operation: "ls-remote --get-url".into(),
+            output: String::new(),
+        });
+    }
+    Ok(effective)
+}
+
+/// Run Git configuration queries as Git would outside a repository.
+///
+/// This is the configuration a fresh `git clone` sees.  The scratch directory
+/// plus `GIT_CEILING_DIRECTORIES` stops repository discovery from reading the
+/// local configuration of an enclosing repository, which clone ignores.
+pub fn git_config_outside_repository<I, S>(arguments: I) -> Result<Output>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let scratch = tempdir()?;
+    let ceiling = scratch.path().parent().unwrap_or(scratch.path());
+    let output = git_command()
+        .args(arguments)
+        .current_dir(scratch.path())
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_COMMON_DIR")
+        .env("GIT_CEILING_DIRECTORIES", ceiling)
+        .output()?;
+    Ok(output)
+}
+
+/// Parse the effective URL of a `clone` / `ls-remote` operand.
+///
+/// Returns `None` when Git would not contact a host ghis can inspect: local
+/// paths, `file://` URLs and transports handled by an external remote helper.
+pub fn url_target_remote(url: &str) -> Result<Option<Remote>> {
+    let effective = effective_fetch_url(url)?;
+    let remote = parse_remote("<url>", effective);
+    Ok(is_routable_remote(&remote).then_some(remote))
 }
 
 fn default_operation_remote(
@@ -683,6 +789,179 @@ fn operation_option_takes_value(operation: &str, option: &str) -> bool {
             | "--refmap"
             | "--filter"
     ) || (operation == "pull" && matches!(option, "--strategy" | "-s" | "--strategy-option" | "-X"))
+}
+
+/// One positional repository argument plus the configuration overrides that
+/// `git clone -c` applies to the new repository before its initial fetch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepositoryOperand {
+    pub url: String,
+    pub config: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OptionArity {
+    Flag,
+    Value,
+    /// The value may only be attached with `=`, as in
+    /// `--recurse-submodules[=<pathspec>]`.
+    OptionalValue,
+}
+
+/// Extract the repository operand from the words that follow a `clone` or
+/// `ls-remote` subcommand.
+///
+/// The parser is deliberately conservative: unknown options, abbreviations and
+/// bundled short flags make the operand uncertain (`None`) instead of guessing,
+/// because the result decides which identity the operation runs as.
+pub fn repository_operand(operation: &str, arguments: &[String]) -> Option<RepositoryOperand> {
+    let arity = match operation {
+        "clone" => clone_option_arity,
+        "ls-remote" => ls_remote_option_arity,
+        _ => return None,
+    };
+    let mut positionals: Vec<String> = Vec::new();
+    let mut config = Vec::new();
+    let mut index = 0;
+    let mut positional_only = false;
+    while let Some(argument) = arguments.get(index) {
+        if positional_only {
+            positionals.push(argument.clone());
+            index += 1;
+            continue;
+        }
+        if argument == "--" || argument == "--end-of-options" {
+            positional_only = true;
+            index += 1;
+            continue;
+        }
+        if argument == "-" || !argument.starts_with('-') {
+            positionals.push(argument.clone());
+            index += 1;
+            continue;
+        }
+        if let Some(long) = argument.strip_prefix("--") {
+            let (name, attached) = match long.split_once('=') {
+                Some((name, value)) => (name, Some(value)),
+                None => (long, None),
+            };
+            // Git accepts unique prefixes, but ghis never guesses which option
+            // a prefix meant.  No real long option has a one-character name.
+            if name.len() < 2 {
+                return None;
+            }
+            let option_arity = match arity(name) {
+                Some(option_arity) => option_arity,
+                None => match name.strip_prefix("no-").and_then(arity) {
+                    Some(OptionArity::Flag | OptionArity::OptionalValue) => OptionArity::Flag,
+                    _ => return None,
+                },
+            };
+            match option_arity {
+                OptionArity::Flag => {
+                    if attached.is_some() {
+                        return None;
+                    }
+                }
+                OptionArity::OptionalValue => {}
+                OptionArity::Value => {
+                    let value = match attached {
+                        Some(value) => value.to_owned(),
+                        None => {
+                            let value = arguments.get(index + 1)?;
+                            index += 1;
+                            value.clone()
+                        }
+                    };
+                    if name == "config" {
+                        config.push(value);
+                    }
+                }
+            }
+            index += 1;
+            continue;
+        }
+        // A short option is selected by its first character.  Value options may
+        // attach the value (`-bmain`, `-j4`); flags must stand alone, so a
+        // bundle such as `-qn` stays uncertain.
+        let mut characters = argument[1..].chars();
+        let short = characters.next()?.to_string();
+        let rest = characters.as_str();
+        match arity(&short)? {
+            OptionArity::Flag => {
+                if !rest.is_empty() {
+                    return None;
+                }
+            }
+            OptionArity::OptionalValue => return None,
+            OptionArity::Value => {
+                let value = if rest.is_empty() {
+                    let value = arguments.get(index + 1)?;
+                    index += 1;
+                    value.clone()
+                } else {
+                    rest.to_owned()
+                };
+                if short == "c" {
+                    config.push(value);
+                }
+            }
+        }
+        index += 1;
+    }
+    let url = positionals.first()?.clone();
+    if url.starts_with('-') {
+        return None;
+    }
+    if operation == "clone" && positionals.len() > 2 {
+        return None;
+    }
+    Some(RepositoryOperand { url, config })
+}
+
+fn clone_option_arity(name: &str) -> Option<OptionArity> {
+    Some(match name {
+        "b" | "o" | "c" | "u" | "j" => OptionArity::Value,
+        "v" | "q" | "n" | "l" | "s" | "4" | "6" => OptionArity::Flag,
+        "branch" | "origin" | "config" | "upload-pack" | "jobs" | "template" | "reference"
+        | "reference-if-able" | "separate-git-dir" | "depth" | "shallow-since"
+        | "shallow-exclude" | "filter" | "server-option" | "bundle-uri" | "ref-format"
+        | "revision" => OptionArity::Value,
+        "recurse-submodules" | "recursive" => OptionArity::OptionalValue,
+        "verbose"
+        | "quiet"
+        | "progress"
+        | "reject-shallow"
+        | "checkout"
+        | "bare"
+        | "mirror"
+        | "local"
+        | "hardlinks"
+        | "shared"
+        | "dissociate"
+        | "single-branch"
+        | "tags"
+        | "shallow-submodules"
+        | "ipv4"
+        | "ipv6"
+        | "also-filter-submodules"
+        | "remote-submodules"
+        | "sparse"
+        | "naked" => OptionArity::Flag,
+        _ => return None,
+    })
+}
+
+fn ls_remote_option_arity(name: &str) -> Option<OptionArity> {
+    Some(match name {
+        "o" => OptionArity::Value,
+        "upload-pack" | "exec" | "sort" | "server-option" => OptionArity::Value,
+        "q" | "t" | "b" | "h" => OptionArity::Flag,
+        "quiet" | "tags" | "branches" | "heads" | "refs" | "get-url" | "symref" | "exit-code" => {
+            OptionArity::Flag
+        }
+        _ => return None,
+    })
 }
 
 /// Read all configured remotes.  A remote's push URL wins over its fetch URL
@@ -1116,6 +1395,7 @@ fn parse_url_parts(url: &str) -> (Transport, Option<String>, Option<String>) {
             }
             "ssh" => return split_authority_path(rest, Transport::Ssh),
             "git" => return split_authority_path(rest, Transport::Git),
+            "git+ssh" | "ssh+git" => return split_authority_path(rest, Transport::Ssh),
             "file" => {
                 return (
                     Transport::File,
@@ -1123,7 +1403,9 @@ fn parse_url_parts(url: &str) -> (Transport, Option<String>, Option<String>) {
                     Some(rest.trim_start_matches('/').to_owned()),
                 );
             }
-            _ => {}
+            other => {
+                return split_authority_path(rest, Transport::Other(other.to_owned()));
+            }
         }
     }
     // SCP-like syntax: user@host:owner/repo.git.  A Windows drive path does
@@ -1263,6 +1545,183 @@ mod tests {
         assert_eq!(remote.owner.as_deref(), Some("acme"));
         let local = parse_remote("origin", "C:\\work\\tool");
         assert!(!local.transport.is_ssh());
+    }
+
+    #[test]
+    fn parses_remote_helper_schemes_and_treats_unknown_schemes_as_opaque() {
+        for url in [
+            "git+ssh://git@github.com/acme/tool.git",
+            "ssh+git://git@github.com/acme/tool.git",
+        ] {
+            let remote = parse_remote("origin", url);
+            assert_eq!(remote.transport, Transport::Ssh);
+            assert_eq!(remote.host.as_deref(), Some("github.com"));
+            assert_eq!(remote.owner.as_deref(), Some("acme"));
+            assert_eq!(remote.repo.as_deref(), Some("tool"));
+            assert!(remote.transport.may_use_ssh());
+        }
+
+        let helper = parse_remote("origin", "foo://git.example.test/acme/tool");
+        assert_eq!(helper.transport, Transport::Other("foo".into()));
+        assert_eq!(helper.host.as_deref(), Some("git.example.test"));
+        assert!(helper.transport.may_use_ssh());
+
+        let plain_http = parse_remote("origin", "http://git.example.test/acme/tool");
+        assert!(!plain_http.transport.may_use_ssh());
+        let local = parse_remote("origin", "/srv/git/acme/tool.git");
+        assert!(!local.transport.may_use_ssh());
+    }
+
+    #[test]
+    fn repository_operand_parses_clone_options_conservatively() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let operand = repository_operand(
+            "clone",
+            &args(&[
+                "-b",
+                "main",
+                "--depth=1",
+                "-j4",
+                "--config",
+                "user.name=x",
+                "--no-tags",
+                "https://git.example.test/acme/tool.git",
+                "tool",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(operand.url, "https://git.example.test/acme/tool.git");
+        assert_eq!(operand.config, vec!["user.name=x"]);
+
+        let attached = repository_operand(
+            "clone",
+            &args(&["-bmain", "-u", "/usr/bin/git-upload-pack", "gx:acme/tool"]),
+        )
+        .unwrap();
+        assert_eq!(attached.url, "gx:acme/tool");
+
+        assert_eq!(
+            repository_operand("clone", &args(&["--recurse-submodules=src", "url"]))
+                .unwrap()
+                .url,
+            "url"
+        );
+        assert_eq!(
+            repository_operand("clone", &args(&["--recurse-submodules", "url"]))
+                .unwrap()
+                .url,
+            "url"
+        );
+        assert_eq!(
+            repository_operand("clone", &args(&["--", "url"]))
+                .unwrap()
+                .url,
+            "url"
+        );
+
+        assert!(repository_operand("clone", &args(&["--depth"])).is_none());
+        assert!(repository_operand("clone", &args(&["--dep", "url"])).is_none());
+        assert!(repository_operand("clone", &args(&["-qn", "url"])).is_none());
+        assert!(repository_operand("clone", &args(&["--bare=yes", "url"])).is_none());
+        assert!(repository_operand("clone", &args(&["--no-depth", "url"])).is_none());
+        assert!(repository_operand("clone", &args(&["url", "dir", "extra"])).is_none());
+        assert!(repository_operand("clone", &args(&["--", "-url"])).is_none());
+    }
+
+    #[test]
+    fn repository_operand_handles_ls_remote_flags_and_patterns() {
+        let args = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+        };
+
+        let operand = repository_operand(
+            "ls-remote",
+            &args(&["-b", "--heads", "origin", "refs/heads/*"]),
+        )
+        .unwrap();
+        assert_eq!(operand.url, "origin");
+
+        let operand = repository_operand(
+            "ls-remote",
+            &args(&[
+                "--upload-pack=/usr/bin/upload",
+                "-o",
+                "opt=1",
+                "https://git.example.test/a/b",
+            ]),
+        )
+        .unwrap();
+        assert_eq!(operand.url, "https://git.example.test/a/b");
+        assert!(operand.config.is_empty());
+
+        assert!(repository_operand("ls-remote", &args(&["-u", "/x", "url"])).is_none());
+        assert!(repository_operand("ls-remote", &args(&[])).is_none());
+    }
+
+    #[test]
+    fn effective_fetch_url_applies_instead_of_from_global_config() {
+        let directory = tempfile::tempdir().unwrap();
+        let global = directory.path().join("gitconfig");
+        fs::write(
+            &global,
+            "[url \"https://git.example.test/\"]\n\tinsteadOf = gx:\n",
+        )
+        .unwrap();
+        let scratch = directory.path().join("scratch");
+        fs::create_dir_all(&scratch).unwrap();
+        let url = effective_fetch_url_in(
+            "gx:acme/tool.git",
+            &scratch,
+            &[
+                ("GIT_CONFIG_GLOBAL", OsStr::new(&global)),
+                ("GIT_CONFIG_NOSYSTEM", OsStr::new("1")),
+            ],
+        )
+        .unwrap();
+        assert_eq!(url, "https://git.example.test/acme/tool.git");
+    }
+
+    #[test]
+    fn effective_fetch_url_ignores_the_enclosing_repository() {
+        let directory = tempfile::tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        fs::create_dir_all(&repository).unwrap();
+        let init = git_command()
+            .args(["init", "-q"])
+            .current_dir(&repository)
+            .output()
+            .unwrap();
+        assert!(init.status.success());
+        let configure = git_command()
+            .args(["config", "url.https://repo.example.test/.insteadOf", "rx:"])
+            .current_dir(&repository)
+            .output()
+            .unwrap();
+        assert!(configure.status.success());
+        let scratch = repository.join("scratch");
+        fs::create_dir_all(&scratch).unwrap();
+        let global = directory.path().join("empty");
+        fs::write(&global, "").unwrap();
+        let url = effective_fetch_url_in(
+            "rx:acme/tool.git",
+            &scratch,
+            &[
+                ("GIT_CONFIG_GLOBAL", OsStr::new(&global)),
+                ("GIT_CONFIG_NOSYSTEM", OsStr::new("1")),
+            ],
+        )
+        .unwrap();
+        // The enclosing repository's local rewrite must not apply.
+        assert_eq!(url, "rx:acme/tool.git");
     }
 
     #[test]
