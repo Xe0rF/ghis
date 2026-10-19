@@ -32,6 +32,12 @@ ghis profile add gitlab \
 
 命令输出即 token，去除首尾空白后由 ghis 配上 username 返回给 Git。命令失败或无输出时，ghis 与 `manage` 一样停止凭据查询，不会回退到终端提示。命令中不要写入 token 本身，它属于外部凭据存储。
 
+`behavior.credential_routing` 控制 `ghis git` 是否为其他主机提供凭据，默认 `per-host`：只要某个主机在配置里只有一个 Profile，且该 Profile 由 ghis 应答凭据（`manage` 或 `command`），wrapper 就在运行时为这个主机注入同样的 helper。当前 Profile 的主机、有两个及以上 Profile 的主机，以及 `passthrough` 的主机都不会被接管。该行为只存在于 wrapper 运行的子进程里，不写入仓库配置，因此直接运行 `/usr/bin/git`、IDE 或 `GHIS_BYPASS=1` 时不会生效。设为 `current-profile` 可恢复“只应答当前 Profile 主机”的旧行为：
+
+```sh
+ghis config set behavior.credential_routing current-profile
+```
+
 ## 安装
 
 需要：
@@ -114,6 +120,31 @@ ghis doctor
 ```
 
 按步骤排查见 [Wiki：故障排查](https://github.com/Xe0rF/ghis/wiki/Troubleshooting)。远程开发和 `forwarded-agent` 见 [Wiki：远程开发与 SSH Agent 转发](https://github.com/Xe0rF/ghis/wiki/Remote-Development-and-Agent-Forwarding)。
+
+## 按仓库 URL 选择 Profile（clone / ls-remote）
+
+`[[rules]]` 通常按仓库的 remote 解析。没有仓库时，`git clone <url>` 和 `git ls-remote <url>` 会改用命令里的 URL 作为解析上下文，因此下面的规则可以直接命中首次 clone：
+
+```toml
+[[rules]]
+id = "gitlab-flowecho"
+profile = "flowecho"
+priority = 100
+host = "git.flowecho.org"
+```
+
+```sh
+git clone https://git.flowecho.org/team/project
+```
+
+注意边界：
+
+- 只有字面量的 `clone` 和仓库外的 `ls-remote` 参与。仓库内的 `fetch` / `pull` / `push` / `ls-remote` 始终按绑定和规则解析，URL 不会改变提交身份或签名。
+- URL 会先按 `url.<base>.insteadOf` 展开，再参与匹配。
+- `--profile` 和 `GHIS_PROFILE` 仍然优先级最高。
+- 选项解析是保守的：遇到未知选项、缩写或捆绑的短选项时不会推断 URL，行为与以前完全一致。
+- 用 URL 选出的 Profile 不会 auto-bind、修复绑定或登记外层仓库；在已有仓库里 clone 不会改动那个仓库的 `ghis.profile`。
+- `default_profile` 只在主机一致时套用。URL 不匹配任何规则时会继续使用现有 Git 配置，`unresolved = "fail"` 时则直接停止。
 
 ## 撤销集成与卸载
 

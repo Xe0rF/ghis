@@ -45,6 +45,11 @@ cargo deny check            # 检查许可证、来源和重复依赖
 - `manage` 与 `command` 写入完全相同的助手字符串，仅助手进程内部的取件来源不同。这保证 `is_managed_credential_helper`、`remove_managed_credential_helpers` 与 `diagnostics::is_ghis_helper` 三处识别逻辑无需区分模式。新增模式时不要引入第二种助手字符串形状，否则 `unbind` 将无法清理自身写入的配置。
 - `passthrough` 不写入任何凭据配置，**包括那个用于截断继承链的空值**。该模式存在的意义就是保留继承链，补上那一行等于取消模式。相应地，命令行的凭据助手覆盖检查对它放宽：`manage` 与 `command` 仍然拒绝。
 - `passthrough` 与 `command` 都要在任何解析或联网失败时停止，不得回退到终端提示或另一个账号。`passthrough` 的差别只在于它根本不解析凭据。
+- `behavior.credential_routing` 默认 `per-host`：`ghis git` 只在运行时以 `-c` 为“全配置中仅有一个 Profile 且该 Profile 由 ghis 应答（manage/command）”的其他主机注入空值重置和完全相同的助手字符串。当前 Profile 的主机、多 Profile 主机与 passthrough 主机不注入，也不写入仓库配置。路由在 credential helper 内按请求主机完成，主 Profile 的主机不得回退到路由，任何失败一律 `quit`。
+
+### URL 目标
+
+命令行 URL 只在 `git clone` 和仓库外的 `git ls-remote` 中参与 Profile 选择；仓库内的 `fetch`/`pull`/`push`/`ls-remote` 只按绑定与规则解析。URL 目标不得触发 auto-bind、绑定修复或仓库登记；选项或 URL 无法可靠解析时保持原有行为，不得猜测。`url.*.insteadOf` 在参与匹配前展开。
 
 ### 取件命令的约定
 
