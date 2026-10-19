@@ -4028,6 +4028,7 @@ mod tests {
     /// load cannot be determined", which left every bound repository, ghis
     /// included, impossible to open a worktree in.  Binding must leave no
     /// `includeIf` behind, in any scope.
+    #[cfg(unix)]
     #[test]
     fn binding_writes_no_conditional_include_and_clears_older_ones() {
         let temp = tempdir().expect("temporary directory");
