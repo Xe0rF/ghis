@@ -2,7 +2,7 @@
 
 ## 项目结构
 
-- `build.rs` 将 Git commit、工作区状态、tag、构建时间、目标平台和构建模式写入版本信息；`src/` 是 Rust 核心代码：`main.rs` 提供 CLI 入口，`app.rs` 负责身份解析与仓库绑定，`config.rs` 管理配置和 XDG 路径，`agent.rs` 与 `src/agent/` 提供 Claude/Codex agent 上下文注入、启动器和设置管理，`git.rs` 封装 Git 操作与主机名归一化，`credential.rs`、`credential_command.rs` 分别封装 Git 凭据助手协议与用户指定的取件命令，`secret.rs` 提供落盘前清零的令牌包装，`github.rs` 封装 gh CLI，`signing.rs` 封装 SSH 签名。
+- `build.rs` 将 Git commit、工作区状态、tag、构建时间、目标平台和构建模式写入版本信息；`src/` 是 Rust 核心代码：`main.rs` 提供 CLI 入口，`app.rs` 负责身份解析与仓库绑定，`config.rs` 管理配置和 XDG 路径，`baseline.rs` 管理 ghis 自有的用户全局 Git 基线（`include.path` 与生成文件），`agent.rs` 与 `src/agent/` 提供 Claude/Codex agent 上下文注入、启动器和设置管理，`git.rs` 封装 Git 操作与主机名归一化，`credential.rs`、`credential_command.rs` 分别封装 Git 凭据助手协议与用户指定的取件命令，`secret.rs` 提供落盘前清零的令牌包装，`github.rs` 封装 gh CLI，`signing.rs` 封装 SSH 签名。
 
   forge 无关的公共设施必须与 forge 专属适配器分开：`git.rs` 的主机名归一化和 `secret.rs` 的令牌包装服务于任意主机，`github.rs` 只应包含 `gh` CLI 相关逻辑。新增代码时不要把通用工具放进 `github.rs`。
 - `tests/` 放置 CLI、wrapper、worktree、凭据、SSH 和并发行为的集成测试。
@@ -42,10 +42,18 @@ cargo deny check            # 检查许可证、来源和重复依赖
 
 `Profile.credential_mode` 决定 HTTPS 凭据由谁提供，共三态，缺省为 `manage`。
 
-- `manage` 与 `command` 写入完全相同的助手字符串，仅助手进程内部的取件来源不同。这保证 `is_managed_credential_helper`、`remove_managed_credential_helpers` 与 `diagnostics::is_ghis_helper` 三处识别逻辑无需区分模式。新增模式时不要引入第二种助手字符串形状，否则 `unbind` 将无法清理自身写入的配置。
-- `passthrough` 不写入任何凭据配置，**包括那个用于截断继承链的空值**。该模式存在的意义就是保留继承链，补上那一行等于取消模式。相应地，命令行的凭据助手覆盖检查对它放宽：`manage` 与 `command` 仍然拒绝。
-- `passthrough` 与 `command` 都要在任何解析或联网失败时停止，不得回退到终端提示或另一个账号。`passthrough` 的差别只在于它根本不解析凭据。
-- `behavior.credential_routing` 默认 `per-host`：`ghis git` 只在运行时以 `-c` 为“全配置中仅有一个 Profile 且该 Profile 由 ghis 应答（manage/command）”的其他主机注入空值重置和完全相同的助手字符串。当前 Profile 的主机、多 Profile 主机与 passthrough 主机不注入，也不写入仓库配置。路由在 credential helper 内按请求主机完成，主 Profile 的主机不得回退到路由，任何失败一律 `quit`。
+- 三种模式写入完全相同的助手字符串与空值重置，仅助手进程内部的取件来源不同。这保证 `is_managed_credential_helper`、`remove_managed_credential_helpers` 与 `diagnostics::is_ghis_helper` 三处识别逻辑无需区分模式。新增模式时不要引入第二种助手字符串形状，否则 `unbind` 将无法清理自身写入的配置。
+- `none` 也写入同一 helper；helper 返回 `quit=true` 并报错，不解析凭据。命令行的凭据助手覆盖检查对三种模式一视同仁，全部拒绝。
+- `none` 与 `command` 都要在任何解析或联网失败时停止，不得回退到终端提示或另一个账号。`none` 的差别只在于它根本不解析凭据。
+- `behavior.credential_routing` 默认 `per-host`：`ghis git` 只在运行时以 `-c` 为“全配置中仅有一个 Profile 且该 Profile 由 ghis 应答（manage/command）”的其他主机注入空值重置和完全相同的助手字符串。当前 Profile 的主机、多 Profile 主机与 `none` 主机不注入，也不写入仓库配置。路由在 credential helper 内按请求主机完成，主 Profile 的主机不得回退到路由，任何失败一律 `quit`。
+
+### 全局 Git 基线与身份判定
+
+`ghis gitconfig setup` 只向用户全局 Git 配置增加一条指向 `ConfigPaths.config_dir/global.gitconfig` 的 `include.path`。生成文件只含 `[user] useConfigOnly = true`，使未绑定 Profile 的仓库停止提交而不是自动推断身份。ghis 只拥有这一条 include 和这个文件：不得删除、改写或迁移用户已有的任何全局条目；`uninstall` 用 `--fixed-value --unset-all` 只移除自己的路径。
+
+Profile 片段同时写入 `[user]`、`[author]`、`[committer]` 的 name/email。Git 中 `author.*`/`committer.*` 优先于 `user.*`，因此局部或 include 进来的 `user.email` 不能在已绑定仓库中覆盖 Profile。
+
+`doctor` 保持只读，按绝对归属判定：任何不在 ghis 片段或基线内、且命中身份/签名/凭据键目录的条目都算外部来源，即使值与当前 Profile 相同。修复建议只输出手动命令；环境变量只报名字不读值，SSH 差异只报键名不报值。
 
 ### URL 目标
 

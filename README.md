@@ -13,12 +13,12 @@
 | 模式 | ghis 写入凭据配置 | token 来源 | 适用 |
 | --- | --- | --- | --- |
 | `manage`（默认） | 写入，并先清空继承链 | `gh auth token` | GitHub 与 GitHub Enterprise |
-| `passthrough` | 不写入，保留继承链 | 不参与 | 传输层交给 SSH 或你自己的 helper |
+| `none` | 写入，并先清空继承链；helper 以 `quit=true` 拒绝 | 不参与 | 只用 SSH remote，不再使用 HTTPS 凭据 |
 | `command` | 写入，并先清空继承链 | 你指定的命令 | 其他 forge，或同一 forge 的多账号 |
 
 省略该字段等同于 `manage`，配置文件不会因此多出一行。
 
-`passthrough` 是一次显式的责任转移：该仓库的凭据由你负责，`ghis` 不参与，也不会因为取不到凭据而中止。它会在联网操作前提示一次。
+`none` 不是"保留继承链"：它和 `manage`、`command` 写入完全相同的 helper，只是 helper 拒绝提供任何 HTTPS 凭据并返回 `quit=true`。Git 不会回退到终端提示，也不会改用其他账号。SSH remote 不受影响。
 
 `command` 模式的命令以 argv 形式给出，不经过 shell：
 
@@ -32,7 +32,7 @@ ghis profile add gitlab \
 
 命令输出即 token，去除首尾空白后由 ghis 配上 username 返回给 Git。命令失败或无输出时，ghis 与 `manage` 一样停止凭据查询，不会回退到终端提示。命令中不要写入 token 本身，它属于外部凭据存储。
 
-`behavior.credential_routing` 控制 `ghis git` 是否为其他主机提供凭据，默认 `per-host`：只要某个主机在配置里只有一个 Profile，且该 Profile 由 ghis 应答凭据（`manage` 或 `command`），wrapper 就在运行时为这个主机注入同样的 helper。当前 Profile 的主机、有两个及以上 Profile 的主机，以及 `passthrough` 的主机都不会被接管。该行为只存在于 wrapper 运行的子进程里，不写入仓库配置，因此直接运行 `/usr/bin/git`、IDE 或 `GHIS_BYPASS=1` 时不会生效。设为 `current-profile` 可恢复“只应答当前 Profile 主机”的旧行为：
+`behavior.credential_routing` 控制 `ghis git` 是否为其他主机提供凭据，默认 `per-host`：只要某个主机在配置里只有一个 Profile，且该 Profile 由 ghis 应答凭据（`manage` 或 `command`），wrapper 就在运行时为这个主机注入同样的 helper。当前 Profile 的主机、有两个及以上 Profile 的主机，以及 `none` 的主机都不会被接管。该行为只存在于 wrapper 运行的子进程里，不写入仓库配置，因此直接运行 `/usr/bin/git`、IDE 或 `GHIS_BYPASS=1` 时不会生效。设为 `current-profile` 可恢复“只应答当前 Profile 主机”的旧行为：
 
 ```sh
 ghis config set behavior.credential_routing current-profile
@@ -66,6 +66,14 @@ ghis shell setup --print  # 只输出初始化内容，不修改启动文件
 ```
 
 Windows 原生环境使用 PowerShell 7（`pwsh`）。平台与 Shell 的适用范围见 [Wiki：平台与 Shell 边界](https://github.com/Xe0rF/ghis/wiki/Architecture#平台与-shell-边界)。
+
+安装后建议接管全局 Git 基线：
+
+```sh
+ghis gitconfig setup
+```
+
+它只在用户全局 Git 配置中增加一条指向 ghis 生成文件的 `include.path`，生成文件的内容是 `user.useConfigOnly = true`。未绑定 Profile 的仓库因此不会用 Git 自动推断的 `user@host` 提交，而是直接停止。ghis 不删除也不改写全局文件里的其他条目；`ghis gitconfig uninstall` 只移除自己写入的那一条，`ghis teardown` 也会撤销它。`ghis onboard` 默认执行这一步。
 
 ## 快速开始
 
@@ -119,6 +127,8 @@ Profile 如何解析、绑定如何写入 worktree，以及配置片段如何让
 ghis doctor
 ```
 
+`doctor` 只读，检查范围包括 system/global/local/worktree/命令行所有 Git 配置作用域、相关环境变量、SSH 配置、全局基线状态以及 ghis 自己的绑定。它不依赖"值是否等于当前 Profile"：任何不是 ghis 写入的身份、签名或凭据设置都会在"外部来源"层报出，并给出手动清理命令。输出按"外部来源 / 全局基线 / ghis 状态 / 当前仓库 / 外部依赖"分层；`--json` 的 `findings` 数组（schema v3）包含 `layer`、`code`、`severity`、`source`、`key`、`value`、`impact` 和 `repair`。`ghis check` 是给 agent 预检用的快速子集，只检查外部 Git/环境变量和当前上下文。
+
 按步骤排查见 [Wiki：故障排查](https://github.com/Xe0rF/ghis/wiki/Troubleshooting)。远程开发和 `forwarded-agent` 见 [Wiki：远程开发与 SSH Agent 转发](https://github.com/Xe0rF/ghis/wiki/Remote-Development-and-Agent-Forwarding)。
 
 ## 按仓库 URL 选择 Profile（clone / ls-remote）
@@ -154,6 +164,12 @@ git clone https://git.flowecho.org/team/project
 ghis shell uninstall
 ```
 
+只移除全局 Git 基线（保留 Profile、规则和其他配置）：
+
+```sh
+ghis gitconfig uninstall
+```
+
 撤销 ghis 管理的 Shell、Claude Code 和当前仓库集成，同时保留 Profile、规则、配置、缓存和状态：
 
 ```sh
@@ -179,6 +195,7 @@ ghis --help
 ghis profile --help
 ghis shell --help
 ghis shell setup --help
+ghis gitconfig --help
 ghis teardown --help
 ghis agent --help
 ghis doctor --help
