@@ -489,6 +489,11 @@ esac
         .env("XDG_STATE_HOME", &state_home)
         .env("GIT_CONFIG_SYSTEM", &system_config)
         .env("GIT_CONFIG_GLOBAL", &global_config)
+        .env(ghis::shell::zsh::LOADED_ENV, "1")
+        .env(
+            ghis::shell::zsh::HEALTH_ENV,
+            ghis::shell::zsh::HEALTHY_MARKER,
+        )
         .env_remove("GIT_CONFIG_NOSYSTEM")
         .env_remove("GHIS_CONFIG")
         .env_remove("GHIS_PROFILE")
