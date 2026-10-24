@@ -113,6 +113,7 @@ case "${1-} ${2-}" in
   "config --get-regexp") : ;;
   "remote -v") : ;;
   "config --local") exit 1 ;;
+  "config --global") exit 1 ;;
   *)
     [ -z "${GH_TOKEN+x}" ] || exit 61
     [ -z "${GITHUB_TOKEN+x}" ] || exit 62
