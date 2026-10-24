@@ -1597,6 +1597,97 @@ case "$GH_HOST" in github.com|git.example.test) exit 0 ;; *) exit 91 ;; esac
 }
 
 #[test]
+fn gh_content_operands_keep_the_repository_binding() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let config_directory = temp.path().join("config/ghis");
+    fs::create_dir_all(&config_directory).expect("config directory");
+    fs::write(
+        config_directory.join("config.toml"),
+        r#"version = 1
+
+[behavior]
+default_profile = "personal"
+
+[profiles.personal]
+host = "github.com"
+login = "personal"
+git_name = "Personal"
+git_email = "personal@example.test"
+
+[profiles.work]
+host = "github.com"
+login = "work-user"
+git_name = "Work"
+git_email = "work@example.test"
+"#,
+    )
+    .expect("config");
+    let repository = temp.path().join("repository");
+    fs::create_dir_all(&repository).expect("repository directory");
+    for args in [
+        &["init", "-q"][..],
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/project.git",
+        ],
+    ] {
+        assert!(
+            Command::new("git")
+                .args(args)
+                .current_dir(&repository)
+                .status()
+                .expect("git")
+                .success()
+        );
+    }
+    let mut bind = isolated_ghis_command();
+    bind.current_dir(&repository).args(["use", "work"]);
+    for (key, value) in xdg_environment(&temp) {
+        bind.env(key, value);
+    }
+    bind.assert().success();
+
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).expect("bin directory");
+    let trace = temp.path().join("gh.trace");
+    write_executable(
+        &bin.join("gh"),
+        r#"#!/bin/sh
+case "$*" in
+  "auth token --hostname github.com --user work-user") printf 'work-token\n'; exit 0 ;;
+  "auth token --hostname github.com --user personal") printf 'personal-token\n'; exit 0 ;;
+esac
+printf '%s token=%s\n' "$*" "${GH_TOKEN-}" >> "$FAKE_GH_TRACE"
+[ "$GH_TOKEN" = work-token ] || exit 81
+"#,
+    );
+
+    for args in [
+        vec!["api", "repos/acme/project"],
+        vec!["release", "upload", "v1", "dist/linux/ghis.tar.gz"],
+    ] {
+        let mut command = isolated_ghis_command();
+        command
+            .current_dir(&repository)
+            .arg("gh")
+            .arg("--")
+            .args(&args)
+            .env("PATH", prepend_path(&bin))
+            .env("FAKE_GH_TRACE", &trace)
+            .env_remove("GH_REPO");
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.assert().success();
+    }
+    let trace = fs::read_to_string(trace).expect("trace");
+    assert!(trace.contains("api repos/acme/project token=work-token"));
+    assert!(trace.contains("release upload v1 dist/linux/ghis.tar.gz token=work-token"));
+}
+
+#[test]
 fn cwd_rules_select_profiles_from_non_git_directories() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let matching = temp.path().join("home/discussions/topic");

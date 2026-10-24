@@ -1836,17 +1836,17 @@ fn gh_profile_target(
             })
         })
         .transpose()?;
-    let explicit_repository = view.repository_selectors.first().copied().or_else(|| {
-        view.positionals
-            .iter()
-            .copied()
-            .find(|value| gh_repository_selector_host(value).is_some())
-    });
+    let explicit_repository = view
+        .repository_selectors
+        .first()
+        .copied()
+        .or_else(|| gh_positional_repository_target(view));
     let repository = explicit_repository.or(inherited_repo);
     let mut host = view
         .hostname_selectors
         .first()
-        .map(|value| (*value).to_owned());
+        .map(|value| (*value).to_owned())
+        .or_else(|| gh_api_url_host(view));
     let mut owner = None;
     let mut repo_name = None;
     if let Some(repository) = repository {
@@ -1871,6 +1871,31 @@ fn gh_profile_target(
             ..RuleContext::default()
         },
     }))
+}
+
+/// Only an operand that `validate_gh_target_view` also treats as a repository
+/// or item may select the Profile.  Any other positional (an API path, a
+/// release asset, a clone destination) is content, and reading it as
+/// `HOST/OWNER/REPO` would discard the repository binding.
+fn gh_positional_repository_target<'a>(view: &GhArgumentView<'a>) -> Option<&'a str> {
+    if !gh_structured_target_command(view.command, view.subcommand) {
+        return None;
+    }
+    view.positionals
+        .first()
+        .copied()
+        .filter(|value| gh_repository_selector_host(value).is_some())
+}
+
+/// A full API URL names a host but no repository: its path segments are API
+/// routes, not an owner that rules could match.
+fn gh_api_url_host(view: &GhArgumentView<'_>) -> Option<String> {
+    if view.command != "api" {
+        return None;
+    }
+    view.positionals
+        .first()
+        .and_then(|endpoint| gh_url_repository_host(endpoint))
 }
 
 fn parse_gh_repository_target(value: &str) -> (Option<String>, Option<String>, Option<String>) {
@@ -4934,6 +4959,48 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    fn profile_target_for(args: &[&str]) -> Option<RuleContext> {
+        let args = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        let view = parse_gh_argument_view(&args).expect("argument view");
+        gh_profile_target(&view, None)
+            .expect("profile target")
+            .map(|target| target.context)
+    }
+
+    #[test]
+    fn gh_profile_target_reads_positionals_only_from_repository_operands() {
+        for args in [
+            &["api", "repos/acme/project"][..],
+            &["release", "upload", "v1", "dist/linux/ghis.tar.gz"],
+            &["browse", "src/agent/claude.rs"],
+            &["search", "code", "acme/project/path"],
+        ] {
+            assert!(
+                profile_target_for(args).is_none(),
+                "{args:?} has no repository operand"
+            );
+        }
+
+        let clone = profile_target_for(&["repo", "clone", "acme/project", "dest/a/b"]);
+        assert!(
+            clone.is_none_or(|context| context.host.as_deref() != Some("dest")),
+            "a clone destination is a path, not a repository"
+        );
+
+        let pull_request =
+            profile_target_for(&["pr", "view", "https://git.example/acme/project/pull/1"])
+                .expect("pull request target");
+        assert_eq!(pull_request.host.as_deref(), Some("git.example"));
+        assert_eq!(pull_request.owner.as_deref(), Some("acme"));
+        assert_eq!(pull_request.repo.as_deref(), Some("project"));
+
+        let api = profile_target_for(&["api", "https://git.example/api/v3/user"])
+            .expect("API URL target");
+        assert_eq!(api.host.as_deref(), Some("git.example"));
+        assert_eq!(api.owner, None, "an API path does not name an owner");
+        assert_eq!(api.repo, None);
     }
 
     #[test]
