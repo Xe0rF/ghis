@@ -1688,6 +1688,50 @@ printf '%s token=%s\n' "$*" "${GH_TOKEN-}" >> "$FAKE_GH_TRACE"
 }
 
 #[test]
+fn gh_project_commands_use_the_profile_token() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).expect("bin directory");
+    let trace = temp.path().join("gh.trace");
+    write_executable(
+        &bin.join("gh"),
+        r#"#!/bin/sh
+case "$*" in
+  "auth token --hostname github.com --user alice") printf 'selected-token\n'; exit 0 ;;
+esac
+printf '%s host=%s token=%s\n' "$*" "${GH_HOST-}" "${GH_TOKEN-}" >> "$FAKE_GH_TRACE"
+[ "$GH_HOST" = github.com ] || exit 91
+[ "$GH_TOKEN" = selected-token ] || exit 92
+[ -z "${GH_REPO+x}" ] || exit 93
+"#,
+    );
+
+    for args in [
+        vec!["project", "list", "--owner", "@me"],
+        vec!["project", "item-list", "1", "--owner", "@me"],
+    ] {
+        let mut command = isolated_ghis_command();
+        command
+            .current_dir(temp.path())
+            .arg("gh")
+            .arg("--")
+            .args(&args)
+            .env("PATH", prepend_path(&bin))
+            .env("FAKE_GH_TRACE", &trace)
+            .env("GH_TOKEN", "inherited-token")
+            .env("GH_REPO", "other.example/acme/project");
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.assert().success();
+    }
+    let trace = fs::read_to_string(trace).expect("trace");
+    assert!(trace.contains("project list --owner @me host=github.com token=selected-token"));
+    assert!(trace.contains("project item-list 1 --owner @me host=github.com token=selected-token"));
+}
+
+#[test]
 fn cwd_rules_select_profiles_from_non_git_directories() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let matching = temp.path().join("home/discussions/topic");

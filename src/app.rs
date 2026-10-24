@@ -2042,6 +2042,7 @@ fn validate_gh_target_view(
             ("repo", Some("sync"), "source") => Some("repo sync --source"),
             ("repo", Some("create"), "template") => Some("repo create --template"),
             ("issue", Some("develop"), "branch-repo") => Some("issue develop --branch-repo"),
+            ("project", Some("item-add"), "url") => Some("project item-add --url"),
             _ => None,
         };
         if let Some(source) = source {
@@ -2099,7 +2100,7 @@ fn parse_gh_argument_view(args: &[String]) -> Result<GhArgumentView<'_>> {
         ("pr", Some("checkout"), 1)
     } else if matches!(
         raw_command,
-        "pr" | "issue" | "repo" | "label" | "auth" | "gist"
+        "pr" | "issue" | "repo" | "label" | "auth" | "gist" | "project"
     ) {
         let subcommand = args.get(1).map(String::as_str);
         if subcommand.is_some_and(|subcommand| subcommand.starts_with('-')) {
@@ -2425,6 +2426,7 @@ fn gh_strict_option_spec(command: &str, subcommand: Option<&str>) -> bool {
 fn gh_command_uses_repository_context(view: &GhArgumentView<'_>) -> bool {
     match (view.command, view.subcommand) {
         ("pr" | "issue", _) => true,
+        ("project", Some("link" | "unlink")) => true,
         ("repo", Some(subcommand)) => !matches!(
             subcommand,
             "clone" | "create" | "gitignore" | "license" | "list"
@@ -2458,6 +2460,7 @@ fn gh_supported_top_level_command(command: &str) -> bool {
             | "licenses"
             | "org"
             | "pr"
+            | "project"
             | "release"
             | "repo"
             | "ruleset"
@@ -2491,6 +2494,7 @@ fn gh_long_option_takes_value(command: &str, subcommand: Option<&str>, name: &st
             | ("gist", Some("edit"), "add" | "desc" | "filename" | "remove")
             | ("gist", Some("list"), "filter" | "limit")
             | ("gist", Some("view"), "filename")
+            | ("project", Some("item-add"), "url")
     ) {
         return true;
     }
@@ -2972,7 +2976,7 @@ fn is_sensitive_operation(command: &str, args: &[String]) -> bool {
     } else {
         matches!(
             first,
-            "pr" | "issue" | "repo" | "release" | "run" | "workflow" | "auth"
+            "pr" | "issue" | "project" | "repo" | "release" | "run" | "workflow" | "auth"
         )
     }
 }
@@ -4801,10 +4805,27 @@ mod tests {
                 "acme/destination".into(),
                 "--source=other.example/acme/source".into(),
             ],
+            vec![
+                "project".into(),
+                "item-add".into(),
+                "1".into(),
+                "--url".into(),
+                "https://other.example/acme/project/issues/1".into(),
+            ],
         ];
         for args in arguments {
             assert!(validate_gh_target_host("github.com", &args, None, None).is_err());
         }
+        assert!(
+            validate_gh_target_host(
+                "github.com",
+                &["project".into(), "link".into(), "1".into()],
+                None,
+                Some("other.example"),
+            )
+            .is_err(),
+            "project link 默认使用当前仓库，remote 主机必须一致"
+        );
         assert!(
             validate_gh_target_host(
                 "github.com",
@@ -4932,6 +4953,39 @@ mod tests {
             Some("enterprise.example"),
         )
         .expect("api does not consume repository context");
+        validate_gh_target_host(
+            "github.com",
+            &[
+                "project".into(),
+                "item-add".into(),
+                "1".into(),
+                "--url".into(),
+                "https://github.com/acme/project/issues/1".into(),
+            ],
+            Some(std::ffi::OsStr::new("enterprise.example/acme/project")),
+            Some("enterprise.example"),
+        )
+        .expect("a matching item URL is accepted and needs no repository context");
+        validate_gh_target_host(
+            "github.com",
+            &["project".into(), "link".into(), "1".into()],
+            None,
+            Some("github.com"),
+        )
+        .expect("project link uses the matching current remote");
+        validate_gh_target_host(
+            "github.com",
+            &[
+                "project".into(),
+                "item-list".into(),
+                "1".into(),
+                "--owner".into(),
+                "acme".into(),
+            ],
+            None,
+            None,
+        )
+        .expect("project subcommands without a repository operand");
         validate_gh_target_host(
             "github.com",
             &[
