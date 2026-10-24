@@ -1761,6 +1761,23 @@ where
             .and_then(repo::GhRemoteContext::remote)
             .and_then(|remote| remote.host.as_deref()),
     )?;
+    if gh_auth_mutates_keyring(&view) {
+        // gh refuses to change the keyring while GH_TOKEN is set, and a missing
+        // or expired token must not block the command that repairs it.
+        let mut command = CommandSpec::gh()
+            .args(forwarded_args.iter().cloned())
+            .clear_github_auth_env()
+            .remove_env("GH_REPO")
+            .env("GH_HOST", profile.host.clone())
+            .current_dir(cwd);
+        if config_path.is_some() {
+            command = command.env("GHIS_CONFIG", ctx.paths.config_file.as_os_str());
+        }
+        return Ok(SystemCommandRunner::new()
+            .run_passthrough(&command)?
+            .code()
+            .unwrap_or(128));
+    }
     let profile_id = ctx
         .profile_id()
         .ok_or_else(|| AppError::Message("未解析 Profile，无法准备 managed SSH".into()))?;
@@ -1797,6 +1814,17 @@ where
     let status = SystemCommandRunner::new().run_passthrough(&command)?;
     drop(token);
     Ok(status.code().unwrap_or(128))
+}
+
+/// `gh auth login`, `logout`, `refresh` and `switch` change gh's own keyring
+/// entry for the active account.  They receive GH_HOST so gh stays on the
+/// Profile's host, but never a token from ghis.
+fn gh_auth_mutates_keyring(view: &GhArgumentView<'_>) -> bool {
+    view.command == "auth"
+        && matches!(
+            view.subcommand,
+            Some("login" | "logout" | "refresh" | "switch")
+        )
 }
 
 #[derive(Debug, Default)]
