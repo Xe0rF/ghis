@@ -495,6 +495,18 @@ pub fn render_profile_fragment(options: &FragmentOptions) -> String {
     output.push_str("\temail = ");
     output.push_str(&git_config_quote(&options.email));
     output.push('\n');
+    // `author.*` and `committer.*` take precedence over `user.*`, so the
+    // Profile identity wins over a leftover global or command-line identity.
+    // `user.*` stays because tools that read it directly still need it.
+    for role in ["author", "committer"] {
+        output.push_str(&format!("[{role}]\n"));
+        output.push_str("\tname = ");
+        output.push_str(&git_config_quote(&options.name));
+        output.push('\n');
+        output.push_str("\temail = ");
+        output.push_str(&git_config_quote(&options.email));
+        output.push('\n');
+    }
     if let Some(value) = options.credential_helper.as_deref() {
         output.push_str("[credential]\n\thelper = ");
         output.push_str(&git_config_quote(value));
@@ -657,6 +669,14 @@ mod tests {
         assert!(fragment.contains("[user]"));
         assert!(fragment.contains("email = alice@example.test"));
         assert!(fragment.contains("ghis credential-helper"));
+        for role in ["[author]", "[committer]"] {
+            assert!(fragment.contains(role), "missing {role}: {fragment}");
+        }
+        assert_eq!(
+            fragment.matches("email = alice@example.test").count(),
+            3,
+            "user, author and committer must all carry the Profile identity"
+        );
     }
 
     #[test]
