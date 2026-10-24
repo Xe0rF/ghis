@@ -7,7 +7,7 @@ use ghis::config::{
     DisplayIdentity, Profile, ResolutionSource, Rule, SigningProfile, SigningTransport, SshMode,
     SshProfile, SshUnmanagedPolicy, UnresolvedPolicy,
 };
-use ghis::{credential, diagnostics, git, github, platform, shell, signing};
+use ghis::{baseline, credential, diagnostics, git, github, platform, shell, signing};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -73,7 +73,7 @@ enum Commands {
     },
     /// 重建 profile Git 配置片段
     Sync,
-    /// 检查依赖、账号、仓库和 1Password/SSH 状态
+    /// 只读检查身份平面：Git 各作用域、环境变量、SSH、全局基线与依赖
     Doctor(DoctorArgs),
     /// 在执行 git/gh 前即时返回结构化诊断（不注入 agent context）
     Check(CheckArgs),
@@ -86,6 +86,11 @@ enum Commands {
     Shell {
         #[command(subcommand)]
         command: ShellCommand,
+    },
+    /// 管理用户全局 Git 基线（唯一由 ghis 写入的全局 Git 配置）
+    Gitconfig {
+        #[command(subcommand)]
+        command: GitconfigCommand,
     },
     /// 撤销 ghis 管理的用户集成
     Teardown(TeardownArgs),
@@ -121,6 +126,21 @@ enum ShellCommand {
     Init(ShellArgs),
     /// 输出 Shell 补全脚本
     Completion(ShellArgs),
+}
+
+#[derive(Debug, Subcommand)]
+enum GitconfigCommand {
+    /// 写入基线文件并在全局 Git 配置中加入 include.path
+    Setup(GitconfigSetupArgs),
+    /// 移除 ghis 写入的 include.path 并删除基线文件
+    Uninstall,
+}
+
+#[derive(Debug, Args)]
+struct GitconfigSetupArgs {
+    /// 只输出路径和内容，不修改任何文件
+    #[arg(long)]
+    print: bool,
 }
 
 #[derive(Debug, Args, Default)]
@@ -409,7 +429,7 @@ struct ProfileArgs {
     /// SSH signing agent source; forwarded-agent uses only SSH_AUTH_SOCK.
     #[arg(long, value_enum, default_value_t = SigningTransportArg::LocalAgent)]
     signing_transport: SigningTransportArg,
-    /// Who supplies the HTTPS credential: manage、passthrough 或 command。
+    /// Who supplies the HTTPS credential: manage、none 或 command。
     #[arg(long, value_enum, default_value_t = CredentialModeArg::Manage)]
     credential_mode: CredentialModeArg,
     /// 取得 token 的命令，逗号分隔的 argv；仅 `command` 模式使用
@@ -489,7 +509,7 @@ struct ProfileEditArgs {
     /// SSH signing agent source; forwarded-agent uses only SSH_AUTH_SOCK.
     #[arg(long, value_enum)]
     signing_transport: Option<SigningTransportArg>,
-    /// Who supplies the HTTPS credential: manage、passthrough 或 command。
+    /// Who supplies the HTTPS credential: manage、none 或 command。
     #[arg(long, value_enum)]
     credential_mode: Option<CredentialModeArg>,
     /// 取得 token 的命令，逗号分隔的 argv；仅 `command` 模式使用
@@ -506,7 +526,7 @@ struct ProfileEditArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 enum CredentialModeArg {
     Manage,
-    Passthrough,
+    None,
     Command,
 }
 
@@ -514,7 +534,7 @@ impl From<CredentialModeArg> for CredentialMode {
     fn from(value: CredentialModeArg) -> Self {
         match value {
             CredentialModeArg::Manage => CredentialMode::Manage,
-            CredentialModeArg::Passthrough => CredentialMode::Passthrough,
+            CredentialModeArg::None => CredentialMode::None,
             CredentialModeArg::Command => CredentialMode::Command,
         }
     }
@@ -639,6 +659,9 @@ fn operation_lock_mode(command: Option<&Commands>) -> OperationLockMode {
         Some(Commands::Shell {
             command: ShellCommand::Setup(_) | ShellCommand::Uninstall(_),
         }) => OperationLockMode::Shared,
+        Some(Commands::Gitconfig {
+            command: GitconfigCommand::Setup(_) | GitconfigCommand::Uninstall,
+        }) => OperationLockMode::Shared,
         _ => OperationLockMode::None,
     }
 }
@@ -711,6 +734,7 @@ fn dispatch(cli: Cli) -> app::Result<i32> {
             agent_command(cli.config.as_deref(), cli.profile.as_deref(), command)
         }
         Commands::Shell { command } => shell_command(command),
+        Commands::Gitconfig { command } => gitconfig_command(cli.config.as_deref(), command),
         Commands::Teardown(args) => teardown(cli.config.as_deref(), args),
         Commands::Git(args) => {
             let argument_view = args
@@ -1366,11 +1390,34 @@ fn apply_onboarding(
         }
     }
 
+    if draft.gitconfig_baseline
+        && let Err(error) = baseline::install(paths)
+    {
+        let binding_rollback = if binding_applied {
+            restore_onboarding_binding(path, target, &draft.id, previous_binding.as_deref())
+        } else {
+            Ok(())
+        };
+        let profile_rollback =
+            rollback_onboarding_profile(paths, &draft.id, &profile, previous_default.as_deref());
+        return Err(with_two_rollback_context(
+            error.into(),
+            binding_rollback,
+            profile_rollback,
+        ));
+    }
+
     println!("✓ 已完成 ghis 初始设置");
     println!("\n  Profile  {}", draft.id);
     println!("  GitHub   {}@{}", draft.login, draft.host);
     if draft.bind_repository {
         println!("  仓库     {}", target.display());
+    }
+    if draft.gitconfig_baseline {
+        println!(
+            "  全局 Git 基线 {}",
+            baseline::baseline_path(paths).display()
+        );
     }
     println!("\n后续可以运行：\n  ghis status\n  ghis doctor");
     Ok(0)
@@ -1612,7 +1659,7 @@ fn profile_details(id: &str, profile: &Profile) -> String {
             "凭据模式：{}",
             match credential_mode {
                 CredentialMode::Manage => "manage",
-                CredentialMode::Passthrough => "passthrough",
+                CredentialMode::None => "none",
                 CredentialMode::Command => "command",
             }
         ));
@@ -2079,6 +2126,7 @@ fn parse_bool(value: &str) -> app::Result<bool> {
 fn sync(path: Option<&Path>) -> app::Result<i32> {
     let (paths, config) = load_config(path)?;
     let written = app::sync_fragments(&paths, &config)?;
+    let baseline_changed = baseline::refresh(&paths)?;
     let config = Config::load(&paths.config_file)?;
     let repositories = app::sync_registered_repositories(&paths, &config);
     println!(
@@ -2088,10 +2136,55 @@ fn sync(path: Option<&Path>) -> app::Result<i32> {
         repositories.repaired,
         repositories.forgotten
     );
+    if baseline_changed {
+        println!("全局 Git 基线已更新。");
+    }
     for warning in repositories.warnings {
         eprintln!("ghis: {warning}");
     }
     Ok(0)
+}
+
+fn gitconfig_command(path: Option<&Path>, command: GitconfigCommand) -> app::Result<i32> {
+    let mut paths = ConfigPaths::discover()?;
+    if let Some(path) = path {
+        paths.set_config_file(path)?;
+    }
+    let target = baseline::baseline_path(&paths);
+    match command {
+        GitconfigCommand::Setup(args) => {
+            if args.print {
+                println!("include.path = {}", target.display());
+                println!();
+                print!("{}", baseline::render());
+                return Ok(0);
+            }
+            let outcome = baseline::install(&paths)?;
+            println!(
+                "全局 Git 基线：{}（{}）",
+                if outcome.file_changed || outcome.include_changed {
+                    "已更新"
+                } else {
+                    "已是最新"
+                },
+                target.display()
+            );
+            Ok(0)
+        }
+        GitconfigCommand::Uninstall => {
+            let changed = baseline::uninstall(&paths)?;
+            println!(
+                "全局 Git 基线：{}{}",
+                if changed { "已移除" } else { "未发现" },
+                if changed {
+                    String::new()
+                } else {
+                    format!("（{}）", target.display())
+                }
+            );
+            Ok(0)
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -2110,10 +2203,8 @@ struct DoctorReport {
     signing_transport: Option<String>,
     signing_program: Option<DoctorSigningProgram>,
     github_signing_key: Option<DoctorGithubSigningKey>,
-    git_config: diagnostics::GitConfigReport,
-    checks: Vec<diagnostics::DiagnosticCheck>,
+    findings: diagnostics::DiagnosticReport,
     repairs: Vec<diagnostics::RepairAction>,
-    warnings: Vec<String>,
 }
 
 #[derive(Serialize)]
@@ -2193,6 +2284,14 @@ struct DoctorLocalSigningKey {
     fingerprint: Option<String>,
 }
 
+fn dependency_finding(
+    code: diagnostics::DiagnosticCode,
+    severity: diagnostics::Severity,
+    impact: impl Into<String>,
+) -> diagnostics::Finding {
+    diagnostics::Finding::new(diagnostics::Layer::Dependency, code, severity, impact)
+}
+
 fn doctor(
     path: Option<&Path>,
     explicit: Option<&str>,
@@ -2200,14 +2299,28 @@ fn doctor(
     redacted: bool,
     check_github_signing_key: bool,
 ) -> app::Result<i32> {
+    use diagnostics::{DiagnosticCode, Finding, Layer, Severity};
+
     let ctx = context(path, explicit, std::env::current_dir()?)?;
-    let mut warnings = ctx.warnings.clone();
+    let mut findings = Vec::new();
+    for warning in &ctx.warnings {
+        findings.push(dependency_finding(
+            DiagnosticCode::InvalidBinding,
+            Severity::Warning,
+            warning.clone(),
+        ));
+    }
     let unknown_keys = diagnostics::unknown_config_keys_report(&ctx.paths.config_file);
     if !unknown_keys.is_empty() {
-        warnings.push(format!(
-            "配置文件包含 ghis 未识别的键（已保留，不会影响执行）：{}",
-            unknown_keys.join("、")
-        ));
+        findings.push(
+            dependency_finding(
+                DiagnosticCode::ConfigUnknownKey,
+                Severity::Warning,
+                "配置文件包含 ghis 未识别的键（已保留，不会影响执行）",
+            )
+            .source("ghis config")
+            .value(unknown_keys.join("、")),
+        );
     }
     let shell_integration = doctor_shell_integration(&ctx)?;
     let diagnostic_cwd = ctx
@@ -2215,27 +2328,65 @@ fn doctor(
         .as_ref()
         .map(|repository| repository.command_dir().to_path_buf())
         .unwrap_or(std::env::current_dir()?);
-    let git_config = match diagnostics::scan_git_config(
+    let mut report = match diagnostics::scan_git_config(
         &diagnostic_cwd,
+        &ctx.paths,
         ctx.profile.as_ref(),
-        ctx.remote.as_ref(),
         ctx.identities.as_ref(),
     ) {
         Ok(report) => report,
         Err(error) => {
-            warnings.push(format!("无法读取 Git 配置来源：{error}"));
-            diagnostics::GitConfigReport::default()
+            findings.push(dependency_finding(
+                DiagnosticCode::GitConfigRead,
+                Severity::Warning,
+                format!("无法读取 Git 配置来源：{error}"),
+            ));
+            diagnostics::DiagnosticReport::default()
         }
     };
+    findings.extend(diagnostics::scan_process_environment());
+    findings.extend(diagnostics::scan_ssh(
+        ctx.profile.as_ref(),
+        ctx.remote.as_ref(),
+    ));
+    findings.extend(diagnostics::baseline_findings(&ctx.paths));
+    if ctx.repository.is_some()
+        && ctx.profile.is_some()
+        // Ownership drift is meaningful only for a repository ghis actually
+        // bound.  `--profile` and rules apply per command and write nothing.
+        && matches!(ctx.resolution.source, ResolutionSource::RepositoryBinding)
+        && app::repository_needs_repair(&ctx)?
+    {
+        findings.push(
+            Finding::new(
+                Layer::Ownership,
+                DiagnosticCode::BindingDrift,
+                Severity::Warning,
+                "仓库绑定与 ghis 生成的 fragment、helper 或 hook 不一致",
+            )
+            .source("ghis")
+            .suggestion("运行 `ghis sync` 重建 fragment 和已登记仓库配置")
+            .repair(diagnostics::RepairAction::confirmation("ghis sync")),
+        );
+    }
+
     let discovery = match github::discover_accounts(None) {
         Ok(discovery) => {
             if let Some(warning) = cache_discovery(&ctx.paths, &discovery) {
-                warnings.push(warning);
+                findings.push(dependency_finding(
+                    DiagnosticCode::GhAuth,
+                    Severity::Warning,
+                    warning,
+                ));
             }
             Some(discovery)
         }
         Err(error) => {
-            warnings.push(format!("gh 账号发现失败：{error}"));
+            findings.push(dependency_finding(
+                DiagnosticCode::GhAuth,
+                Severity::Warning,
+                format!("gh 账号发现失败：{error}"),
+            ));
             None
         }
     };
@@ -2248,10 +2399,17 @@ fn doctor(
                     true
                 }
                 Err(_) => {
-                    warnings.push(format!(
-                        "无法取得 {}/{} 的凭据；绑定仓库的 HTTPS 操作会停止",
-                        profile.host, profile.login
-                    ));
+                    findings.push(
+                        dependency_finding(
+                            DiagnosticCode::CredentialUnavailable,
+                            Severity::Error,
+                            format!(
+                                "无法取得 {}/{} 的凭据；绑定仓库的 HTTPS 操作会停止",
+                                profile.host, profile.login
+                            ),
+                        )
+                        .source("gh"),
+                    );
                     false
                 }
             },
@@ -2292,7 +2450,11 @@ fn doctor(
             match doctor_local_signing_key(ctx.profile.as_ref().expect("signing profile exists")) {
                 Ok(key) => (Some(key), None),
                 Err(error) => {
-                    warnings.push(error.clone());
+                    findings.push(dependency_finding(
+                        DiagnosticCode::SigningProgram,
+                        Severity::Error,
+                        error.clone(),
+                    ));
                     (None, Some(error))
                 }
             }
@@ -2303,7 +2465,7 @@ fn doctor(
     let selector = doctor_key_selector(
         ctx.profile.as_ref(),
         local_signing_key.as_ref().map(|key| key.material.as_str()),
-        &mut warnings,
+        &mut findings,
     );
     let ssh_agent = match socket {
         Some(socket) => match signing::inspect_agent(&socket) {
@@ -2313,16 +2475,27 @@ fn doctor(
                     .as_deref()
                     .map(diagnostics::sanitize_external_output);
                 if agent_required && !agent.available {
-                    warnings.push(format!(
-                        "SSH Agent 不可用：{}",
-                        agent_error.as_deref().unwrap_or("未知错误")
-                    ));
+                    findings.push(
+                        dependency_finding(
+                            DiagnosticCode::SshKey,
+                            Severity::Error,
+                            format!(
+                                "SSH Agent 不可用：{}",
+                                agent_error.as_deref().unwrap_or("未知错误")
+                            ),
+                        )
+                        .source("ssh agent"),
+                    );
                 }
                 let selected_key = selector
                     .as_ref()
                     .and_then(|selector| signing::select_key(&agent.keys, selector));
                 if agent_required && selector.is_some() && selected_key.is_none() {
-                    warnings.push("配置的 SSH 公钥或指纹不在所选 Agent 中".into());
+                    findings.push(dependency_finding(
+                        DiagnosticCode::SshKey,
+                        Severity::Error,
+                        "配置的 SSH 公钥或指纹不在所选 Agent 中",
+                    ));
                 }
                 Some(DoctorAgent {
                     socket: agent.socket.display().to_string(),
@@ -2344,7 +2517,11 @@ fn doctor(
             Err(error) => {
                 let error = diagnostics::sanitize_external_output(&error.to_string());
                 if agent_required {
-                    warnings.push(format!("SSH Agent 检查失败：{error}"));
+                    findings.push(dependency_finding(
+                        DiagnosticCode::SshKey,
+                        Severity::Error,
+                        format!("SSH Agent 检查失败：{error}"),
+                    ));
                 }
                 Some(DoctorAgent {
                     socket: socket.display().to_string(),
@@ -2364,7 +2541,11 @@ fn doctor(
         },
         None => {
             if agent_required {
-                warnings.push("未发现当前 Profile 需要的 SSH Agent socket".into());
+                findings.push(dependency_finding(
+                    DiagnosticCode::SshKey,
+                    Severity::Error,
+                    "未发现当前 Profile 需要的 SSH Agent socket",
+                ));
             }
             None
         }
@@ -2397,7 +2578,11 @@ fn doctor(
                 .as_ref()
                 .is_some_and(|program| !program.available))
     {
-        warnings.push("已启用 SSH commit signing，但签名程序不可执行".into());
+        findings.push(dependency_finding(
+            DiagnosticCode::SigningProgram,
+            Severity::Error,
+            "已启用 SSH commit signing，但签名程序不可执行",
+        ));
     }
     let signing_transport = ctx.profile.as_ref().map(|profile| {
         match profile.signing.transport {
@@ -2412,25 +2597,23 @@ fn doctor(
         ctx.profile.as_ref(),
         local_signing_key.as_ref(),
         local_signing_key_error.as_deref(),
-        &mut warnings,
+        &mut findings,
     );
     let git_status = tool_status("git", &["--version"]);
     let gh_status = tool_status("gh", &["--version"]);
     let shell_kind = resolve_shell(None)?;
     let shell_kind_name = shell_kind.to_string();
     let shell_status = shell_tool_status(shell_kind);
-    let checks = build_doctor_checks(
+    findings.extend(build_doctor_findings(
         &ctx,
         &shell_integration,
         &git_status,
         &gh_status,
         &shell_status,
         &shell_kind_name,
-        credential_available,
-        ssh_agent.as_ref(),
-        &git_config,
-    );
-    let repairs = collect_repairs(&checks, &git_config);
+    ));
+    report.extend(findings);
+    let repairs = collect_repairs(&report);
     let report = DoctorReport {
         schema_version: ghis::SCHEMA_VERSION,
         git: git_status,
@@ -2461,10 +2644,8 @@ fn doctor(
         signing_transport,
         signing_program,
         github_signing_key,
-        git_config,
-        checks,
+        findings: report,
         repairs,
-        warnings,
     };
     if redacted {
         print_redacted_json(&report)?;
@@ -2549,12 +2730,21 @@ fn doctor(
         } else {
             println!("GitHub SSH 签名公钥: 未启用");
         }
-        println!(
-            "Git 配置冲突: {}",
-            diagnostics::summary_line(&report.git_config)
-        );
-        for item in &report.git_config.diagnostics {
-            println!("{}", diagnostics::render_row(item));
+        println!("诊断: {}", diagnostics::summary_line(&report.findings));
+        for layer in diagnostics::Layer::ORDER {
+            let items = report
+                .findings
+                .findings
+                .iter()
+                .filter(|item| item.layer == layer)
+                .collect::<Vec<_>>();
+            if items.is_empty() {
+                continue;
+            }
+            println!("[{}]", layer.label());
+            for item in items {
+                println!("  {}", diagnostics::render_row(item));
+            }
         }
         if !report.repairs.is_empty() {
             println!("修复建议:");
@@ -2571,130 +2761,71 @@ fn doctor(
                 );
             }
         }
-        for warning in &report.warnings {
-            eprintln!("警告：{warning}");
-        }
     }
     Ok(0)
 }
 
-#[allow(clippy::too_many_arguments)]
-fn build_doctor_checks(
+fn build_doctor_findings(
     ctx: &AppContext,
     shell: &DoctorShellIntegration,
     git: &ToolStatus,
     gh: &ToolStatus,
     shell_tool: &ToolStatus,
     shell_kind: &str,
-    credential_available: Option<bool>,
-    ssh_agent: Option<&DoctorAgent>,
-    git_config: &diagnostics::GitConfigReport,
-) -> Vec<diagnostics::DiagnosticCheck> {
-    use diagnostics::{DiagnosticCheck, DiagnosticCode, RepairAction, Severity};
-    let mut checks = Vec::new();
+) -> Vec<diagnostics::Finding> {
+    use diagnostics::{DiagnosticCode, Finding, Layer, RepairAction, Severity};
+    let mut findings = Vec::new();
     for (name, status) in [("git", git), ("gh", gh), (shell_kind, shell_tool)] {
-        checks.push(DiagnosticCheck::new(
-            match name {
-                "gh" => DiagnosticCode::GhAuth,
-                _ if name == shell_kind => DiagnosticCode::ShellIntegration,
-                _ => DiagnosticCode::GlobalGitConfig,
-            },
-            if status.available {
-                Severity::Info
-            } else {
-                Severity::Error
-            },
-            format!(
-                "{name} {}",
-                if status.available {
-                    "可用"
-                } else {
-                    "不可用"
-                }
-            ),
-            None,
-        ));
+        if !status.available {
+            findings.push(
+                dependency_finding(
+                    DiagnosticCode::ToolMissing,
+                    Severity::Error,
+                    format!("{name} 不可用"),
+                )
+                .key(name.to_owned()),
+            );
+        }
     }
-    checks.push(DiagnosticCheck::new(
-        DiagnosticCode::ShellIntegration,
-        if shell.wrapper_loaded {
-            Severity::Info
-        } else {
-            Severity::Warning
-        },
-        shell.advice.clone(),
-        (!shell.wrapper_loaded).then(|| RepairAction::confirmation(shell.repair_command.clone())),
-    ));
-    if credential_available == Some(false) {
-        let command = ctx.profile.as_ref().map_or_else(
-            || "gh auth login".to_string(),
-            |profile| format!("gh auth login --hostname {}", profile.host),
+    if !shell.wrapper_loaded {
+        findings.push(
+            Finding::new(
+                Layer::Dependency,
+                DiagnosticCode::ShellIntegration,
+                Severity::Warning,
+                shell.advice.clone(),
+            )
+            .source("shell")
+            .repair(RepairAction::confirmation(shell.repair_command.clone())),
         );
-        checks.push(DiagnosticCheck::new(
-            DiagnosticCode::GhAuth,
-            Severity::Error,
-            "当前 Profile 的 GitHub 凭据不可用",
-            Some(RepairAction::manual(command)),
-        ));
     }
     if matches!(
         ctx.resolution.source,
         ResolutionSource::InvalidRepositoryBinding
     ) {
-        checks.push(DiagnosticCheck::new(
-            DiagnosticCode::InvalidBinding,
-            Severity::Error,
-            "仓库绑定的 Profile 已不存在；必须选择新的 Profile 或解绑",
-            Some(RepairAction::confirmation(
+        findings.push(
+            Finding::new(
+                Layer::Context,
+                DiagnosticCode::InvalidBinding,
+                Severity::Error,
+                "仓库绑定的 Profile 已不存在；必须选择新的 Profile 或解绑",
+            )
+            .source("ghis")
+            .suggestion("运行 `ghis use <profile>` 或 `ghis unbind`")
+            .repair(RepairAction::confirmation(
                 "ghis use <profile>  # 或 ghis unbind",
             )),
-        ));
+        );
     }
-    if ssh_agent.is_some_and(|agent| !agent.available) {
-        checks.push(DiagnosticCheck::new(
-            DiagnosticCode::SshKey,
-            Severity::Error,
-            "当前 Profile 所需的 SSH Agent/key 不可用",
-            Some(RepairAction::manual("ssh-add -L")),
-        ));
-    }
-    if !git_config.diagnostics.is_empty() {
-        checks.push(DiagnosticCheck::new(
-            DiagnosticCode::GlobalGitConfig,
-            if git_config.errors > 0 {
-                Severity::Error
-            } else {
-                Severity::Warning
-            },
-            diagnostics::summary_line(git_config),
-            Some(RepairAction::manual(
-                "git config --show-origin --show-scope --list",
-            )),
-        ));
-    }
-    checks.push(DiagnosticCheck::new(
-        DiagnosticCode::GlobalGitConfig,
-        Severity::Info,
-        "可安全重建 ghis fragment 和已登记仓库配置",
-        Some(RepairAction::automatic("ghis sync")),
-    ));
-    checks
+    findings
 }
 
-fn collect_repairs(
-    checks: &[diagnostics::DiagnosticCheck],
-    report: &diagnostics::GitConfigReport,
-) -> Vec<diagnostics::RepairAction> {
+fn collect_repairs(report: &diagnostics::DiagnosticReport) -> Vec<diagnostics::RepairAction> {
     let mut seen = BTreeSet::new();
-    checks
+    report
+        .findings
         .iter()
-        .filter_map(|check| check.repair.clone())
-        .chain(
-            report
-                .diagnostics
-                .iter()
-                .filter_map(|item| item.repair.clone()),
-        )
+        .filter_map(|finding| finding.repair.clone())
         .filter(|repair| seen.insert((repair.kind as u8, repair.command.clone())))
         .collect()
 }
@@ -2742,11 +2873,13 @@ struct CheckReport {
     schema_version: u32,
     operation: CheckOperation,
     operation_summary: CheckOperationSummary,
-    git_config: diagnostics::GitConfigReport,
-    checks: Vec<diagnostics::DiagnosticCheck>,
+    findings: diagnostics::DiagnosticReport,
     repairs: Vec<diagnostics::RepairAction>,
 }
 
+/// The agent preflight only runs the checks that decide whether an operation
+/// is safe: foreign Git/environment state and the current context.  It does
+/// not start `ssh -G`, query GitHub or inspect tools; that is `doctor`'s job.
 fn check(path: Option<&Path>, explicit: Option<&str>, args: CheckArgs) -> app::Result<i32> {
     let ctx = context(path, explicit, std::env::current_dir()?)?;
     let cwd = ctx
@@ -2755,33 +2888,45 @@ fn check(path: Option<&Path>, explicit: Option<&str>, args: CheckArgs) -> app::R
         .map_or(std::env::current_dir()?, |repo| {
             repo.command_dir().to_path_buf()
         });
-    let git_config = diagnostics::scan_git_config(
+    let mut findings = diagnostics::scan_git_config(
         &cwd,
+        &ctx.paths,
         ctx.profile.as_ref(),
-        ctx.remote.as_ref(),
         ctx.identities.as_ref(),
-    )?;
-    let shell = doctor_shell_integration(&ctx)?;
-    let shell_kind = resolve_shell(None)?;
-    let shell_kind_name = shell_kind.to_string();
-    let checks = build_doctor_checks(
-        &ctx,
-        &shell,
-        &tool_status("git", &["--version"]),
-        &tool_status("gh", &["--version"]),
-        &shell_tool_status(shell_kind),
-        &shell_kind_name,
-        None,
-        None,
-        &git_config,
+    )?
+    .findings;
+    findings.extend(diagnostics::scan_process_environment());
+    if matches!(
+        ctx.resolution.source,
+        ResolutionSource::InvalidRepositoryBinding
+    ) {
+        findings.push(
+            diagnostics::Finding::new(
+                diagnostics::Layer::Context,
+                diagnostics::DiagnosticCode::InvalidBinding,
+                diagnostics::Severity::Error,
+                "仓库绑定的 Profile 已不存在；必须选择新的 Profile 或解绑",
+            )
+            .source("ghis"),
+        );
+    }
+    let findings = diagnostics::DiagnosticReport::from_findings(
+        findings
+            .into_iter()
+            .filter(|finding| {
+                matches!(
+                    finding.layer,
+                    diagnostics::Layer::Foreign | diagnostics::Layer::Context
+                )
+            })
+            .collect(),
     );
-    let repairs = collect_repairs(&checks, &git_config);
+    let repairs = collect_repairs(&findings);
     let report = CheckReport {
         schema_version: ghis::SCHEMA_VERSION,
         operation: args.operation,
         operation_summary: summarize_check_operation(args.operation, &args.args),
-        git_config,
-        checks,
+        findings,
         repairs,
     };
     if args.redacted {
@@ -2800,29 +2945,19 @@ fn check(path: Option<&Path>, explicit: Option<&str>, args: CheckArgs) -> app::R
                 ""
             }
         );
-        for check in &report.checks {
+        println!("诊断: {}", diagnostics::summary_line(&report.findings));
+        for finding in &report.findings.findings {
             println!(
-                "{}\t{:?}\t{}",
-                check.severity.label(),
-                check.code,
-                check.summary
+                "[{}] {}",
+                finding.layer.label(),
+                diagnostics::render_row(finding)
             );
         }
         for repair in &report.repairs {
             println!("[{}]\t{}", repair.kind.label(), repair.command);
         }
     }
-    Ok(
-        if report
-            .checks
-            .iter()
-            .any(|check| check.severity == diagnostics::Severity::Error)
-        {
-            1
-        } else {
-            0
-        },
-    )
+    Ok(if report.findings.errors > 0 { 1 } else { 0 })
 }
 
 fn doctor_shell_integration(ctx: &AppContext) -> app::Result<DoctorShellIntegration> {
@@ -3001,7 +3136,7 @@ fn doctor_github_signing_key(
     profile: Option<&Profile>,
     local_key: Option<&DoctorLocalSigningKey>,
     local_error: Option<&str>,
-    warnings: &mut Vec<String>,
+    warnings: &mut Vec<diagnostics::Finding>,
 ) -> Option<DoctorGithubSigningKey> {
     let profile = profile.filter(|profile| profile.signing.enabled)?;
     let local_fingerprint = local_key.and_then(|key| key.fingerprint.clone());
@@ -3032,7 +3167,11 @@ fn doctor_github_signing_key(
                 .collect::<Option<Vec<_>>>();
             let Some(materials) = materials else {
                 let error = "GitHub 返回了无法识别的 SSH signing 公钥".to_string();
-                warnings.push(format!("{error}；不会因此判定本地签名 key 失效"));
+                warnings.push(dependency_finding(
+                    diagnostics::DiagnosticCode::GithubSigningKey,
+                    diagnostics::Severity::Warning,
+                    format!("{error}；不会因此判定本地签名 key 失效"),
+                ));
                 return Some(DoctorGithubSigningKey {
                     checked: true,
                     status: DoctorGithubSigningKeyStatus::Unavailable,
@@ -3052,7 +3191,11 @@ fn doctor_github_signing_key(
                     let error = format!(
                         "GitHub 返回了无法通过 ssh-keygen 校验的 SSH signing 公钥：{error}"
                     );
-                    warnings.push(format!("{error}；不会因此判定本地签名 key 失效"));
+                    warnings.push(dependency_finding(
+                        diagnostics::DiagnosticCode::GithubSigningKey,
+                        diagnostics::Severity::Warning,
+                        format!("{error}；不会因此判定本地签名 key 失效"),
+                    ));
                     return Some(DoctorGithubSigningKey {
                         checked: true,
                         status: DoctorGithubSigningKeyStatus::Unavailable,
@@ -3061,10 +3204,11 @@ fn doctor_github_signing_key(
                         error: Some(error),
                     });
                 }
-                warnings.push(
-                    "GitHub 未登记当前 Profile 的 SSH 签名公钥；本地 key 未被判为失效，但 GitHub 可能无法验证签名"
-                        .into(),
-                );
+                warnings.push(dependency_finding(
+                    diagnostics::DiagnosticCode::GithubSigningKey,
+                    diagnostics::Severity::Warning,
+                    "GitHub 未登记当前 Profile 的 SSH 签名公钥；本地 key 未被判为失效，但 GitHub 可能无法验证签名",
+                ));
             }
             Some(DoctorGithubSigningKey {
                 checked: true,
@@ -3080,8 +3224,10 @@ fn doctor_github_signing_key(
         }
         Err(error) => {
             let error = error.to_string();
-            warnings.push(format!(
-                "无法检查 GitHub SSH 签名公钥：{error}；不会因此判定本地签名 key 失效"
+            warnings.push(dependency_finding(
+                diagnostics::DiagnosticCode::GithubSigningKey,
+                diagnostics::Severity::Warning,
+                format!("无法检查 GitHub SSH 签名公钥：{error}；不会因此判定本地签名 key 失效"),
             ));
             Some(DoctorGithubSigningKey {
                 checked: true,
@@ -3109,7 +3255,7 @@ fn doctor_github_signing_key_text(status: DoctorGithubSigningKeyStatus) -> &'sta
 fn doctor_key_selector(
     profile: Option<&Profile>,
     signing_public_key: Option<&str>,
-    warnings: &mut Vec<String>,
+    warnings: &mut Vec<diagnostics::Finding>,
 ) -> Option<signing::SigningProfile> {
     let profile = profile?;
     let ssh = profile.ssh.as_ref();
@@ -3122,7 +3268,11 @@ fn doctor_key_selector(
     if ssh.is_some_and(|ssh| {
         matches!(ssh.mode, SshMode::OnePassword | SshMode::Managed) && ssh.public_key.is_none()
     }) {
-        warnings.push("当前 Profile 纳管 SSH，但未配置公钥文件".into());
+        warnings.push(dependency_finding(
+            diagnostics::DiagnosticCode::SshKey,
+            diagnostics::Severity::Warning,
+            "当前 Profile 纳管 SSH，但未配置公钥文件",
+        ));
     }
 
     let public_key = if profile.signing.enabled {
@@ -3134,7 +3284,11 @@ fn doctor_key_selector(
                 match fs::read_to_string(&path) {
                     Ok(key) => Some(key),
                     Err(error) => {
-                        warnings.push(format!("无法读取 SSH 公钥 {}：{error}", path.display()));
+                        warnings.push(dependency_finding(
+                            diagnostics::DiagnosticCode::SshKey,
+                            diagnostics::Severity::Warning,
+                            format!("无法读取 SSH 公钥 {}：{error}", path.display()),
+                        ));
                         None
                     }
                 }
@@ -3309,6 +3463,10 @@ fn teardown(path: Option<&Path>, args: TeardownArgs) -> app::Result<i32> {
         println!("  Shell 初始化文件：{}", init_file.display());
         println!("  Claude Code 用户 Hook：{}", user_settings.display());
         println!("  Claude Code 项目 Hook：{}", project_settings.display());
+        println!(
+            "  全局 Git 基线：{}",
+            baseline::baseline_path(&paths).display()
+        );
         if let Some(repository) = &ctx.repository {
             println!("  仓库绑定：{}", repository.command_dir().display());
         } else {
@@ -3349,6 +3507,16 @@ fn teardown(path: Option<&Path>, args: TeardownArgs) -> app::Result<i32> {
             settings.display()
         );
     }
+
+    let baseline_changed = baseline::uninstall(&paths)?;
+    println!(
+        "全局 Git 基线：{}",
+        if baseline_changed {
+            "已移除"
+        } else {
+            "未发现"
+        }
+    );
 
     if ctx.repository.is_some() {
         app::unbind_repository(&ctx)?;

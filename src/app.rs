@@ -34,6 +34,8 @@ pub enum AppError {
     Process(#[from] ProcessError),
     #[error("SSH/签名错误：{0}")]
     Signing(#[from] signing::SigningError),
+    #[error("全局 Git 基线错误：{0}")]
+    Baseline(#[from] crate::baseline::BaselineError),
     #[error("I/O 错误：{0}")]
     Io(#[from] io::Error),
     #[error("{0}")]
@@ -262,8 +264,13 @@ impl AppContext {
                 (ResolutionSource::InvalidRepositoryBinding, _) => {
                     "仓库绑定的 Profile 已失效，拒绝回退到其他身份".into()
                 }
-                (_, true) => "目标仓库 URL 未匹配任何 Profile，将继续使用现有 Git 配置".into(),
-                (_, false) => "仓库尚未绑定 ghis profile，将继续使用现有 Git 配置".into(),
+                (_, true) => {
+                    "目标仓库 URL 未匹配任何 Profile；ghis 不提供身份，必要时请绑定 Profile".into()
+                }
+                (_, false) => {
+                    "仓库尚未绑定 ghis profile；ghis 不提供身份，提交前请运行 `ghis use <profile>`"
+                        .into()
+                }
             });
         }
         let profile = resolution
@@ -391,11 +398,11 @@ fn unique_profile_for_target(
 
 /// Profiles that answer HTTPS credentials for hosts other than `current`'s.
 ///
-/// Only hosts with exactly one credential-managing Profile qualify; a host
+/// Only hosts with exactly one credential-serving Profile qualify; a host
 /// shared by several Profiles stays with the inherited helper chain, and the
 /// current Profile's host always keeps its existing semantics (including a
-/// passthrough chain).  The result is sorted by normalized host so injected
-/// argv is deterministic.
+/// `none` profile whose helper refuses).  The result is sorted by normalized
+/// host so injected argv is deterministic.
 pub fn credential_routes<'a>(
     config: &'a Config,
     current: Option<&Profile>,
@@ -664,10 +671,11 @@ pub fn bind_repository(ctx: &AppContext, id: &str) -> Result<()> {
     for include_key in &include_keys {
         repo::add_local_config(repository, include_key, fragment.to_string_lossy().as_ref())?;
     }
-    if profile.manages_credentials() {
-        let helper = credential_helper_command(&ctx.paths);
-        git::install_credential_helper(repository, &profile.host, &helper)?;
-    }
+    // Every mode installs the same helper string.  A `none` profile still gets
+    // the empty reset and the helper so the inherited chain is cut for this
+    // host; the helper then refuses with `quit=true` instead of resolving.
+    let helper = credential_helper_command(&ctx.paths);
+    git::install_credential_helper(repository, &profile.host, &helper)?;
     if git::supports_named_hooks() {
         let binary = current_binary();
         git::install_named_hooks_with_config(repository, &binary, Some(&ctx.paths.config_file))?;
@@ -778,7 +786,7 @@ fn profile_include_keys() -> Vec<String> {
 /// The `includeIf` spellings earlier versions wrote.
 ///
 /// Kept only so bind and unbind can erase them.  A repository bound by an older
-/// ghis reports no `include.path`, so `repository_binding_needs_repair` sends it
+/// ghis reports no `include.path`, so `repository_needs_repair` sends it
 /// through `bind_repository`, which clears these before writing the new key.
 fn legacy_profile_include_keys(repository: &Repository) -> Vec<String> {
     let common = fs::canonicalize(&repository.common_dir)
@@ -912,7 +920,7 @@ pub fn sync_registered_repositories(paths: &ConfigPaths, config: &Config) -> Rep
                 continue;
             }
         };
-        match repository_binding_needs_repair(&ctx) {
+        match repository_needs_repair(&ctx) {
             Ok(true) => match bind_repository(&ctx, &binding) {
                 Ok(()) => {
                     report.repaired += 1;
@@ -1179,7 +1187,7 @@ where
     validate_git_auth_safety(&ctx, args, &operation)?;
     let execution_policy = validate_profile_operation(&ctx, &operation)?;
     let repository_binding = matches!(ctx.resolution.source, ResolutionSource::RepositoryBinding);
-    let binding_needs_repair = repository_binding && repository_binding_needs_repair(&ctx)?;
+    let binding_needs_repair = repository_binding && repository_needs_repair(&ctx)?;
     let should_auto_bind = ctx.repository.is_some()
         && ctx.url_target.is_none()
         && ctx.config.behavior.auto_bind
@@ -1204,7 +1212,7 @@ where
     if let Some(warning) = identity_override.as_deref() {
         eprintln!("{warning}");
     }
-    if let Some(warning) = passthrough_credential_notice(&ctx, &operation) {
+    if let Some(warning) = none_credential_notice(&ctx, &operation) {
         eprintln!("{warning}");
     }
     // Keep the caller's working directory for the real Git invocation.  In
@@ -1222,11 +1230,12 @@ where
             .arg(format!("include.path={}", fragment.display()))
             .env("GHIS_PROFILE", id);
     }
-    // Keep identity fragments before caller options so an explicit
-    // `-c user.name=...` still works (and is reported by the banner). Put the
-    // credential policy after caller global options, but before Git's `--`
-    // option terminator/subcommand. Appending `-c` after `--` makes Git treat it
-    // as a command (notably for `git --version` and `ghis git -- --version`).
+    // Keep identity fragments before caller options. The fragment pins
+    // `author.*`/`committer.*`, so `-c user.name` cannot change the commit
+    // identity any more; role-specific overrides are reported by the banner.
+    // Put the credential policy after caller global options, but before Git's
+    // `--` option terminator/subcommand. Appending `-c` after `--` makes Git
+    // treat it as a command (notably for `git --version` and `ghis git -- --version`).
     command = command.args(forwarded_args[..policy_index].iter().cloned());
     if let Some(signing_key) = execution_policy.signing_key.as_deref() {
         command = command
@@ -1242,18 +1251,15 @@ where
     if let Some(profile) = ctx.profile.as_ref() {
         // Restrict the fail-closed helper to this Profile's GitHub host. Other
         // HTTPS services and cross-host submodules keep their own helper chain.
-        // A `passthrough` profile writes nothing here: its inherited chain is
-        // the one the user asked to keep, so even the empty reset value would
-        // remove what the mode is for.
-        if profile.manages_credentials() {
-            let helper = credential_helper_command(&ctx.paths);
-            let helper_key = git::credential_helper_key(&profile.host);
-            command = command
-                .arg("-c")
-                .arg(format!("{helper_key}="))
-                .arg("-c")
-                .arg(format!("{helper_key}={helper}"));
-        }
+        // The same string is used for every mode; a `none` profile's helper
+        // answers with `quit=true` rather than a token.
+        let helper = credential_helper_command(&ctx.paths);
+        let helper_key = git::credential_helper_key(&profile.host);
+        command = command
+            .arg("-c")
+            .arg(format!("{helper_key}="))
+            .arg("-c")
+            .arg(format!("{helper_key}={helper}"));
     }
     // Route other hosts that have exactly one credential-managing Profile.
     // This is runtime-only: nothing is written to the repository, and the
@@ -2874,7 +2880,7 @@ fn current_binary() -> String {
         .unwrap_or_else(|| "ghis".into())
 }
 
-fn repository_binding_needs_repair(ctx: &AppContext) -> Result<bool> {
+pub fn repository_needs_repair(ctx: &AppContext) -> Result<bool> {
     let Some(repository) = ctx.repository.as_ref() else {
         return Ok(false);
     };
@@ -2902,14 +2908,7 @@ fn repository_binding_needs_repair(ctx: &AppContext) -> Result<bool> {
         }
     }
     let key = git::credential_helper_key(&profile.host);
-    // `passthrough` must leave the key absent.  If a previous bind installed it,
-    // the repository still needs repair so the leftover helper stops shadowing
-    // whatever the user configured for that host.
-    let expected_values = if profile.manages_credentials() {
-        vec![String::new(), credential_helper_command(&ctx.paths)]
-    } else {
-        Vec::new()
-    };
+    let expected_values = vec![String::new(), credential_helper_command(&ctx.paths)];
     if repo::local_config_values(repository, &key)? != expected_values {
         return Ok(true);
     }
@@ -3507,16 +3506,16 @@ fn git_boolean_is_enabled(value: &str) -> bool {
     )
 }
 
-/// A `passthrough` profile applies the Profile's identity but leaves the
-/// transport alone.  Say so on every networked operation, so a failed push
-/// points at the mode rather than at an unexplained authentication error.
-fn passthrough_credential_notice(ctx: &AppContext, operation: &GitOperation) -> Option<String> {
+/// A `none` profile applies the Profile's identity but declines HTTPS
+/// credentials.  Say so on every networked operation, so a failed push points
+/// at the mode rather than at an unexplained authentication error.
+fn none_credential_notice(ctx: &AppContext, operation: &GitOperation) -> Option<String> {
     let profile = ctx.profile.as_ref()?;
-    if profile.manages_credentials() || !operation.contacts_network() {
+    if profile.serves_credentials() || !operation.contacts_network() {
         return None;
     }
     Some(format!(
-        "ghis: Profile `{}` 的 credential_mode 为 passthrough，ghis 未写入凭据配置；Git 使用现有凭据来源",
+        "ghis: Profile `{}` 的 credential_mode 为 none，HTTPS 凭据请求会被拒绝；请使用 SSH remote 或 command 模式",
         ctx.profile_id().unwrap_or_default()
     ))
 }
@@ -3539,13 +3538,10 @@ fn validate_git_auth_safety(
     let overrides = command_line_config_overrides(args, operation);
     for item in &overrides {
         if is_credential_helper_key(&item.key) {
-            // A `passthrough` profile installs no helper and injects no
-            // credential configuration, so there is nothing for a command-line
-            // override to bypass.  Refusing it would only stop the user from
-            // configuring credentials they explicitly took responsibility for.
-            if !profile.manages_credentials() {
-                continue;
-            }
+            // Every mode installs the fail-closed helper, so a command-line
+            // override always bypasses the selected Profile's credential
+            // policy — including `none`, which must not be replaced by a
+            // helper the profile did not authorize.
             return Err(AppError::Message(
                 "检测到命令行 credential helper 覆盖；它会绕过所选 Profile，已停止操作。确需自行管理凭据时请使用 GHIS_BYPASS=1"
                     .into(),
@@ -3763,15 +3759,24 @@ fn identity_override_warning(
     let mut config_overrides = command_line_git_config(args);
     config_overrides.extend(command_line_git_config(&operation.arguments));
     for item in config_overrides {
+        // The Profile fragment sets `author.*` and `committer.*`, which take
+        // precedence over `user.*`.  Only the role-specific keys can still
+        // change the identity of the commit that will be created.
         match item.key.as_str() {
-            "user.name" => {
+            "author.name" => {
                 author_name.clone_from(&item.value);
-                committer_name = item.value;
                 push_unique(&mut sources, item.source);
             }
-            "user.email" => {
+            "author.email" => {
                 author_email.clone_from(&item.value);
-                committer_email = item.value;
+                push_unique(&mut sources, item.source);
+            }
+            "committer.name" => {
+                committer_name.clone_from(&item.value);
+                push_unique(&mut sources, item.source);
+            }
+            "committer.email" => {
+                committer_email.clone_from(&item.value);
                 push_unique(&mut sources, item.source);
             }
             _ => {}
@@ -4200,17 +4205,17 @@ mod tests {
             assert!(hook.contains(&context.paths.config_file.to_string_lossy().to_string()));
         }
 
-        assert!(!repository_binding_needs_repair(&context).expect("complete binding"));
+        assert!(!repository_needs_repair(&context).expect("complete binding"));
         let repository = context.repository.as_ref().expect("repository");
         git::remove_credential_helper(repository, "github.com").expect("remove helper");
-        assert!(repository_binding_needs_repair(&context).expect("missing helper"));
+        assert!(repository_needs_repair(&context).expect("missing helper"));
         bind_repository(&context, "personal").expect("repair helper");
-        assert!(!repository_binding_needs_repair(&context).expect("repaired helper"));
+        assert!(!repository_needs_repair(&context).expect("repaired helper"));
         if git::supports_named_hooks() {
             git::remove_named_hooks(repository).expect("remove hooks");
-            assert!(repository_binding_needs_repair(&context).expect("missing hooks"));
+            assert!(repository_needs_repair(&context).expect("missing hooks"));
             bind_repository(&context, "personal").expect("repair hooks");
-            assert!(!repository_binding_needs_repair(&context).expect("repaired hooks"));
+            assert!(!repository_needs_repair(&context).expect("repaired hooks"));
         }
 
         let mut updated_config = context.config.clone();
@@ -4226,9 +4231,9 @@ mod tests {
             None,
         )
         .expect("updated context");
-        assert!(repository_binding_needs_repair(&updated_context).expect("stale fragment"));
+        assert!(repository_needs_repair(&updated_context).expect("stale fragment"));
         bind_repository(&updated_context, "personal").expect("repair stale fragment");
-        assert!(!repository_binding_needs_repair(&updated_context).expect("current fragment"));
+        assert!(!repository_needs_repair(&updated_context).expect("current fragment"));
         let email = Command::new("git")
             .args(["config", "--includes", "--get", "user.email"])
             .current_dir(&repository_path)
@@ -4264,7 +4269,7 @@ mod tests {
     // platform scope.
     #[cfg(unix)]
     #[test]
-    fn a_passthrough_binding_writes_no_credential_helper() {
+    fn a_none_binding_installs_the_fail_closed_helper() {
         let temp = tempdir().expect("temporary directory");
         let repository_path = temp.path().join("repository");
         assert!(
@@ -4295,27 +4300,27 @@ mod tests {
             temp.path().join("state"),
         );
         let mut config = Config::default();
-        let mut passthrough = profile();
-        passthrough.host = "git.example.test".into();
-        passthrough.login = "alice".into();
-        passthrough.credential_mode = Some(config::CredentialMode::Passthrough);
-        config.profiles.insert("gitlab".into(), passthrough);
+        let mut none = profile();
+        none.host = "git.example.test".into();
+        none.login = "alice".into();
+        none.credential_mode = Some(config::CredentialMode::None);
+        config.profiles.insert("gitlab".into(), none);
         let context = AppContext::from_config(paths, config, &repository_path, Some("gitlab"))
             .expect("context");
         bind_repository(&context, "gitlab").expect("bind");
 
         let repository = context.repository.as_ref().expect("repository");
-        // Not one value, not even the empty reset: the inherited chain is what
-        // this mode exists to keep.
+        // `none` gets exactly the same string as `manage` and `command`; the
+        // difference is inside the helper, which answers `quit=true`.
         assert_eq!(
             repo::local_config_values(repository, &git::credential_helper_key("git.example.test"))
                 .expect("read helper"),
-            Vec::<String>::new(),
-            "passthrough must leave the helper key absent"
+            vec![String::new(), credential_helper_command(&context.paths)],
+            "none must write the same empty reset and helper string"
         );
         assert!(
-            !repository_binding_needs_repair(&context).expect("complete binding"),
-            "an absent helper is the expected state for passthrough"
+            !repository_needs_repair(&context).expect("complete binding"),
+            "the shared helper string is the expected state for every mode"
         );
 
         // Identity still applies, which is the whole point of the mode.
@@ -4327,19 +4332,6 @@ mod tests {
         assert_eq!(
             String::from_utf8_lossy(&name.stdout).trim(),
             "Alice Example"
-        );
-
-        // A leftover helper from an earlier `manage` bind must still be removed.
-        let helper = credential_helper_command(&context.paths);
-        git::install_credential_helper(repository, "git.example.test", &helper)
-            .expect("simulate a previous manage bind");
-        assert!(repository_binding_needs_repair(&context).expect("stale helper"));
-        bind_repository(&context, "gitlab").expect("repair");
-        assert_eq!(
-            repo::local_config_values(repository, &git::credential_helper_key("git.example.test"))
-                .expect("read helper"),
-            Vec::<String>::new(),
-            "re-binding a passthrough profile removes the previous helper"
         );
     }
 

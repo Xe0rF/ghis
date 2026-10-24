@@ -513,11 +513,15 @@ fn doctor_redacted_json_preserves_statuses_and_fingerprints_but_hides_environmen
     assert_eq!(redacted_value["profile"], "personal");
     assert_eq!(redacted_value["repository"], "<路径已隐藏>");
     assert!(
-        redacted_value["checks"]
+        redacted_value["findings"]["findings"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|check| { check.get("code").is_some() && check.get("severity").is_some() })
+            .all(|finding| {
+                finding.get("layer").is_some()
+                    && finding.get("code").is_some()
+                    && finding.get("severity").is_some()
+            })
     );
     assert!(
         redacted_value["repairs"]
@@ -572,13 +576,15 @@ fn check_redacted_json_preserves_operation_summary_and_repairs_but_hides_config_
         default["operation_summary"]
     );
     assert!(
-        redacted_value["git_config"]["diagnostics"]
+        redacted_value["findings"]["findings"]
             .as_array()
             .unwrap()
             .iter()
-            .all(|diagnostic| diagnostic["origin"] == "<路径已隐藏>"
-                && diagnostic.get("code").is_some()
-                && diagnostic.get("severity").is_some())
+            .all(|finding| {
+                finding.get("layer").is_some()
+                    && finding.get("code").is_some()
+                    && finding.get("severity").is_some()
+            })
     );
     assert!(
         redacted_value["repairs"]
@@ -2406,6 +2412,9 @@ fn onboard_dynamic_prompt_supports_hjkl_text_and_keeps_terminal_local() {
     let repository = temp.path().join("repo");
     fs::create_dir_all(&fake_bin).expect("fake bin");
     fs::create_dir_all(&repository).expect("repository");
+    // The wizard installs the global Git baseline by default, and
+    // `git config --global` cannot create a missing HOME.
+    fs::create_dir_all(temp.path().join("home")).expect("home directory");
     write_executable(
         &fake_bin.join("gh"),
         r#"#!/bin/sh
@@ -3619,6 +3628,8 @@ git_email = "work@example.test"
             "user.name=Command Identity",
             "-c",
             "user.email=command@example.test",
+            "-c",
+            "author.email=config-author@example.test",
             "commit",
             "--author",
             "Flag Author <flag@example.test>",
@@ -3647,7 +3658,10 @@ git_email = "work@example.test"
         .stderr(predicate::str::contains(
             "提交者=Environment Committer <committer@example.test>",
         ))
-        .stderr(predicate::str::contains("git -c user.name"))
+        .stderr(predicate::str::contains("git -c author.email"))
+        // The fragment now sets `author.*`/`committer.*`, so a plain
+        // `user.*` override no longer changes the identity of the commit.
+        .stderr(predicate::str::contains("git -c user.name").not())
         .stderr(predicate::str::contains("环境变量 GIT_AUTHOR_NAME"))
         .stderr(predicate::str::contains("commit --author"))
         .stderr(predicate::str::contains("实际身份可能与配置身份不同"));
@@ -4483,22 +4497,25 @@ prirority = 5
 
     let human = run(false);
     assert!(human.status.success());
-    let stderr = String::from_utf8_lossy(&human.stderr);
-    assert!(stderr.contains("未识别的键"), "{stderr}");
-    assert!(stderr.contains("future_root"));
-    assert!(stderr.contains("behavior.futur_behaviour"));
-    assert!(stderr.contains("profiles.personal.discription"));
-    assert!(stderr.contains("rules[0].prirority"));
+    let stdout = String::from_utf8_lossy(&human.stdout);
+    assert!(stdout.contains("未识别的键"), "{stdout}");
+    assert!(stdout.contains("future_root"));
+    assert!(stdout.contains("behavior.futur_behaviour"));
+    assert!(stdout.contains("profiles.personal.discription"));
+    assert!(stdout.contains("rules[0].prirority"));
 
     let report: serde_json::Value = serde_json::from_slice(&run(true).stdout).expect("doctor JSON");
-    let warnings = report["warnings"].as_array().expect("warnings array");
+    let findings = report["findings"]["findings"]
+        .as_array()
+        .expect("findings array");
     assert!(
-        warnings.iter().any(|warning| {
-            warning
-                .as_str()
-                .is_some_and(|text| text.contains("future_root"))
+        findings.iter().any(|finding| {
+            finding["code"] == "config_unknown_key"
+                && finding["value"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("future_root"))
         }),
-        "JSON warnings must include unknown keys: {warnings:?}"
+        "JSON findings must include unknown keys: {findings:?}"
     );
 
     // A profile edit must keep the unknown keys on disk.
@@ -4724,7 +4741,7 @@ fn credential_mode_flags_round_trip_through_the_config_file() {
         "--email",
         "frez79@example.test",
         "--credential-mode",
-        "passthrough",
+        "none",
     ]);
     for (key, value) in xdg_environment(&temp) {
         add.env(key, value);
@@ -4732,13 +4749,10 @@ fn credential_mode_flags_round_trip_through_the_config_file() {
     add.assert().success();
 
     let written = fs::read_to_string(&config_file).expect("read config");
-    assert!(
-        written.contains(r#"credential_mode = "passthrough""#),
-        "{written}"
-    );
+    assert!(written.contains(r#"credential_mode = "none""#), "{written}");
     assert!(
         !written.contains("credential_command"),
-        "passthrough must not gain a command: {written}"
+        "none must not gain a command: {written}"
     );
 
     let mut edit = isolated_ghis_command();
@@ -4821,7 +4835,7 @@ host = "git.example.test"
 login = "worker"
 git_name = "Flowecho Identity"
 git_email = "35-worker@users.noreply.git.example.test"
-credential_mode = "passthrough"
+credential_mode = "none"
 "#,
     )
     .expect("ghis config");

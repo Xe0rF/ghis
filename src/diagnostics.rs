@@ -1,12 +1,13 @@
 //! Read-only diagnostics for Git configuration that can alter identity,
 //! authentication, signing, or the actual remote used by an operation.
 
-use crate::config::{Profile, SshMode};
+use crate::config::{ConfigPaths, CredentialMode, Profile, SshMode};
 use crate::git::{self, ConfigEntry, EffectiveIdentities};
 use crate::repo::Remote;
 use crate::signing;
 use serde::Serialize;
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::Path;
 
 /// Report unknown ghis configuration keys for doctor-style diagnostics.
@@ -38,21 +39,70 @@ impl Severity {
 }
 
 /// Stable machine-readable identifier for a diagnostic finding.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DiagnosticCode {
     GitIdentityConflict,
     SigningConflict,
+    SigningProgram,
     SshCommand,
+    SshExternal,
     CredentialHelper,
+    CredentialUsername,
     AuthorizationHeader,
+    HttpExtraHeader,
+    AskPass,
     UrlRewrite,
+    EnvironmentOverride,
     EffectiveIdentityMismatch,
     InvalidBinding,
+    BindingDrift,
+    Baseline,
     ShellIntegration,
+    ToolMissing,
     GhAuth,
-    GlobalGitConfig,
+    CredentialUnavailable,
+    GithubSigningKey,
+    ConfigUnknownKey,
     SshKey,
+    GitConfigRead,
+}
+
+/// Which layer a finding belongs to.  Text output groups findings by this
+/// order, from "settings ghis does not own" to "things ghis depends on".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Layer {
+    /// Settings outside ghis that can decide identity, signing or credentials.
+    Foreign,
+    /// The user-global Git baseline ghis owns.
+    Baseline,
+    /// ghis-owned fragments, bindings and hooks that drifted.
+    Ownership,
+    /// The identity this repository actually resolves to.
+    Context,
+    /// Tools and external services ghis depends on.
+    Dependency,
+}
+
+impl Layer {
+    pub const ORDER: [Layer; 5] = [
+        Self::Foreign,
+        Self::Baseline,
+        Self::Ownership,
+        Self::Context,
+        Self::Dependency,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Foreign => "外部来源",
+            Self::Baseline => "全局基线",
+            Self::Ownership => "ghis 状态",
+            Self::Context => "当前仓库",
+            Self::Dependency => "外部依赖",
+        }
+    }
 }
 
 /// Safety class for a proposed repair.
@@ -113,83 +163,111 @@ impl RepairAction {
 /// enter this public structure so JSON and text output cannot expose an
 /// Authorization header or credential helper body.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct GitConfigDiagnostic {
+pub struct Finding {
+    pub layer: Layer,
     pub code: DiagnosticCode,
     pub severity: Severity,
+    /// Where the value comes from: `scope:origin`, `env`, `ssh -G` or a tool.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub source: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub key: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub value: String,
-    pub scope: String,
-    pub origin: String,
     pub impact: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
     pub suggestion: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repair: Option<RepairAction>,
 }
 
-/// A doctor check separate from the detailed Git configuration scan.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct DiagnosticCheck {
-    pub code: DiagnosticCode,
-    pub severity: Severity,
-    pub summary: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub repair: Option<RepairAction>,
-}
-
-impl DiagnosticCheck {
+impl Finding {
     pub fn new(
+        layer: Layer,
         code: DiagnosticCode,
         severity: Severity,
-        summary: impl Into<String>,
-        repair: Option<RepairAction>,
+        impact: impl Into<String>,
     ) -> Self {
         Self {
+            layer,
             code,
             severity,
-            summary: bounded(&summary.into()),
-            repair,
+            source: String::new(),
+            key: String::new(),
+            value: String::new(),
+            impact: bounded(&impact.into()),
+            suggestion: String::new(),
+            repair: None,
         }
+    }
+
+    pub fn source(mut self, source: impl Into<String>) -> Self {
+        self.source = bounded(&source.into());
+        self
+    }
+
+    pub fn key(mut self, key: impl Into<String>) -> Self {
+        self.key = bounded(&key.into());
+        self
+    }
+
+    pub fn value(mut self, value: impl Into<String>) -> Self {
+        self.value = bounded(&value.into());
+        self
+    }
+
+    pub fn suggestion(mut self, suggestion: impl Into<String>) -> Self {
+        self.suggestion = bounded(&suggestion.into());
+        self
+    }
+
+    pub fn repair(mut self, repair: RepairAction) -> Self {
+        self.repair = Some(repair);
+        self
+    }
+
+    pub fn with_severity(mut self, severity: Severity) -> Self {
+        self.severity = severity;
+        self
     }
 }
 
 /// Structured report consumed by the JSON and text front ends.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
-pub struct GitConfigReport {
+pub struct DiagnosticReport {
     pub info: usize,
     pub warnings: usize,
     pub errors: usize,
-    pub diagnostics: Vec<GitConfigDiagnostic>,
+    pub findings: Vec<Finding>,
 }
 
-impl GitConfigReport {
-    fn from_diagnostics(diagnostics: Vec<GitConfigDiagnostic>) -> Self {
-        // Git's merged list is ordered by source and value. Keep that order:
-        // it is material for multi-valued credential helpers and URL rewrite
-        // precedence. Severity counts let the callers present a summary
-        // without rewriting the underlying configuration order.
-        let info = diagnostics
-            .iter()
-            .filter(|item| item.severity == Severity::Info)
-            .count();
-        let warnings = diagnostics
-            .iter()
-            .filter(|item| item.severity == Severity::Warning)
-            .count();
-        let errors = diagnostics
-            .iter()
-            .filter(|item| item.severity == Severity::Error)
-            .count();
+impl DiagnosticReport {
+    pub fn from_findings(mut findings: Vec<Finding>) -> Self {
+        // Keep material ordering inside a layer (Git's own config order decides
+        // multi-value helper precedence) and only group by layer.
+        findings.sort_by_key(|finding| finding.layer as u8);
+        let count = |severity| {
+            findings
+                .iter()
+                .filter(|finding| finding.severity == severity)
+                .count()
+        };
         Self {
-            info,
-            warnings,
-            errors,
-            diagnostics,
+            info: count(Severity::Info),
+            warnings: count(Severity::Warning),
+            errors: count(Severity::Error),
+            findings,
         }
+    }
+
+    pub fn extend(&mut self, findings: impl IntoIterator<Item = Finding>) {
+        self.findings.extend(findings);
+        *self = Self::from_findings(std::mem::take(&mut self.findings));
     }
 }
 
 /// Compact summary suitable for a status row or a doctor heading.
-pub fn summary_line(report: &GitConfigReport) -> String {
+pub fn summary_line(report: &DiagnosticReport) -> String {
     format!(
         "信息={} 警告={} 错误={}",
         report.info, report.warnings, report.errors
@@ -197,305 +275,287 @@ pub fn summary_line(report: &GitConfigReport) -> String {
 }
 
 /// Render one finding for text terminal output.
-pub fn render_row(item: &GitConfigDiagnostic) -> String {
-    format!(
-        "{}\t{}={}\t范围={} 来源={}\t影响={}\t建议={}",
+pub fn render_row(item: &Finding) -> String {
+    let mut rendered = format!(
+        "{}\t{}={}\t来源={}\t影响={}",
         item.severity.label(),
         item.key,
         item.value,
-        item.scope,
-        item.origin,
-        item.impact,
-        item.suggestion
-    )
+        item.source,
+        item.impact
+    );
+    if !item.suggestion.is_empty() {
+        rendered.push_str(&format!("\t建议={}", item.suggestion));
+    }
+    rendered
 }
 
 /// Inspect Git's merged configuration without changing any setting.
 pub fn scan_git_config(
     cwd: &Path,
+    paths: &ConfigPaths,
     profile: Option<&Profile>,
-    remote: Option<&Remote>,
     identities: Option<&EffectiveIdentities>,
-) -> git::Result<GitConfigReport> {
+) -> git::Result<DiagnosticReport> {
     let entries = git::config_entries(cwd)?;
-    Ok(scan_entries(&entries, profile, remote, identities))
+    Ok(scan_entries(&entries, paths, profile, identities))
 }
 
 /// Analyze entries already obtained from Git. This pure form keeps tests
 /// independent from the caller's real HOME and global Git configuration.
+///
+/// The judgment is absolute rather than profile-relative: any identity,
+/// signing or credential setting that ghis did not write is a finding, even
+/// when its value happens to match the current Profile.  A matching value is
+/// still foreign state that can decide an unbound repository or another
+/// Profile.
 pub fn scan_entries(
     entries: &[ConfigEntry],
+    paths: &ConfigPaths,
     profile: Option<&Profile>,
-    remote: Option<&Remote>,
     identities: Option<&EffectiveIdentities>,
-) -> GitConfigReport {
-    let mut diagnostics = Vec::new();
-    let effective_helpers = effective_credential_helpers(entries);
-
+) -> DiagnosticReport {
+    let visible = effective_credential_helpers(entries);
+    let owned = owned_entries(entries, paths);
+    let mut findings = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
-        if is_ghis_fragment(entry) {
+        if owned[index] {
             continue;
         }
-        let key = entry.key.as_str();
-        if matches!(key, "user.name" | "user.email") {
-            inspect_identity_entry(entry, profile, identities, &mut diagnostics);
-        } else if matches!(
-            key,
-            "user.signingkey" | "commit.gpgsign" | "gpg.format" | "gpg.ssh.program"
-        ) {
-            inspect_signing_entry(entry, profile, &mut diagnostics);
-        } else if key == "core.sshcommand" {
-            inspect_ssh_command(entry, profile, remote, &mut diagnostics);
-        } else if is_credential_helper(key) {
-            if !effective_helpers[index] {
-                continue;
-            }
-            let ghis_reset = entry.value.trim().is_empty()
-                && entries[index + 1..]
-                    .iter()
-                    .enumerate()
-                    .any(|(offset, next)| {
-                        effective_helpers[index + 1 + offset]
-                            && next.key.eq_ignore_ascii_case(key)
-                            && is_ghis_helper(&next.value)
-                    });
-            inspect_credential_helper(entry, profile, remote, ghis_reset, &mut diagnostics);
-        } else if is_extra_header(key) {
-            inspect_extra_header(entry, profile, remote, &mut diagnostics);
-        } else if is_url_rewrite(key) {
-            inspect_url_rewrite(entry, remote, &mut diagnostics);
+        if is_credential_helper(&entry.key) && !visible[index] {
+            continue;
+        }
+        let Some(category) = foreign_category(&entry.key) else {
+            continue;
+        };
+        findings.push(foreign_finding(entry, category, entries, &owned, index));
+    }
+    inspect_effective_identity(profile, identities, &mut findings);
+    DiagnosticReport::from_findings(findings)
+}
+
+/// Entry-level ownership.  A fragment or the baseline path is ghis's; so is
+/// the exact credential-helper string ghis writes and the empty value directly
+/// before it that cuts the inherited chain.  Everything else is foreign,
+/// including user entries that happen to equal a Profile value.
+fn owned_entries(entries: &[ConfigEntry], paths: &ConfigPaths) -> Vec<bool> {
+    let mut owned = entries
+        .iter()
+        .map(|entry| origin_is_ghis(entry, paths))
+        .collect::<Vec<_>>();
+    for (index, entry) in entries.iter().enumerate() {
+        if !is_credential_helper(&entry.key) {
+            continue;
+        }
+        if is_ghis_helper(&entry.value)
+            || (entry.value.trim().is_empty()
+                && entries.get(index + 1).is_some_and(|next| {
+                    next.scope == entry.scope
+                        && next.key.eq_ignore_ascii_case(&entry.key)
+                        && is_ghis_helper(&next.value)
+                }))
+        {
+            owned[index] = true;
         }
     }
-
-    inspect_effective_identity(profile, identities, &mut diagnostics);
-    GitConfigReport::from_diagnostics(diagnostics)
+    owned
 }
 
-fn inspect_identity_entry(
-    entry: &ConfigEntry,
-    profile: Option<&Profile>,
-    identities: Option<&EffectiveIdentities>,
-    diagnostics: &mut Vec<GitConfigDiagnostic>,
-) {
-    let Some(profile) = profile else {
-        return;
+fn origin_is_ghis(entry: &ConfigEntry, paths: &ConfigPaths) -> bool {
+    let Some(path) = entry.origin.strip_prefix("file:") else {
+        return false;
     };
-    // Once Git's effective author/committer identities are available, the
-    // final-value check below is authoritative. Lower-priority values are
-    // valid fallbacks and must not be reported as current-repository conflicts.
-    if identities.is_some() {
-        return;
-    }
-    let expected = if entry.key == "user.name" {
-        &profile.git_name
-    } else {
-        &profile.git_email
-    };
-    if entry.value.trim_end() == expected {
-        return;
-    }
-    diagnostics.push(finding(
-        Severity::Warning,
-        entry,
-        "这个身份值与当前 Profile 不同，可能在未绑定仓库或显式覆盖时成为提交身份",
-        "保留前先确认其适用范围；ghis 不会自动删除全局、system 或仓库配置",
-    ));
+    let path = Path::new(path);
+    path_matches(path, &crate::baseline::baseline_path(paths))
+        || path_is_under(path, &paths.fragments_dir)
 }
 
-fn inspect_signing_entry(
-    entry: &ConfigEntry,
-    profile: Option<&Profile>,
-    diagnostics: &mut Vec<GitConfigDiagnostic>,
-) {
-    let Some(profile) = profile else {
-        return;
-    };
-    let value = entry.value.trim();
-    let conflicts = match entry.key.as_str() {
-        "commit.gpgsign" => {
-            parse_git_bool(value).is_some_and(|enabled| enabled != profile.signing.enabled)
+#[cfg(windows)]
+fn path_matches(path: &Path, target: &Path) -> bool {
+    path.to_string_lossy()
+        .eq_ignore_ascii_case(&target.to_string_lossy())
+}
+
+#[cfg(not(windows))]
+fn path_matches(path: &Path, target: &Path) -> bool {
+    path == target
+}
+
+#[cfg(windows)]
+fn path_is_under(path: &Path, directory: &Path) -> bool {
+    let path = path.to_string_lossy().to_ascii_lowercase();
+    let directory = directory.to_string_lossy().to_ascii_lowercase();
+    path == directory
+        || path.starts_with(&format!("{}{}", directory, std::path::MAIN_SEPARATOR))
+        || path.starts_with(&format!("{directory}/"))
+        || path.starts_with(&format!("{directory}\\"))
+}
+
+#[cfg(not(windows))]
+fn path_is_under(path: &Path, directory: &Path) -> bool {
+    path.starts_with(directory)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForeignCategory {
+    Identity,
+    Signing,
+    SshCommand,
+    CredentialHelper,
+    CredentialUsername,
+    ExtraHeader,
+    AskPass,
+    UrlRewrite,
+}
+
+/// The identity-plane keys ghis owns.  `gpg.ssh.allowedSignersFile` is
+/// deliberately absent: it verifies signatures and does not choose an identity.
+fn foreign_category(key: &str) -> Option<ForeignCategory> {
+    let key = key.to_ascii_lowercase();
+    match key.as_str() {
+        "user.name" | "user.email" | "user.useconfigonly" | "author.name" | "author.email"
+        | "committer.name" | "committer.email" => Some(ForeignCategory::Identity),
+        "user.signingkey"
+        | "commit.gpgsign"
+        | "tag.gpgsign"
+        | "push.gpgsign"
+        | "gpg.format"
+        | "gpg.program"
+        | "gpg.ssh.defaultkeycommand" => Some(ForeignCategory::Signing),
+        "core.sshcommand" => Some(ForeignCategory::SshCommand),
+        "core.askpass" => Some(ForeignCategory::AskPass),
+        _ if key.starts_with("gpg.") && key.ends_with(".program") => Some(ForeignCategory::Signing),
+        _ if is_credential_helper(&key) => Some(ForeignCategory::CredentialHelper),
+        _ if key.starts_with("credential.")
+            && (key == "credential.username" || key.ends_with(".username")) =>
+        {
+            Some(ForeignCategory::CredentialUsername)
         }
-        "gpg.format" => profile.signing.enabled && !value.eq_ignore_ascii_case("ssh"),
-        "gpg.ssh.program" => {
-            profile.signing.enabled
-                && expected_signing_program(profile)
-                    .is_some_and(|expected| !same_config_value(value, &expected))
-        }
-        "user.signingkey" => {
-            profile.signing.enabled
-                && profile_signing_key(profile)
-                    .as_deref()
-                    .is_some_and(|expected| !same_signing_key(value, expected))
-        }
-        _ => false,
-    };
-    if !conflicts {
-        return;
-    }
-    diagnostics.push(finding(
-        Severity::Warning,
-        entry,
-        "这个签名设置可能覆盖当前 Profile 的 SSH signing 配置或强制启用另一种签名方式",
-        "把账号相关签名设置放进 Profile；ghis 只报告，不会改写现有全局配置",
-    ));
-}
-
-/// The generated fragment uses an explicit signing key when supplied, and
-/// otherwise reuses the managed SSH public-key path. Keep that same fallback
-/// here so a matching global value is not reported as a conflict merely
-/// because the profile chose the authentication key for signing as well.
-fn profile_signing_key(profile: &Profile) -> Option<String> {
-    profile.signing.signing_key.clone().or_else(|| {
-        profile
-            .ssh
-            .as_ref()
-            .and_then(|ssh| ssh.public_key.as_ref())
-            .map(|path| path.to_string_lossy().into_owned())
-    })
-}
-
-fn same_config_value(actual: &str, expected: &str) -> bool {
-    actual.trim() == expected.trim()
-}
-
-fn expected_signing_program(profile: &Profile) -> Option<String> {
-    profile
-        .signing
-        .program
-        .as_ref()
-        .map(|path| path.to_string_lossy().into_owned())
-        .or_else(|| {
-            signing::discover_signing_program(None)
-                .map(|program| program.path.to_string_lossy().into_owned())
-        })
-}
-
-fn same_signing_key(actual: &str, expected: &str) -> bool {
-    let actual = actual.trim();
-    let expected = expected.trim();
-    let actual_material = actual
-        .strip_prefix("key::")
-        .and_then(signing::public_key_material);
-    let expected_material = expected
-        .strip_prefix("key::")
-        .and_then(signing::public_key_material);
-    match (actual_material, expected_material) {
-        (Some(actual), Some(expected)) => actual == expected,
-        _ => same_config_value(actual, expected),
+        _ if is_extra_header(&key) => Some(ForeignCategory::ExtraHeader),
+        _ if is_url_rewrite(&key) => Some(ForeignCategory::UrlRewrite),
+        _ => None,
     }
 }
 
-fn inspect_ssh_command(
+fn foreign_finding(
     entry: &ConfigEntry,
-    profile: Option<&Profile>,
-    remote: Option<&Remote>,
-    diagnostics: &mut Vec<GitConfigDiagnostic>,
-) {
-    let managed = profile
-        .and_then(|profile| profile.ssh.as_ref())
-        .is_some_and(|ssh| matches!(ssh.mode, SshMode::OnePassword | SshMode::Managed));
-    let ssh_remote = remote.is_some_and(|remote| remote.transport.may_use_ssh());
-    diagnostics.push(finding(
-        if managed || ssh_remote {
-            Severity::Warning
-        } else {
-            Severity::Info
-        },
-        entry,
-        "core.sshCommand 会改变 SSH push 使用的程序、Agent 或 key",
-        "确认它不会固定到其他账号；使用纳管 SSH 时应由 Profile fragment 提供连接设置",
-    ));
-}
-
-fn inspect_credential_helper(
-    entry: &ConfigEntry,
-    profile: Option<&Profile>,
-    remote: Option<&Remote>,
-    ghis_reset: bool,
-    diagnostics: &mut Vec<GitConfigDiagnostic>,
-) {
-    let managed = is_ghis_helper(&entry.value);
-    let applies = entry_applies_to_host(entry, profile, remote);
-    // A `passthrough` profile installs nothing, so whatever helper is here came
-    // from the user.  Reporting it as an unmarked entry keeps doctor honest
-    // about who wrote it.
-    let passthrough = profile.is_some_and(|profile| !profile.manages_credentials());
-    diagnostics.push(finding(
-        if managed || ghis_reset {
-            Severity::Info
-        } else if applies && !passthrough {
-            Severity::Warning
-        } else {
-            Severity::Info
-        },
-        entry,
-        if managed {
-            "这是 ghis 安装的专用 credential helper；它会按当前 Profile 选择凭据"
-        } else if ghis_reset {
-            "这是 ghis helper 前的空值重置；它会清除继承的 helper，避免账号串用"
-        } else if passthrough {
-            "当前 Profile 的 credential_mode 为 passthrough，ghis 未写入凭据配置；该 helper 由用户维护"
-        } else {
-            "credential helper 参与凭据查找；错误的链顺序可能让 Git 尝试另一个账号"
-        },
-        if managed || ghis_reset {
-            "确认它前面的空值重置和 helper 链顺序没有被其他配置覆盖"
-        } else if passthrough {
-            "passthrough 模式保留继承链；请自行确认该 helper 指向预期的账号"
-        } else {
-            "检查 helper 的作用域和顺序；绑定仓库会为 Profile 主机安装专用 helper"
-        },
-    ));
-}
-
-fn inspect_extra_header(
-    entry: &ConfigEntry,
-    profile: Option<&Profile>,
-    remote: Option<&Remote>,
-    diagnostics: &mut Vec<GitConfigDiagnostic>,
-) {
+    category: ForeignCategory,
+    entries: &[ConfigEntry],
+    owned: &[bool],
+    index: usize,
+) -> Finding {
     let authorization = is_authorization_header(&entry.value);
-    let applies = entry_applies_to_host(entry, profile, remote);
-    diagnostics.push(finding(
-        if authorization && applies {
-            Severity::Error
-        } else if authorization {
-            Severity::Warning
-        } else {
-            Severity::Info
-        },
-        entry,
-        if authorization {
-            "Authorization extraHeader 会绕过 credential helper，可能直接使用另一个账号的凭据"
-        } else {
-            "HTTP extraHeader 会改变 Git 与远端的请求"
-        },
-        "核对并手动移除不需要的 extraHeader；为防止泄露，ghis 不显示其值也不会自动清理",
-    ));
+    let (code, severity, impact, suggestion) = match category {
+        ForeignCategory::Identity => (
+            DiagnosticCode::GitIdentityConflict,
+            Severity::Error,
+            "全局、system 或仓库配置提供的身份会与 Profile 竞争；author/committer 键优先于 user 键",
+            "删除这些条目，让身份只来自 Profile fragment",
+        ),
+        ForeignCategory::Signing => (
+            DiagnosticCode::SigningConflict,
+            Severity::Error,
+            "签名设置可能覆盖当前 Profile 的 SSH signing 配置或强制启用另一种签名方式",
+            "把账号相关签名设置放进 Profile；ghis 不会自动删除现有配置",
+        ),
+        ForeignCategory::SshCommand => (
+            DiagnosticCode::SshCommand,
+            Severity::Error,
+            "core.sshCommand 会改变 SSH push 使用的程序、Agent 或 key",
+            "把 SSH 连接设置放进 Profile 的 ssh.mode = managed/1password",
+        ),
+        ForeignCategory::CredentialHelper => (
+            DiagnosticCode::CredentialHelper,
+            Severity::Error,
+            "credential helper 参与凭据查找；错误的链顺序可能让 Git 尝试另一个账号",
+            "删除该 helper，让绑定仓库只使用 ghis 的 credential helper",
+        ),
+        ForeignCategory::CredentialUsername => (
+            DiagnosticCode::CredentialUsername,
+            Severity::Error,
+            "credential username 会固定 HTTPS 基本认证的用户名，覆盖 Profile 的账号",
+            "删除该 username 设置，让 ghis 按 Profile 提供用户名",
+        ),
+        ForeignCategory::AskPass => (
+            DiagnosticCode::AskPass,
+            Severity::Error,
+            "core.askPass 让 Git 从另一个程序取密码，可能绕过 credential helper 和 Profile 凭据策略",
+            "删除该设置；需要自定义取件时改用 Profile 的 credential_mode = command",
+        ),
+        ForeignCategory::ExtraHeader if authorization => (
+            DiagnosticCode::AuthorizationHeader,
+            Severity::Error,
+            "Authorization extraHeader 会绕过 credential helper，可能直接使用另一个账号的凭据",
+            "核对并手动移除不需要的 extraHeader；为防止泄露，ghis 不显示其值也不会自动清理",
+        ),
+        ForeignCategory::ExtraHeader => (
+            DiagnosticCode::HttpExtraHeader,
+            Severity::Warning,
+            "HTTP extraHeader 会改变 Git 与远端的请求",
+            "核对并手动移除不需要的 extraHeader",
+        ),
+        ForeignCategory::UrlRewrite => (
+            DiagnosticCode::UrlRewrite,
+            Severity::Warning,
+            "URL rewrite 可能把显示的 remote 改写到另一个协议、主机或仓库",
+            "确认改写后的目标仍属于当前 Profile；ghis 不会修改 remote 或 URL rewrite",
+        ),
+    };
+    let mut suggestion = suggestion.to_owned();
+    if entry.scope == "system" {
+        suggestion.push_str("（system 配置需要管理员权限）");
+    }
+    Finding::new(Layer::Foreign, code, severity, impact)
+        .source(format!("{}:{}", entry.scope, entry.origin))
+        .key(redact_key(&entry.key))
+        .value(display_value(entry))
+        .suggestion(suggestion)
+        .repair(foreign_repair(entry, entries, owned, index))
 }
 
-fn inspect_url_rewrite(
+/// Suggested repair is read-only and manual: ghis never deletes a setting the
+/// user wrote.  Choose `--edit` when the same file also holds a ghis-owned
+/// value under the key, and when the key itself cannot be shown safely.
+fn foreign_repair(
     entry: &ConfigEntry,
-    remote: Option<&Remote>,
-    diagnostics: &mut Vec<GitConfigDiagnostic>,
-) {
-    let applies = remote.is_some_and(|remote| remote.url.starts_with(entry.value.trim()));
-    diagnostics.push(finding(
-        if applies {
-            Severity::Warning
-        } else {
-            Severity::Info
-        },
-        entry,
-        "URL rewrite 可能把显示的 remote 改写到另一个协议、主机或仓库",
-        "确认改写后的目标仍属于当前 Profile；ghis 不会修改 remote 或 URL rewrite",
-    ));
+    entries: &[ConfigEntry],
+    owned: &[bool],
+    index: usize,
+) -> RepairAction {
+    let key = redact_key(&entry.key);
+    let hidden_key = key != entry.key;
+    let shared_origin = entries.iter().enumerate().any(|(other, candidate)| {
+        other != index
+            && owned[other]
+            && candidate.origin == entry.origin
+            && candidate.key.eq_ignore_ascii_case(&entry.key)
+    });
+    if let Some(file) = entry.origin.strip_prefix("file:")
+        && !hidden_key
+        && !shared_origin
+    {
+        return RepairAction::manual(format!(
+            "git config --file {} --unset-all {}",
+            shell_quote_argument(file),
+            shell_quote_argument(&key)
+        ));
+    }
+    if let Some(file) = entry.origin.strip_prefix("file:") {
+        return RepairAction::manual(format!(
+            "git config --file {} --edit",
+            shell_quote_argument(file)
+        ));
+    }
+    RepairAction::manual(format!(
+        "git config --show-origin --show-scope --get-all {}",
+        shell_quote_argument(&key)
+    ))
 }
 
 fn inspect_effective_identity(
     profile: Option<&Profile>,
     identities: Option<&EffectiveIdentities>,
-    diagnostics: &mut Vec<GitConfigDiagnostic>,
+    findings: &mut Vec<Finding>,
 ) {
     let (Some(profile), Some(identities)) = (profile, identities) else {
         return;
@@ -507,79 +567,270 @@ fn inspect_effective_identity(
         if identity.name == profile.git_name && identity.email == profile.git_email {
             continue;
         }
-        diagnostics.push(GitConfigDiagnostic {
-            code: DiagnosticCode::EffectiveIdentityMismatch,
-            severity: Severity::Error,
-            key: format!("effective.{role}"),
-            value: bounded(&format!("{} <{}>", identity.name, identity.email)),
-            scope: "effective".into(),
-            origin: "git var".into(),
-            impact: bounded(&format!(
-                "Git 最终使用的 {role} 与当前 Profile 的 {} <{}> 不一致",
-                profile.git_name, profile.git_email
-            )),
-            suggestion: "在 commit 前检查环境变量、-c 参数以及 local/worktree 配置".into(),
-            repair: Some(RepairAction::manual(
+        findings.push(
+            Finding::new(
+                Layer::Context,
+                DiagnosticCode::EffectiveIdentityMismatch,
+                Severity::Error,
+                format!(
+                    "Git 最终使用的 {role} 与当前 Profile 的 {} <{}> 不一致",
+                    profile.git_name, profile.git_email
+                ),
+            )
+            .source("git var")
+            .key(format!("effective.{role}"))
+            .value(format!("{} <{}>", identity.name, identity.email))
+            .suggestion("在 commit 前检查环境变量、-c 参数以及 local/worktree 配置")
+            .repair(RepairAction::manual(
                 "git var GIT_AUTHOR_IDENT && git var GIT_COMMITTER_IDENT",
             )),
-        });
+        );
     }
-}
-
-fn finding(
-    severity: Severity,
-    entry: &ConfigEntry,
-    impact: impl Into<String>,
-    suggestion: impl Into<String>,
-) -> GitConfigDiagnostic {
-    let (code, repair) = classify_git_config_repair(entry);
-    GitConfigDiagnostic {
-        code,
-        severity,
-        key: redact_key(&entry.key),
-        value: display_value(entry),
-        scope: bounded(&entry.scope),
-        origin: bounded(&entry.origin),
-        impact: bounded(&impact.into()),
-        suggestion: bounded(&suggestion.into()),
-        repair,
-    }
-}
-
-fn classify_git_config_repair(entry: &ConfigEntry) -> (DiagnosticCode, Option<RepairAction>) {
-    let key = entry.key.as_str();
-    let code = if matches!(key, "user.name" | "user.email") {
-        DiagnosticCode::GitIdentityConflict
-    } else if matches!(
-        key,
-        "user.signingkey" | "commit.gpgsign" | "gpg.format" | "gpg.ssh.program"
-    ) {
-        DiagnosticCode::SigningConflict
-    } else if key == "core.sshcommand" {
-        DiagnosticCode::SshCommand
-    } else if is_credential_helper(key) {
-        DiagnosticCode::CredentialHelper
-    } else if is_extra_header(key) {
-        DiagnosticCode::AuthorizationHeader
-    } else {
-        DiagnosticCode::UrlRewrite
-    };
-    // Existing Git settings, especially system/global values and credentials,
-    // are never removed automatically. The command is deliberately read-only.
-    let repair = RepairAction::manual(format!(
-        "git config --show-origin --show-scope --get-all {}",
-        shell_quote_argument(&redact_key(key))
-    ));
-    (code, Some(repair))
 }
 
 fn shell_quote_argument(value: &str) -> String {
     format!("'{value}'")
 }
 
-fn is_ghis_fragment(entry: &ConfigEntry) -> bool {
-    let origin = entry.origin.replace('\\', "/").to_ascii_lowercase();
-    origin.contains("/ghis/fragments/") || origin.contains("/ghis/fragments/config-")
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvironmentCategory {
+    Identity,
+    Token,
+    Transport,
+    ConfigSelection,
+}
+
+fn environment_category(name: &str) -> Option<EnvironmentCategory> {
+    match name {
+        "GIT_AUTHOR_NAME" | "GIT_AUTHOR_EMAIL" | "GIT_COMMITTER_NAME" | "GIT_COMMITTER_EMAIL" => {
+            Some(EnvironmentCategory::Identity)
+        }
+        "GH_TOKEN"
+        | "GITHUB_TOKEN"
+        | "GH_ENTERPRISE_TOKEN"
+        | "GITHUB_ENTERPRISE_TOKEN"
+        | "GH_HOST"
+        | "GH_CONFIG_DIR" => Some(EnvironmentCategory::Token),
+        "GIT_SSH_COMMAND" | "GIT_SSH" | "GIT_ASKPASS" | "SSH_ASKPASS" => {
+            Some(EnvironmentCategory::Transport)
+        }
+        "GIT_CONFIG_GLOBAL" | "GIT_CONFIG_SYSTEM" | "GIT_CONFIG_NOSYSTEM" | "GIT_CONFIG_COUNT" => {
+            Some(EnvironmentCategory::ConfigSelection)
+        }
+        _ => None,
+    }
+}
+
+/// Names of environment variables that can decide identity, credentials or
+/// transport.  Values are never read: reporting the name is enough to explain
+/// why a command used another account, and a token must not enter a report.
+pub fn scan_process_environment() -> Vec<Finding> {
+    scan_environment(std::env::vars_os().map(|(name, _)| name.to_string_lossy().into_owned()))
+}
+
+pub fn scan_environment<I>(names: I) -> Vec<Finding>
+where
+    I: IntoIterator<Item = String>,
+{
+    let names = names
+        .into_iter()
+        .filter(|name| environment_category(name).is_some())
+        .collect::<std::collections::BTreeSet<_>>();
+    names
+        .into_iter()
+        .map(|name| {
+            let (severity, impact, suggestion) =
+                match environment_category(&name).expect("filtered to known categories") {
+                    EnvironmentCategory::Identity => (
+                        Severity::Error,
+                        "环境变量身份优先于所有 Git 配置，会改变实际提交身份",
+                        "在当前 Shell 中取消该变量；ghis 不修改环境变量",
+                    ),
+                    EnvironmentCategory::Token => (
+                        Severity::Warning,
+                        "该变量会让 ghis 调用 gh 时使用另一凭据或实例",
+                        "在当前 Shell 中取消该变量；ghis 不读取或修改它",
+                    ),
+                    EnvironmentCategory::Transport => (
+                        Severity::Warning,
+                        "该变量会替换 SSH 或凭据提示程序，可能绕过 Profile 的传输策略",
+                        "在当前 Shell 中取消该变量",
+                    ),
+                    EnvironmentCategory::ConfigSelection => (
+                        Severity::Info,
+                        "该变量改变 Git 读取的全局或 system 配置文件",
+                        "确认目标文件仍是预期来源；ghis 不修改环境变量",
+                    ),
+                };
+            Finding::new(
+                Layer::Foreign,
+                DiagnosticCode::EnvironmentOverride,
+                severity,
+                impact,
+            )
+            .source("env")
+            .key(name)
+            .value("<已设置>")
+            .suggestion(suggestion)
+        })
+        .collect()
+}
+
+/// Whether an externally managed SSH configuration can decide this identity.
+///
+/// Only external SSH with no ghis-managed key is relevant: a managed profile
+/// runs `ssh -F <generated config>`, so the user's `~/.ssh/config` cannot pick
+/// another key for it.  `none` profiles matter even over HTTPS because SSH is
+/// the transport that replaces the refused credential.
+pub fn scan_ssh(profile: Option<&Profile>, remote: Option<&Remote>) -> Vec<Finding> {
+    let Some(profile) = profile else {
+        return Vec::new();
+    };
+    let external = profile
+        .ssh
+        .as_ref()
+        .is_none_or(|ssh| ssh.mode == SshMode::External);
+    if !external {
+        return Vec::new();
+    }
+    let relevant = profile.credential_mode() == CredentialMode::None
+        || remote.is_some_and(|remote| remote.transport.is_ssh());
+    if !relevant {
+        return Vec::new();
+    }
+    let host = profile.host.split(':').next().unwrap_or(&profile.host);
+    if host.is_empty() {
+        return Vec::new();
+    }
+    let Some(configured) = ssh_settings(host, None) else {
+        return Vec::new();
+    };
+    let Some(defaults) = ssh_settings(host, Some(empty_ssh_config())) else {
+        return Vec::new();
+    };
+    let differences = ssh_differences(&configured, &defaults);
+    // Report which settings differ, never their values: an IdentityFile or
+    // ProxyCommand can contain paths and commands the user did not ask to share.
+    let value = if differences.is_empty() {
+        "<未检测到差异>".to_owned()
+    } else {
+        format!("差异：{}", differences.join("、"))
+    };
+    vec![
+        Finding::new(
+            Layer::Foreign,
+            DiagnosticCode::SshExternal,
+            Severity::Warning,
+            "系统 SSH 配置会决定 SSH remote 使用的 key 与 Agent，ghis 无法保证它与 Profile 一致",
+        )
+        .source(format!("ssh -G {host}"))
+        .key("ssh")
+        .value(value)
+        .suggestion("需要 ghis 接管时，在 Profile 中设置 ssh.mode = managed 或 1password"),
+    ]
+}
+
+/// Settings that can select a key, agent or route.  Only the key names leave
+/// this function; the values are compared, never rendered.
+fn ssh_differences(
+    configured: &BTreeMap<String, Vec<String>>,
+    defaults: &BTreeMap<String, Vec<String>>,
+) -> Vec<&'static str> {
+    const COMPARED: [&str; 9] = [
+        "user",
+        "hostname",
+        "port",
+        "identityfile",
+        "identityagent",
+        "identitiesonly",
+        "proxycommand",
+        "proxyjump",
+        "certificatefile",
+    ];
+    COMPARED
+        .iter()
+        .filter(|key| configured.get(**key) != defaults.get(**key))
+        .copied()
+        .collect()
+}
+
+fn ssh_settings(host: &str, config: Option<&str>) -> Option<BTreeMap<String, Vec<String>>> {
+    let mut command = std::process::Command::new("ssh");
+    if let Some(config) = config {
+        command.arg("-F").arg(config);
+    }
+    let output = command.arg("-G").arg(host).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let mut settings: BTreeMap<String, Vec<String>> = BTreeMap::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let line = line.trim_end();
+        let Some((key, value)) = line.split_once(' ') else {
+            continue;
+        };
+        settings
+            .entry(key.to_ascii_lowercase())
+            .or_default()
+            .push(value.trim().to_owned());
+    }
+    Some(settings)
+}
+
+#[cfg(windows)]
+fn empty_ssh_config() -> &'static str {
+    "NUL"
+}
+
+#[cfg(not(windows))]
+fn empty_ssh_config() -> &'static str {
+    "/dev/null"
+}
+
+/// The global baseline is ghis-owned state; a missing or stale file is a
+/// finding even when no repository is open.
+pub fn baseline_findings(paths: &ConfigPaths) -> Vec<Finding> {
+    let status = match crate::baseline::status(paths) {
+        Ok(status) => status,
+        Err(error) => {
+            return vec![
+                Finding::new(
+                    Layer::Baseline,
+                    DiagnosticCode::Baseline,
+                    Severity::Warning,
+                    format!("无法读取全局 Git 基线：{error}"),
+                )
+                .source("git config --global include.path"),
+            ];
+        }
+    };
+    if status.up_to_date() {
+        return Vec::new();
+    }
+    let (value, impact) = if !status.installed() {
+        (
+            "<未设置>",
+            "未安装全局 Git 基线；未绑定 Profile 的仓库可能用自动推断的身份提交",
+        )
+    } else {
+        (
+            "<需更新>",
+            "全局 Git 基线文件已过期，或同一路径被 include 多次",
+        )
+    };
+    vec![
+        Finding::new(
+            Layer::Baseline,
+            DiagnosticCode::Baseline,
+            Severity::Warning,
+            impact,
+        )
+        .source("git config --global include.path")
+        .key("include.path")
+        .value(value)
+        .suggestion("运行 `ghis gitconfig setup`；它只写入 ghis 自己的 include 条目")
+        .repair(RepairAction::confirmation("ghis gitconfig setup")),
+    ]
 }
 
 /// Return only helper entries that can participate in the final helper chain.
@@ -668,39 +919,6 @@ fn is_url_rewrite(key: &str) -> bool {
     key.starts_with("url.") && (key.ends_with(".insteadof") || key.ends_with(".pushinsteadof"))
 }
 
-fn entry_applies_to_host(
-    entry: &ConfigEntry,
-    profile: Option<&Profile>,
-    remote: Option<&Remote>,
-) -> bool {
-    let key = entry.key.to_ascii_lowercase();
-    if matches!(key.as_str(), "credential.helper" | "http.extraheader") {
-        return true;
-    }
-    let scoped_host = if is_credential_helper(&key) {
-        key.strip_prefix("credential.")
-            .and_then(|value| value.strip_suffix(".helper"))
-            .and_then(|selector| crate::repo::parse_remote("config", selector).host)
-    } else if is_extra_header(&key) {
-        key.strip_prefix("http.")
-            .and_then(|value| value.strip_suffix(".extraheader"))
-            .and_then(|selector| crate::repo::parse_remote("config", selector).host)
-    } else {
-        None
-    };
-    let profile_host = profile.map(|profile| crate::git::normalize_host(&profile.host));
-    let remote_host = remote
-        .and_then(|remote| remote.host.as_deref())
-        .map(crate::git::normalize_host);
-    scoped_host.is_some_and(|host| {
-        let host = crate::git::normalize_host(&host);
-        profile_host
-            .iter()
-            .chain(remote_host.iter())
-            .any(|candidate| *candidate == host)
-    })
-}
-
 fn is_authorization_header(value: &str) -> bool {
     value.lines().any(|line| {
         line.split_once(':').is_some_and(|(name, _)| {
@@ -710,14 +928,6 @@ fn is_authorization_header(value: &str) -> bool {
             )
         })
     })
-}
-
-fn parse_git_bool(value: &str) -> Option<bool> {
-    match value.to_ascii_lowercase().as_str() {
-        "true" | "yes" | "on" | "1" => Some(true),
-        "false" | "no" | "off" | "0" | "" => Some(false),
-        _ => None,
-    }
 }
 
 fn display_value(entry: &ConfigEntry) -> String {
@@ -1058,7 +1268,9 @@ pub fn sanitize_display_text(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::ConfigPaths;
     use crate::git::GitIdentity;
+    use tempfile::TempDir;
 
     fn entry(scope: &str, origin: &str, key: &str, value: &str) -> ConfigEntry {
         ConfigEntry {
@@ -1066,6 +1278,19 @@ mod tests {
             origin: origin.into(),
             key: key.into(),
             value: value.into(),
+        }
+    }
+
+    fn paths(temp: &TempDir) -> ConfigPaths {
+        let config_dir = temp.path().join("config/ghis");
+        ConfigPaths {
+            config_file: config_dir.join("config.toml"),
+            cache_dir: temp.path().join("cache/ghis"),
+            state_dir: temp.path().join("state/ghis"),
+            fragments_dir: config_dir.join("fragments"),
+            log_file: temp.path().join("state/ghis/log"),
+            repositories_file: temp.path().join("state/ghis/repositories.json"),
+            config_dir,
         }
     }
 
@@ -1079,59 +1304,126 @@ mod tests {
         }
     }
 
-    #[test]
-    fn reports_effective_identity_mismatch_as_error() {
-        let identities = EffectiveIdentities {
+    fn identities(name: &str, email: &str) -> EffectiveIdentities {
+        EffectiveIdentities {
             author: GitIdentity {
-                name: "Other".into(),
-                email: "other@example.test".into(),
+                name: name.into(),
+                email: email.into(),
                 raw: String::new(),
             },
             committer: GitIdentity {
-                name: "Alice".into(),
-                email: "alice@users.noreply.github.com".into(),
+                name: name.into(),
+                email: email.into(),
                 raw: String::new(),
             },
-        };
-        let report = scan_entries(&[], Some(&profile()), None, Some(&identities));
-        assert_eq!(report.errors, 1);
-        assert_eq!(report.diagnostics[0].key, "effective.author");
+        }
     }
 
     #[test]
-    fn ignores_overridden_identity_entries_when_effective_identity_matches() {
+    fn reports_effective_identity_mismatch_as_error() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let report = scan_entries(
+            &[],
+            &paths(&temp),
+            Some(&profile()),
+            Some(&identities("Other", "other@example.test")),
+        );
+        assert_eq!(report.errors, 2);
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|item| item.layer == Layer::Context)
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|item| item.key == "effective.author")
+        );
+    }
+
+    #[test]
+    fn a_global_identity_that_matches_the_profile_is_still_foreign() {
+        let temp = tempfile::tempdir().expect("temporary directory");
         let configured = profile();
-        let identities = EffectiveIdentities {
-            author: GitIdentity {
-                name: configured.git_name.clone(),
-                email: configured.git_email.clone(),
-                raw: String::new(),
-            },
-            committer: GitIdentity {
-                name: configured.git_name.clone(),
-                email: configured.git_email.clone(),
-                raw: String::new(),
-            },
-        };
         let report = scan_entries(
             &[
-                entry("global", "file:/home/test/.gitconfig", "user.name", "Other"),
+                entry(
+                    "global",
+                    "file:/home/test/.gitconfig",
+                    "user.name",
+                    &configured.git_name,
+                ),
                 entry(
                     "global",
                     "file:/home/test/.gitconfig",
                     "user.email",
-                    "other@example.test",
+                    &configured.git_email,
                 ),
             ],
+            &paths(&temp),
             Some(&configured),
             None,
-            Some(&identities),
         );
-        assert_eq!(report, GitConfigReport::default());
+        assert_eq!(report.errors, 2);
+        assert!(report.findings.iter().all(|item| {
+            item.layer == Layer::Foreign
+                && item.code == DiagnosticCode::GitIdentityConflict
+                && item.source == "global:file:/home/test/.gitconfig"
+        }));
+    }
+
+    #[test]
+    fn reports_role_specific_identity_keys() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let report = scan_entries(
+            &[entry(
+                "global",
+                "file:/home/test/.gitconfig",
+                "author.email",
+                "other@example.test",
+            )],
+            &paths(&temp),
+            Some(&profile()),
+            None,
+        );
+        assert_eq!(report.errors, 1);
+        assert_eq!(report.findings[0].key, "author.email");
+        assert_eq!(report.findings[0].value, "other@example.test");
+    }
+
+    #[test]
+    fn ignores_ghis_fragments_and_the_generated_baseline() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let paths = paths(&temp);
+        let fragment = paths.fragments_dir.join("work.gitconfig");
+        let baseline = crate::baseline::baseline_path(&paths);
+        let report = scan_entries(
+            &[
+                entry(
+                    "worktree",
+                    &format!("file:{}", fragment.display()),
+                    "user.name",
+                    "Other",
+                ),
+                entry(
+                    "global",
+                    &format!("file:{}", baseline.display()),
+                    "user.useconfigonly",
+                    "true",
+                ),
+            ],
+            &paths,
+            Some(&profile()),
+            None,
+        );
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
     }
 
     #[test]
     fn redacts_authorization_and_shell_helper_values() {
+        let temp = tempfile::tempdir().expect("temporary directory");
         let report = scan_entries(
             &[
                 entry(
@@ -1147,11 +1439,11 @@ mod tests {
                     "!printf password=top-secret",
                 ),
             ],
+            &paths(&temp),
             Some(&profile()),
             None,
-            None,
         );
-        assert_eq!(report.errors, 1);
+        assert_eq!(report.errors, 2);
         let json = serde_json::to_string(&report).unwrap();
         assert!(!json.contains("top-secret"));
         assert!(json.contains("<已隐藏>"));
@@ -1159,6 +1451,7 @@ mod tests {
 
     #[test]
     fn redacts_userinfo_from_non_shell_credential_helpers() {
+        let temp = tempfile::tempdir().expect("temporary directory");
         let report = scan_entries(
             &[entry(
                 "global",
@@ -1166,17 +1459,18 @@ mod tests {
                 "credential.helper",
                 "https://user:secret@example.test/helper --flag",
             )],
+            &paths(&temp),
             Some(&profile()),
             None,
-            None,
         );
-        let value = &report.diagnostics[0].value;
+        let value = &report.findings[0].value;
         assert!(!value.contains("secret"));
         assert!(value.contains("<已隐藏>@example.test"));
     }
 
     #[test]
     fn keeps_scope_origin_and_multivalue_helper_order() {
+        let temp = tempfile::tempdir().expect("temporary directory");
         let report = scan_entries(
             &[
                 entry(
@@ -1198,21 +1492,20 @@ mod tests {
                     "store",
                 ),
             ],
+            &paths(&temp),
             Some(&profile()),
             None,
-            None,
         );
-        assert_eq!(report.warnings, 2);
-        assert!(report.diagnostics.iter().all(|item| item.scope != "system"));
+        assert_eq!(report.errors, 2);
         assert!(
             report
-                .diagnostics
+                .findings
                 .iter()
-                .any(|item| item.value.contains("重置 helper 链"))
+                .all(|item| item.source == "global:file:/home/test/.gitconfig")
         );
         assert_eq!(
             report
-                .diagnostics
+                .findings
                 .iter()
                 .map(|item| item.value.as_str())
                 .collect::<Vec<_>>(),
@@ -1221,7 +1514,9 @@ mod tests {
     }
 
     #[test]
-    fn hides_shadowed_and_wrapper_duplicate_credential_helpers() {
+    fn a_later_reset_shadows_earlier_foreign_helpers() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let helper = "!'/usr/bin/ghis' --config '/tmp/ghis.toml' credential-helper";
         let report = scan_entries(
             &[
                 entry(
@@ -1246,7 +1541,7 @@ mod tests {
                     "worktree",
                     "file:.git/config.worktree",
                     "credential.https://github.com.helper",
-                    "!'/usr/bin/ghis' --config '/tmp/ghis.toml' credential-helper",
+                    helper,
                 ),
                 entry(
                     "command",
@@ -1258,29 +1553,22 @@ mod tests {
                     "command",
                     "command line:",
                     "credential.https://github.com.helper",
-                    "!'/usr/bin/ghis' --config '/tmp/ghis.toml' credential-helper",
+                    helper,
                 ),
             ],
+            &paths(&temp),
             Some(&profile()),
             None,
-            None,
         );
-        assert_eq!(report.warnings, 0);
-        assert_eq!(report.info, 2);
-        assert_eq!(
-            report
-                .diagnostics
-                .iter()
-                .map(|item| item.scope.as_str())
-                .collect::<Vec<_>>(),
-            vec!["worktree", "worktree"]
-        );
-        assert!(report.diagnostics[0].value.contains("重置 helper 链"));
-        assert_eq!(report.diagnostics[1].value, "<shell helper，内容已隐藏>");
+        // The worktree reset shadows the global pair, and the worktree pair is
+        // the helper ghis itself wrote; the wrapper's command-line duplicate is
+        // invisible.
+        assert!(report.findings.is_empty(), "{:?}", report.findings);
     }
 
     #[test]
-    fn scopes_authentication_settings_to_an_exact_host() {
+    fn credential_helpers_for_other_hosts_are_still_foreign() {
+        let temp = tempfile::tempdir().expect("temporary directory");
         let report = scan_entries(
             &[
                 entry(
@@ -1296,16 +1584,22 @@ mod tests {
                     "store",
                 ),
             ],
+            &paths(&temp),
             Some(&profile()),
             None,
-            None,
         );
-        assert_eq!(report.diagnostics[0].severity, Severity::Info);
-        assert_eq!(report.diagnostics[1].severity, Severity::Warning);
+        assert_eq!(report.errors, 2);
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|item| item.code == DiagnosticCode::CredentialHelper)
+        );
     }
 
     #[test]
     fn reports_proxy_authorization_and_hides_ssh_command_contents() {
+        let temp = tempfile::tempdir().expect("temporary directory");
         let report = scan_entries(
             &[
                 entry(
@@ -1321,13 +1615,13 @@ mod tests {
                     "ssh -o ProxyCommand='echo ssh-command-secret'",
                 ),
             ],
+            &paths(&temp),
             Some(&profile()),
             None,
-            None,
         );
-        assert_eq!(report.diagnostics[0].severity, Severity::Error);
-        assert_eq!(report.diagnostics[0].value, "<已隐藏>");
-        assert_eq!(report.diagnostics[1].value, "<SSH 命令内容已隐藏>");
+        assert_eq!(report.errors, 2);
+        assert_eq!(report.findings[0].value, "<已隐藏>");
+        assert_eq!(report.findings[1].value, "<SSH 命令内容已隐藏>");
         assert!(
             !serde_json::to_string(&report)
                 .unwrap()
@@ -1337,6 +1631,7 @@ mod tests {
 
     #[test]
     fn does_not_silently_hide_an_unrelated_helper_with_ghis_words() {
+        let temp = tempfile::tempdir().expect("temporary directory");
         let report = scan_entries(
             &[
                 entry(
@@ -1352,34 +1647,17 @@ mod tests {
                     "!'/usr/bin/ghis' --config '/tmp/ghis.toml' credential-helper",
                 ),
             ],
+            &paths(&temp),
             Some(&profile()),
             None,
-            None,
         );
-        assert_eq!(report.diagnostics.len(), 2);
-        assert_eq!(report.diagnostics[0].severity, Severity::Warning);
-        assert_eq!(report.diagnostics[1].severity, Severity::Info);
-        assert_eq!(report.diagnostics[0].value, "<shell helper，内容已隐藏>");
+        assert_eq!(report.errors, 1);
+        assert_eq!(report.findings[0].value, "<shell helper，内容已隐藏>");
     }
 
     #[test]
-    fn ignores_ghis_generated_fragment_entries() {
-        let report = scan_entries(
-            &[entry(
-                "worktree",
-                "file:/home/test/.config/ghis/fragments/work.gitconfig",
-                "user.name",
-                "Other",
-            )],
-            Some(&profile()),
-            None,
-            None,
-        );
-        assert!(report.diagnostics.is_empty());
-    }
-
-    #[test]
-    fn ignores_profile_matching_ssh_signing_settings() {
+    fn a_global_signing_setting_is_foreign_even_when_it_matches_the_profile() {
+        let temp = tempfile::tempdir().expect("temporary directory");
         let mut configured = profile();
         configured.signing.enabled = true;
         configured.signing.signing_key = Some("/keys/alice-signing.pub".into());
@@ -1402,194 +1680,122 @@ mod tests {
                     " /keys/alice-signing.pub ",
                 ),
             ],
+            &paths(&temp),
             Some(&configured),
-            None,
             None,
         );
 
-        assert!(report.diagnostics.is_empty());
-    }
-
-    #[test]
-    fn reports_only_mismatched_profile_signing_settings() {
-        let mut configured = profile();
-        configured.signing.enabled = true;
-        configured.signing.signing_key = Some("/keys/alice-signing.pub".into());
-        configured.signing.program = Some("/opt/1Password/op-ssh-sign".into());
-
-        let report = scan_entries(
-            &[
-                entry(
-                    "global",
-                    "file:/tmp/config",
-                    "gpg.ssh.program",
-                    "/usr/bin/ssh-keygen",
-                ),
-                entry(
-                    "global",
-                    "file:/tmp/config",
-                    "user.signingkey",
-                    "/keys/other-signing.pub",
-                ),
-            ],
-            Some(&configured),
-            None,
-            None,
-        );
-
-        assert_eq!(report.warnings, 2);
-        assert_eq!(
+        assert_eq!(report.errors, 4);
+        assert!(
             report
-                .diagnostics
+                .findings
                 .iter()
-                .map(|diagnostic| diagnostic.key.as_str())
-                .collect::<Vec<_>>(),
-            vec!["gpg.ssh.program", "user.signingkey"]
+                .all(|item| item.code == DiagnosticCode::SigningConflict)
         );
-    }
-
-    #[test]
-    fn compares_inline_signing_material_without_comments_and_redacts_all_key_shapes() {
-        let mut configured = profile();
-        configured.signing.enabled = true;
-        configured.signing.signing_key =
-            Some("key::ecdsa-sha2-nistp256 AAAATEST profile comment".into());
-
-        let report = scan_entries(
-            &[entry(
-                "global",
-                "file:/tmp/config",
-                "user.signingkey",
-                "key::ecdsa-sha2-nistp256 AAAATEST global comment",
-            )],
-            Some(&configured),
-            None,
-            None,
-        );
-
-        assert!(report.diagnostics.is_empty());
-        let diagnostic = finding(
-            Severity::Warning,
-            &entry(
-                "global",
-                "file:/tmp/config",
-                "user.signingkey",
-                "sk-ssh-ed25519@openssh.com AAAASECRET local comment",
-            ),
-            "impact",
-            "suggestion",
-        );
-        assert_eq!(diagnostic.value, "<SSH 公钥内容已隐藏>");
-        assert!(
-            !serde_json::to_string(&diagnostic)
-                .unwrap()
-                .contains("AAAASECRET")
-        );
-        let prefixed = finding(
-            Severity::Warning,
-            &entry(
-                "global",
-                "file:/tmp/config",
-                "user.signingkey",
-                "key::ecdsa-sha2-nistp256 AAAAPREFIXED local comment",
-            ),
-            "impact",
-            "suggestion",
-        );
-        assert_eq!(prefixed.value, "<SSH 公钥内容已隐藏>");
-        assert!(
-            !serde_json::to_string(&prefixed)
-                .unwrap()
-                .contains("AAAAPREFIXED")
-        );
-    }
-
-    #[test]
-    fn accepts_managed_ssh_key_as_the_default_signing_key() {
-        let mut configured = profile();
-        configured.signing.enabled = true;
-        configured.ssh = Some(crate::config::SshProfile {
-            mode: SshMode::OnePassword,
-            public_key: Some("/keys/authentication.pub".into()),
-            ..crate::config::SshProfile::default()
-        });
-
-        let report = scan_entries(
-            &[entry(
-                "global",
-                "file:/tmp/config",
-                "user.signingkey",
-                "/keys/authentication.pub",
-            )],
-            Some(&configured),
-            None,
-            None,
-        );
-
-        assert!(report.diagnostics.is_empty());
-    }
-
-    #[test]
-    fn ignores_inert_key_and_program_when_profile_signing_is_disabled() {
-        let report = scan_entries(
-            &[
-                entry(
-                    "global",
-                    "file:/tmp/config",
-                    "gpg.ssh.program",
-                    "/opt/1Password/op-ssh-sign",
-                ),
-                entry(
-                    "global",
-                    "file:/tmp/config",
-                    "user.signingkey",
-                    "/keys/alice-signing.pub",
-                ),
-            ],
-            Some(&profile()),
-            None,
-            None,
-        );
-
-        assert!(report.diagnostics.is_empty());
     }
 
     #[test]
     fn redacts_userinfo_embedded_in_url_rewrite_keys_and_values() {
-        let diagnostic = finding(
-            Severity::Warning,
-            &entry(
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let report = scan_entries(
+            &[entry(
                 "global",
                 "file:/tmp/config",
                 "url.https://token@example.test/.insteadof",
                 "https://secret@example.test/",
-            ),
-            "impact",
-            "suggestion",
+            )],
+            &paths(&temp),
+            Some(&profile()),
+            None,
         );
-        assert!(!diagnostic.key.contains("token"));
-        assert!(!diagnostic.value.contains("secret"));
+        assert_eq!(report.warnings, 1);
+        assert_eq!(report.findings[0].code, DiagnosticCode::UrlRewrite);
+        assert!(!report.findings[0].key.contains("token"));
+        assert!(!report.findings[0].value.contains("secret"));
     }
 
     #[test]
     fn sanitizes_control_characters_in_config_provenance_and_values() {
-        let diagnostic = finding(
-            Severity::Warning,
-            &entry(
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let report = scan_entries(
+            &[entry(
                 "global\t",
                 "file:/tmp/evil\u{1b}[2J",
                 "user.name",
                 "Alice\nwarning\r\t\u{7}",
-            ),
-            "impact\nwith newline",
-            "suggestion\u{1b}[31m",
+            )],
+            &paths(&temp),
+            None,
+            None,
         );
-        let rendered = render_row(&diagnostic);
+        let rendered = render_row(&report.findings[0]);
         assert!(!rendered.contains('\u{1b}'));
         assert!(!rendered.contains('\u{7}'));
         assert!(!rendered.contains("Alice\nwarning"));
         assert!(rendered.contains("Alice\\nwarning\\r\\t\\u{0007}"));
         assert!(rendered.contains("file:/tmp/evil\\u{001B}[2J"));
+    }
+
+    #[test]
+    fn environment_findings_report_names_never_values() {
+        let findings = scan_environment(
+            [
+                "GIT_AUTHOR_EMAIL",
+                "GH_TOKEN",
+                "GIT_CONFIG_GLOBAL",
+                "UNRELATED",
+            ]
+            .into_iter()
+            .map(str::to_owned),
+        );
+        assert_eq!(findings.len(), 3);
+        assert_eq!(
+            findings
+                .iter()
+                .map(|item| item.key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["GH_TOKEN", "GIT_AUTHOR_EMAIL", "GIT_CONFIG_GLOBAL"]
+        );
+        assert!(
+            findings
+                .iter()
+                .all(|item| item.value == "<已设置>" && item.source == "env")
+        );
+        let severity = |key: &str| {
+            findings
+                .iter()
+                .find(|item| item.key == key)
+                .expect("finding")
+                .severity
+        };
+        assert_eq!(severity("GIT_AUTHOR_EMAIL"), Severity::Error);
+        assert_eq!(severity("GH_TOKEN"), Severity::Warning);
+        assert_eq!(severity("GIT_CONFIG_GLOBAL"), Severity::Info);
+    }
+
+    #[test]
+    fn ssh_differences_name_changed_settings_without_their_values() {
+        let mut configured = BTreeMap::new();
+        configured.insert(
+            "identityfile".to_owned(),
+            vec!["/home/test/.ssh/id_work".into()],
+        );
+        configured.insert(
+            "proxycommand".to_owned(),
+            vec!["ssh -W %h:%p secret-jump".into()],
+        );
+        configured.insert("port".to_owned(), vec!["22".into()]);
+        let mut defaults = BTreeMap::new();
+        defaults.insert(
+            "identityfile".to_owned(),
+            vec!["/home/test/.ssh/id_ed25519".into()],
+        );
+        defaults.insert("proxycommand".to_owned(), vec!["none".into()]);
+        defaults.insert("port".to_owned(), vec!["22".into()]);
+
+        let differences = ssh_differences(&configured, &defaults);
+        assert_eq!(differences, vec!["identityfile", "proxycommand"]);
+        assert!(!differences.iter().any(|key| key.contains("secret")));
     }
 
     #[test]

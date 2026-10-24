@@ -294,7 +294,18 @@ program = {signing_program:?}
         "SHA256:work"
     );
     assert_eq!(report["signing_program"]["available"], true);
-    assert_eq!(report["warnings"], serde_json::json!([]));
+    let findings = report["findings"]["findings"].as_array().expect("findings");
+    assert!(findings.iter().any(|finding| {
+        finding["layer"] == "foreign"
+            && finding["key"] == "GH_TOKEN"
+            && finding["value"] == "<已设置>"
+    }));
+    assert!(
+        findings
+            .iter()
+            .all(|finding| finding["value"] != "wrong-inherited-token"),
+        "the environment scan must never read token values"
+    );
 
     let combined = format!(
         "{}{}",
@@ -426,6 +437,7 @@ fn doctor_json_reports_system_and_global_git_conflicts_without_leaking_headers()
         r#"#!/bin/sh
 case "$1 $2" in
   "auth status") printf '%s\n' '{"hosts":{}}' ;;
+  "--version ") printf '%s\n' 'gh version test' ;;
   *) exit 64 ;;
 esac
 "#,
@@ -445,6 +457,11 @@ esac
         r#"[credential]
     helper =
     helper = store
+[user]
+    name = Global Identity
+    email = global@example.test
+[author]
+    email = config-author@example.test
 [url "ssh://git@github.com/"]
     insteadOf = https://github.com/
 "#,
@@ -488,28 +505,53 @@ esac
         String::from_utf8_lossy(&output.stderr)
     );
     let report: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
-    let diagnostics = report["git_config"]["diagnostics"]
-        .as_array()
-        .expect("git config diagnostics");
-    assert_eq!(report["git_config"]["errors"], 1);
-    assert_eq!(report["git_config"]["warnings"], 2);
-    assert_eq!(report["git_config"]["info"], 1);
+    let diagnostics = report["findings"]["findings"].as_array().expect("findings");
+    // Two credential helpers plus the Authorization header plus user.name,
+    // user.email and author.email are all foreign state.
+    assert_eq!(report["findings"]["errors"], 6);
+    // The URL rewrite is a warning and the uninstalled baseline is another.
+    assert_eq!(report["findings"]["warnings"], 2);
+    assert_eq!(report["findings"]["info"], 2);
+    assert!(
+        diagnostics
+            .iter()
+            .all(|item| item["layer"] == "foreign" || item["layer"] == "baseline")
+    );
+
+    for key in ["user.name", "user.email", "author.email"] {
+        let identity = diagnostics
+            .iter()
+            .find(|item| item["key"] == key)
+            .unwrap_or_else(|| panic!("missing identity finding for {key}"));
+        assert_eq!(identity["severity"], "error");
+        assert_eq!(
+            identity["source"],
+            format!("global:file:{}", global_config.display())
+        );
+        assert_eq!(identity["code"], "git_identity_conflict");
+    }
 
     let helpers = diagnostics
         .iter()
         .filter(|item| item["key"] == "credential.helper")
         .collect::<Vec<_>>();
     assert_eq!(helpers.len(), 2);
-    assert!(helpers.iter().all(|item| item["scope"] != "system"));
+    assert!(
+        helpers
+            .iter()
+            .all(|item| { item["source"] == format!("global:file:{}", global_config.display()) })
+    );
     assert!(helpers.iter().any(|item| {
-        item["scope"] == "global"
-            && item["origin"] == format!("file:{}", global_config.display())
-            && item["value"] == "<空值：重置 helper 链>"
+        item["value"] == "<空值：重置 helper 链>"
+            && item["repair"]["command"]
+                .as_str()
+                .is_some_and(|command| command.contains("--unset-all"))
     }));
     assert!(helpers.iter().any(|item| {
-        item["scope"] == "global"
-            && item["origin"] == format!("file:{}", global_config.display())
-            && item["value"] == "store"
+        item["value"] == "store"
+            && item["repair"]["command"]
+                .as_str()
+                .is_some_and(|command| command.contains("--unset-all"))
     }));
 
     let authorization = diagnostics
@@ -517,11 +559,15 @@ esac
         .find(|item| item["key"] == "http.extraheader")
         .expect("Authorization extraHeader diagnostic");
     assert_eq!(authorization["severity"], "error");
-    assert_eq!(authorization["scope"], "system");
     assert_eq!(authorization["value"], "<已隐藏>");
     assert_eq!(
-        authorization["origin"],
-        format!("file:{}", system_config.display())
+        authorization["source"],
+        format!("system:file:{}", system_config.display())
+    );
+    assert!(
+        authorization["repair"]["command"]
+            .as_str()
+            .is_some_and(|command| command.contains("system.gitconfig"))
     );
 
     let rewrite = diagnostics
@@ -532,12 +578,11 @@ esac
             })
         })
         .expect("URL rewrite diagnostic");
-    assert_eq!(rewrite["severity"], "info");
-    assert_eq!(rewrite["scope"], "global");
+    assert_eq!(rewrite["severity"], "warning");
     assert_eq!(rewrite["value"], "https://github.com/");
     assert_eq!(
-        rewrite["origin"],
-        format!("file:{}", global_config.display())
+        rewrite["source"],
+        format!("global:file:{}", global_config.display())
     );
 
     let combined = format!(
@@ -692,14 +737,34 @@ esac
         String::from_utf8_lossy(&output.stderr)
     );
     let report: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
-    let diagnostics = report["git_config"]["diagnostics"]
-        .as_array()
-        .expect("git config diagnostics");
+    let diagnostics = report["findings"]["findings"].as_array().expect("findings");
 
-    assert!(diagnostics.iter().all(|item| item["key"] != "user.name"));
-    // The identity is now read with the selected Profile's fragment applied, so
-    // an unbound repository no longer looks like a conflict.  Reporting one
-    // would be the old bug: comparing against an identity no commit carries.
+    // A global include and local config are foreign even while a Profile is
+    // selected: `--profile` applies to this command only and writes nothing.
+    let included_name = diagnostics
+        .iter()
+        .find(|item| item["key"] == "user.name")
+        .expect("included user.name diagnostic");
+    assert_eq!(included_name["severity"], "error");
+    assert_eq!(included_name["value"], "Included Identity");
+    assert_eq!(
+        included_name["source"],
+        format!("global:file:{}", included_config.display())
+    );
+
+    let local_email = diagnostics
+        .iter()
+        .find(|item| item["key"] == "user.email")
+        .expect("local user.email diagnostic");
+    assert_eq!(local_email["severity"], "error");
+    assert!(
+        local_email["source"]
+            .as_str()
+            .is_some_and(|source| source.starts_with("local:") && source.ends_with(".git/config"))
+    );
+
+    // The effective identity itself matches the Profile: the fragment pins
+    // author and committer, so local user.email cannot leak into a commit.
     assert!(
         diagnostics
             .iter()
@@ -714,31 +779,26 @@ esac
         .collect::<Vec<_>>();
     assert_eq!(helpers, vec!["<空值：重置 helper 链>", "store"]);
 
-    assert!(
-        diagnostics
-            .iter()
-            .all(|item| !matches!(item["key"].as_str(), Some("user.name" | "user.email")))
-    );
-
     let header = diagnostics
         .iter()
         .find(|item| item["key"] == "http.https://github.com/.extraheader")
         .expect("worktree extraHeader diagnostic");
     assert_eq!(header["severity"], "error");
-    assert_eq!(header["scope"], "worktree");
     assert_eq!(header["value"], "<已隐藏>");
-    assert!(
-        header["origin"]
-            .as_str()
-            .is_some_and(|origin| origin.contains("config.worktree"))
-    );
+    assert!(header["source"].as_str().is_some_and(
+        |source| source.starts_with("worktree:") && source.contains("config.worktree")
+    ));
 
     let rewrite = diagnostics
         .iter()
         .find(|item| item["key"] == "url.ssh://<已隐藏>@github.com/.insteadof")
         .expect("local URL rewrite diagnostic");
     assert_eq!(rewrite["severity"], "warning");
-    assert_eq!(rewrite["scope"], "local");
+    assert!(
+        rewrite["source"]
+            .as_str()
+            .is_some_and(|source| source.starts_with("local:"))
+    );
 
     let combined = format!(
         "{}{}",
@@ -968,13 +1028,14 @@ program = {signing_program:?}
     assert_eq!(report["github_signing_key"]["status"], "not_matched");
     assert_eq!(report["github_signing_key"]["github_key_count"], 1);
     assert!(
-        report["warnings"]
+        report["findings"]["findings"]
             .as_array()
-            .expect("warnings")
+            .expect("findings")
             .iter()
-            .any(|warning| warning
-                .as_str()
-                .is_some_and(|warning| warning.contains("本地 key 未被判为失效")))
+            .any(|finding| finding["code"] == "github_signing_key"
+                && finding["impact"]
+                    .as_str()
+                    .is_some_and(|impact| impact.contains("本地 key 未被判为失效")))
     );
 
     let output = run(
@@ -989,15 +1050,14 @@ program = {signing_program:?}
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
     assert_eq!(report["github_signing_key"]["status"], "unavailable");
     assert!(
-        report["warnings"]
+        report["findings"]["findings"]
             .as_array()
-            .expect("warnings")
+            .expect("findings")
             .iter()
-            .any(|warning| {
-                warning
+            .any(|finding| finding["code"] == "github_signing_key"
+                && finding["impact"]
                     .as_str()
-                    .is_some_and(|warning| warning.contains("不会因此判定本地签名 key 失效"))
-            })
+                    .is_some_and(|impact| impact.contains("不会因此判定本地签名 key 失效")))
     );
     assert!(
         !report["github_signing_key"]["error"]
@@ -1062,4 +1122,98 @@ program = {signing_program:?}
             .expect("trace")
             .contains("ssh_signing_keys")
     );
+}
+
+#[test]
+fn doctor_does_not_report_its_own_fragments_baseline_or_binding() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let repo = temp.path().join("repo");
+    let fake_bin = temp.path().join("bin");
+    let config_home = temp.path().join("config");
+    let cache_home = temp.path().join("cache");
+    let state_home = temp.path().join("state");
+    let global_config = temp.path().join("global.gitconfig");
+    let ghis_config = config_home.join("ghis/config.toml");
+    fs::create_dir_all(&fake_bin).expect("fake bin");
+    fs::create_dir_all(ghis_config.parent().expect("config parent")).expect("config directory");
+    fs::write(&global_config, "[init]\n\tdefaultBranch = main\n").expect("global git config");
+    executable(
+        &fake_bin.join("gh"),
+        r#"#!/bin/sh
+case "$1 $2" in
+  "auth status") printf '%s\n' '{"hosts":{}}' ;;
+  "--version ") printf '%s\n' 'gh version test' ;;
+  *) exit 64 ;;
+esac
+"#,
+    );
+    fs::write(
+        &ghis_config,
+        r#"version = 1
+
+[profiles.work]
+host = "github.com"
+login = "worker"
+git_name = "Work Identity"
+git_email = "work@example.test"
+"#,
+    )
+    .expect("ghis config");
+    git_ok(
+        temp.path(),
+        &["init", "-q", repo.to_str().expect("UTF-8 path")],
+    );
+
+    let inherited_path = std::env::var_os("PATH").expect("PATH");
+    let path = std::env::join_paths(
+        std::iter::once(fake_bin).chain(std::env::split_paths(&inherited_path)),
+    )
+    .expect("joined PATH");
+    let command = |args: &[&str]| {
+        let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+        command
+            .current_dir(&repo)
+            .args(["--config", ghis_config.to_str().expect("UTF-8 config")])
+            .args(args)
+            .env("PATH", &path)
+            .env("HOME", temp.path())
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_CACHE_HOME", &cache_home)
+            .env("XDG_STATE_HOME", &state_home)
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", &global_config)
+            .env_remove("GIT_CONFIG_NOSYSTEM")
+            .env_remove("GHIS_CONFIG")
+            .env_remove("GHIS_PROFILE")
+            .env_remove("GHIS_BANNER_SHOWN")
+            .env_remove("GHIS_WRAPPER_ACTIVE")
+            .env_remove("GHIS_BYPASS")
+            .env_remove("GHIS_DISABLE_CHPWD");
+        command
+    };
+    command(&["gitconfig", "setup"]).assert().success();
+    command(&["use", "work"]).assert().success();
+
+    let output = command(&["doctor", "--json"]).output().expect("run doctor");
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    let findings = report["findings"]["findings"].as_array().expect("findings");
+    let fragments = config_home.join("ghis/fragments");
+    assert!(
+        findings.iter().all(|finding| {
+            !matches!(finding["key"].as_str(), Some("user.name" | "user.email"))
+                && finding["layer"] != "baseline"
+                && finding["layer"] != "ownership"
+                && !finding["source"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(fragments.to_str().expect("UTF-8 fragments path"))
+        }),
+        "doctor reported its own state: {findings:?}"
+    );
+    assert_eq!(report["profile"], "work");
 }
