@@ -1732,6 +1732,50 @@ printf '%s host=%s token=%s\n' "$*" "${GH_HOST-}" "${GH_TOKEN-}" >> "$FAKE_GH_TR
 }
 
 #[test]
+fn gh_attestation_commands_use_the_profile_token() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).expect("bin directory");
+    let trace = temp.path().join("gh.trace");
+    write_executable(
+        &bin.join("gh"),
+        r#"#!/bin/sh
+case "$*" in
+  "auth token --hostname github.com --user alice") printf 'selected-token\n'; exit 0 ;;
+esac
+printf '%s token=%s\n' "$*" "${GH_TOKEN-}" >> "$FAKE_GH_TRACE"
+[ "$GH_TOKEN" = selected-token ] || exit 82
+"#,
+    );
+
+    let mut command = isolated_ghis_command();
+    command
+        .current_dir(temp.path())
+        .args([
+            "gh",
+            "--",
+            "attestation",
+            "verify",
+            "dist/linux/ghis.tar.gz",
+            "--owner",
+            "acme",
+        ])
+        .env("PATH", prepend_path(&bin))
+        .env("FAKE_GH_TRACE", &trace);
+    for (key, value) in xdg_environment(&temp) {
+        command.env(key, value);
+    }
+    command.assert().success();
+    let trace = fs::read_to_string(trace).expect("trace");
+    assert!(
+        trace.contains(
+            "attestation verify dist/linux/ghis.tar.gz --owner acme token=selected-token"
+        )
+    );
+}
+
+#[test]
 fn cwd_rules_select_profiles_from_non_git_directories() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let matching = temp.path().join("home/discussions/topic");

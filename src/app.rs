@@ -2038,6 +2038,11 @@ fn validate_gh_target_view(
     }
 
     for (name, value) in &view.option_values {
+        // `attestation verify --owner` scopes the lookup to an organization, so
+        // the enclosing repository no longer describes the target.
+        if view.command == "attestation" && *name == "owner" {
+            repository_context_overridden = true;
+        }
         let source = match (view.command, view.subcommand, *name) {
             ("repo", Some("sync"), "source") => Some("repo sync --source"),
             ("repo", Some("create"), "template") => Some("repo create --template"),
@@ -2100,7 +2105,7 @@ fn parse_gh_argument_view(args: &[String]) -> Result<GhArgumentView<'_>> {
         ("pr", Some("checkout"), 1)
     } else if matches!(
         raw_command,
-        "pr" | "issue" | "repo" | "label" | "auth" | "gist" | "project"
+        "pr" | "issue" | "repo" | "label" | "auth" | "gist" | "project" | "attestation"
     ) {
         let subcommand = args.get(1).map(String::as_str);
         if subcommand.is_some_and(|subcommand| subcommand.starts_with('-')) {
@@ -2447,6 +2452,7 @@ fn gh_supported_top_level_command(command: &str) -> bool {
             | "--version"
             | "alias"
             | "api"
+            | "attestation"
             | "auth"
             | "browse"
             | "cache"
@@ -2495,6 +2501,7 @@ fn gh_long_option_takes_value(command: &str, subcommand: Option<&str>, name: &st
             | ("gist", Some("list"), "filter" | "limit")
             | ("gist", Some("view"), "filename")
             | ("project", Some("item-add"), "url")
+            | ("attestation", _, "owner")
     ) {
         return true;
     }
@@ -4812,6 +4819,20 @@ mod tests {
                 "--url".into(),
                 "https://other.example/acme/project/issues/1".into(),
             ],
+            vec![
+                "attestation".into(),
+                "verify".into(),
+                "ghis.tar.gz".into(),
+                "--hostname".into(),
+                "other.example".into(),
+            ],
+            vec![
+                "attestation".into(),
+                "download".into(),
+                "ghis.tar.gz".into(),
+                "-R".into(),
+                "other.example/acme/project".into(),
+            ],
         ];
         for args in arguments {
             assert!(validate_gh_target_host("github.com", &args, None, None).is_err());
@@ -4825,6 +4846,16 @@ mod tests {
             )
             .is_err(),
             "project link 默认使用当前仓库，remote 主机必须一致"
+        );
+        assert!(
+            validate_gh_target_host(
+                "github.com",
+                &["attestation".into(), "verify".into(), "ghis.tar.gz".into()],
+                None,
+                Some("other.example"),
+            )
+            .is_err(),
+            "without --owner or --repo, attestation uses the current repository"
         );
         assert!(
             validate_gh_target_host(
@@ -4986,6 +5017,34 @@ mod tests {
             None,
         )
         .expect("project subcommands without a repository operand");
+        for args in [
+            vec![
+                "attestation".into(),
+                "verify".into(),
+                "dist/linux/ghis.tar.gz".into(),
+                "--owner".into(),
+                "acme".into(),
+            ],
+            vec![
+                "attestation".into(),
+                "verify".into(),
+                "oci://ghcr.io/acme/ghis".into(),
+                "--owner".into(),
+                "acme".into(),
+            ],
+            vec![
+                "attestation".into(),
+                "verify".into(),
+                "ghis.tar.gz".into(),
+                "-b".into(),
+                "dist/bundles/ghis.jsonl".into(),
+                "--owner".into(),
+                "acme".into(),
+            ],
+        ] {
+            validate_gh_target_host("github.com", &args, None, Some("enterprise.example"))
+                .expect("artifact paths are content, not repositories");
+        }
         validate_gh_target_host(
             "github.com",
             &[
