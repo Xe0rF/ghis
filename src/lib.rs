@@ -7,6 +7,7 @@
 pub mod agent;
 pub mod agent_context;
 pub mod app;
+pub mod baseline;
 pub mod config;
 pub mod credential;
 pub mod credential_command;

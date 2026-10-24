@@ -28,6 +28,9 @@ pub struct Draft {
     pub make_default: bool,
     pub bind_repository: bool,
     pub setup_zsh: bool,
+    /// Install the global Git baseline so unbound repositories cannot commit
+    /// with an inferred identity.
+    pub gitconfig_baseline: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -188,6 +191,7 @@ struct Wizard<'a> {
     make_default: bool,
     bind_repository: bool,
     setup_zsh: bool,
+    gitconfig_baseline: bool,
     review_selected: usize,
     error: Option<String>,
 }
@@ -227,6 +231,7 @@ impl<'a> Wizard<'a> {
             make_default: config.behavior.default_profile.is_none(),
             bind_repository: false,
             setup_zsh: false,
+            gitconfig_baseline: true,
             review_selected: 0,
             error: None,
         }
@@ -416,6 +421,10 @@ impl<'a> Wizard<'a> {
             ("设为默认 Profile", self.make_default),
             ("绑定当前 Git worktree", self.bind_repository),
             ("安装 zsh wrapper", self.setup_zsh),
+            (
+                "接管全局 Git 基线（未绑定仓库不再自动推断身份）",
+                self.gitconfig_baseline,
+            ),
         ];
         for (index, (label, enabled)) in options.into_iter().enumerate() {
             let marker = if index == self.option_selected {
@@ -445,6 +454,10 @@ impl<'a> Wizard<'a> {
         lines.push(format!("  默认 Profile  {}", yes_no(self.make_default)));
         lines.push(format!("  绑定仓库      {}", yes_no(self.bind_repository)));
         lines.push(format!("  zsh wrapper  {}", yes_no(self.setup_zsh)));
+        lines.push(format!(
+            "  全局 Git 基线 {}",
+            yes_no(self.gitconfig_baseline)
+        ));
         lines.push(String::new());
         for (index, label) in ["应用配置", "返回修改", "取消"].into_iter().enumerate() {
             let marker = if index == self.review_selected {
@@ -660,9 +673,9 @@ impl<'a> Wizard<'a> {
 
     fn handle_options(&mut self, key: InputKey) -> Option<FlowResult<Draft>> {
         if is_up(key) {
-            self.option_selected = previous(self.option_selected, 3);
+            self.option_selected = previous(self.option_selected, 4);
         } else if is_down(key) {
-            self.option_selected = next(self.option_selected, 3);
+            self.option_selected = next(self.option_selected, 4);
         } else if is_back(key) {
             self.step = Step::Identity;
             self.identity_field = IdentityField::EmailMenu;
@@ -674,6 +687,7 @@ impl<'a> Wizard<'a> {
                 }
                 1 => self.error = Some("当前目录不是 Git 仓库，无法绑定 worktree。".into()),
                 2 => self.setup_zsh = !self.setup_zsh,
+                3 => self.gitconfig_baseline = !self.gitconfig_baseline,
                 _ => {}
             }
         } else if is_forward(key) {
@@ -703,6 +717,7 @@ impl<'a> Wizard<'a> {
                         make_default: self.make_default,
                         bind_repository: self.bind_repository,
                         setup_zsh: self.setup_zsh,
+                        gitconfig_baseline: self.gitconfig_baseline,
                     }));
                 }
                 1 => self.step = Step::Options,
@@ -874,6 +889,12 @@ where
         "安装 zsh wrapper",
         false,
     ));
+    let gitconfig_baseline = answer!(line_confirm(
+        &mut reader,
+        &mut writer,
+        "接管全局 Git 基线（未绑定仓库不再自动推断身份）",
+        true,
+    ));
     writeln!(
         writer,
         "\n确认配置：{id}，{login}@{}，{git_name} <{git_email}>",
@@ -898,6 +919,7 @@ where
         make_default,
         bind_repository,
         setup_zsh,
+        gitconfig_baseline,
     }))
 }
 
@@ -1286,7 +1308,7 @@ mod tests {
 
     #[test]
     fn line_mode_collects_hjkl_text_without_cursor_control() {
-        let input = io::Cursor::new("\n\nhjkl User\n\n\nn\ny\n");
+        let input = io::Cursor::new("\n\nhjkl User\n\n\nn\ny\ny\n");
         let mut output = Vec::new();
         let result = run_line_mode(
             input,
