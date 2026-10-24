@@ -1816,6 +1816,65 @@ esac
 }
 
 #[test]
+fn gh_auth_refresh_requires_the_active_profile_account() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).expect("bin directory");
+    write_executable(
+        &bin.join("gh"),
+        r#"#!/bin/sh
+printf '%s host=%s\n' "$*" "${GH_HOST-}" >> "$FAKE_GH_TRACE"
+case "$*" in
+  "auth status --json hosts --hostname github.com")
+    printf '{"hosts":{"github.com":[{"host":"github.com","login":"alice","active":false,"state":"success"},{"host":"github.com","login":"%s","active":true,"state":"success"}]}}\n' "${FAKE_GH_ACTIVE}"
+    exit 0 ;;
+  "auth refresh"*)
+    [ -z "${GH_TOKEN+x}" ] || exit 71
+    exit 0 ;;
+esac
+exit 62
+"#,
+    );
+
+    let other = temp.path().join("gh-other.trace");
+    let mut command = isolated_ghis_command();
+    command
+        .current_dir(temp.path())
+        .args(["gh", "--", "auth", "refresh", "-s", "project"])
+        .env("PATH", prepend_path(&bin))
+        .env("FAKE_GH_TRACE", &other)
+        .env("FAKE_GH_ACTIVE", "someone-else");
+    for (key, value) in xdg_environment(&temp) {
+        command.env(key, value);
+    }
+    command
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("与当前 Profile 的 alice 不一致"));
+    let trace = fs::read_to_string(&other).expect("trace");
+    assert!(
+        !trace.contains("auth refresh"),
+        "refresh must not run for another account: {trace}"
+    );
+
+    let matching = temp.path().join("gh-matching.trace");
+    let mut command = isolated_ghis_command();
+    command
+        .current_dir(temp.path())
+        .args(["gh", "--", "auth", "refresh", "-s", "project"])
+        .env("PATH", prepend_path(&bin))
+        .env("FAKE_GH_TRACE", &matching)
+        .env("FAKE_GH_ACTIVE", "alice");
+    for (key, value) in xdg_environment(&temp) {
+        command.env(key, value);
+    }
+    command.assert().success();
+    let trace = fs::read_to_string(&matching).expect("trace");
+    assert!(trace.contains("auth refresh -s project host=github.com"));
+}
+
+#[test]
 fn cwd_rules_select_profiles_from_non_git_directories() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let matching = temp.path().join("home/discussions/topic");

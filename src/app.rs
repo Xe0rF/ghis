@@ -1762,6 +1762,9 @@ where
             .and_then(|remote| remote.host.as_deref()),
     )?;
     if gh_auth_mutates_keyring(&view) {
+        if view.subcommand == Some("refresh") {
+            ensure_gh_refresh_targets_profile(profile)?;
+        }
         // gh refuses to change the keyring while GH_TOKEN is set, and a missing
         // or expired token must not block the command that repairs it.
         let mut command = CommandSpec::gh()
@@ -1825,6 +1828,31 @@ fn gh_auth_mutates_keyring(view: &GhArgumentView<'_>) -> bool {
             view.subcommand,
             Some("login" | "logout" | "refresh" | "switch")
         )
+}
+
+/// `gh auth refresh` only touches the account that is active for the host.
+/// ghis never switches accounts, so a different active account stops the
+/// command with the exact sequence the caller can run instead.
+fn ensure_gh_refresh_targets_profile(profile: &Profile) -> Result<()> {
+    let host = git::normalize_host(&profile.host);
+    let discovery = github::discover_accounts(Some(&profile.host))?;
+    let active = discovery
+        .accounts
+        .iter()
+        .find(|account| account.active && git::normalize_host(&account.host) == host);
+    let Some(active) = active else {
+        return Err(AppError::Message(format!(
+            "gh 在 {host} 上没有报告活动账号，无法确定 refresh 会作用于哪个账号；ghis 不会替你切换账号。请先运行 `gh auth switch --hostname {host} --user {}`",
+            profile.login
+        )));
+    };
+    if active.login.eq_ignore_ascii_case(&profile.login) {
+        return Ok(());
+    }
+    Err(AppError::Message(format!(
+        "gh 在 {host} 上的活动账号是 {}，与当前 Profile 的 {} 不一致，已停止 refresh（ghis 不会替你切换账号）。请依次运行：`gh auth switch --hostname {host} --user {}`，`gh auth refresh --hostname {host} <原参数>`，`gh auth switch --hostname {host} --user {}`",
+        active.login, profile.login, profile.login, active.login
+    )))
 }
 
 #[derive(Debug, Default)]
