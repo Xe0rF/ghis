@@ -27,8 +27,8 @@ fn context(source: ResolutionSource, profile_id: Option<&str>) -> AppContext {
             fingerprint: None,
             program: Some(PathBuf::from("CANARY_SIGNING_PROGRAM")),
         },
-        credential_mode: Some(ghis::config::CredentialMode::Passthrough),
-        credential_command: Some(vec!["CANARY_CREDENTIAL_COMMAND".into()]),
+        credential_mode: Some(ghis::config::CredentialMode::None),
+        credential_command: None,
         credential_username: Some("CANARY_CREDENTIAL_USERNAME".into()),
     };
     let mut config = Config::default();

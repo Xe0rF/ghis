@@ -610,7 +610,7 @@ git_email = "personal@example.test"
 }
 
 #[test]
-fn passthrough_permits_a_helper_override_that_command_mode_still_refuses() {
+fn none_and_command_modes_both_refuse_a_helper_override() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let root = temporary.path();
     let repository = init_repository(root);
@@ -656,7 +656,7 @@ host = "git.example.test"
 login = "alice"
 git_name = "Alice Example"
 git_email = "alice@example.test"
-credential_mode = "{passthrough}"
+credential_mode = "{none}"
 
 [profiles.command]
 host = "git.example.test"
@@ -667,13 +667,13 @@ credential_mode = "command"
 credential_command = [{token_script:?}]
 credential_username = "oauth2"
 "#,
-            passthrough = "passthrough",
+            none = "none",
             token_script = token_script.to_string_lossy(),
         ),
     )
     .expect("config");
 
-    for (profile, expect_refusal) in [("gitlab", false), ("command", true)] {
+    for (profile, expect_refusal) in [("gitlab", true), ("command", true)] {
         let _ = fs::remove_file(&override_trace);
         let mut bind = AssertCommand::cargo_bin("ghis").expect("ghis binary");
         bind.args([
@@ -722,7 +722,7 @@ credential_username = "oauth2"
             override_command.assert().success();
             assert!(
                 override_trace.exists(),
-                "passthrough must let the user configure their own helper"
+                "a permitted override must reach the user helper"
             );
         }
 

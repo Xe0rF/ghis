@@ -208,13 +208,13 @@ fn a_host_with_two_profiles_is_never_routed() {
 }
 
 #[test]
-fn a_passthrough_host_is_never_routed() {
+fn a_none_host_is_never_routed() {
     let temp = tempfile::tempdir().expect("temporary directory");
     write_config(
         &temp,
         &BASE.replace(
             "credential_mode = \"command\"\ncredential_command = [\"printf\", \"test-token\"]",
-            "credential_mode = \"passthrough\"",
+            "credential_mode = \"none\"",
         ),
     );
     let bin = fake_git_bin(&temp);
@@ -280,14 +280,11 @@ fn current_profile_mode_disables_routing() {
 }
 
 #[test]
-fn a_command_line_helper_override_disables_routing() {
+fn a_command_line_helper_override_disables_routing_without_a_profile() {
     let temp = tempfile::tempdir().expect("temporary directory");
-    write_config(
-        &temp,
-        &format!(
-            "{BASE}\n[profiles.legacy]\nhost = \"github.com\"\nlogin = \"legacy\"\ngit_name = \"Legacy\"\ngit_email = \"legacy@example.test\"\ncredential_mode = \"passthrough\"\n"
-        ),
-    );
+    // No resolved Profile: with one, every credential-helper override is
+    // refused outright, so the routing rule is only reachable here.
+    write_config(&temp, &BASE.replace("default_profile = \"personal\"\n", ""));
     let bin = fake_git_bin(&temp);
     let work = temp.path().join("work");
     fs::create_dir_all(&work).expect("work directory");
@@ -295,8 +292,6 @@ fn a_command_line_helper_override_disables_routing() {
     ghis(&temp, Some(&bin))
         .current_dir(&work)
         .args([
-            "--profile",
-            "legacy",
             "git",
             "--",
             "-c",

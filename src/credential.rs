@@ -274,8 +274,8 @@ fn host_matches(request: &CredentialRequest, profile: &CredentialProfile) -> boo
 }
 
 /// Resolve a matching profile.  `Manage` reads gh's keyring, `Command` runs the
-/// profile's argv.  No token is cached by this helper and `store`/`erase`
-/// remain no-ops.
+/// profile's argv, and `none` refuses.  No token is cached by this helper and
+/// `store`/`erase` remain no-ops.
 pub fn get_for_profile(
     request: &CredentialRequest,
     profile: &CredentialProfile,
@@ -286,13 +286,14 @@ pub fn get_for_profile(
     let password = match profile.mode {
         config::CredentialMode::Manage => github::token(&profile.host, &profile.login)?,
         config::CredentialMode::Command => crate::credential_command::run(&profile.command)?,
-        // A passthrough profile never has this helper installed, so reaching
-        // here would mean something installed it anyway.  Refuse rather than
-        // resolve: falling through to gh would apply a GitHub token the profile
-        // explicitly declined to use.
-        config::CredentialMode::Passthrough => {
+        // `none` still installs the same helper so the empty reset before it
+        // cuts the inherited chain, but it never resolves a token.  Failing
+        // here stops Git instead of falling through to another helper, a
+        // terminal prompt, or a token the profile declined to use.
+        config::CredentialMode::None => {
             return Err(CredentialError::Lookup(
-                "credential helper ran for a passthrough profile".into(),
+                "Profile 的 credential_mode 为 none，ghis 不提供 HTTPS 凭据；请改用 SSH remote 或 command 模式"
+                    .into(),
             ));
         }
     };
@@ -627,11 +628,11 @@ mod tests {
     }
 
     #[test]
-    fn a_passthrough_profile_refuses_to_resolve_anything() {
+    fn a_none_profile_refuses_to_resolve_anything() {
         let profile = CredentialProfile {
             username: "alice".into(),
             command: Vec::new(),
-            mode: config::CredentialMode::Passthrough,
+            mode: config::CredentialMode::None,
             host: "git.example.test".into(),
             login: "alice".into(),
         };
@@ -645,7 +646,7 @@ mod tests {
         let error = handle(Action::Get, input, &mut output, ProfileLookup { profile })
             .expect_err("must not resolve");
         assert_eq!(output, b"quit=true\n\n");
-        assert!(error.to_string().contains("passthrough"), "{error}");
+        assert!(error.to_string().contains("none"), "{error}");
     }
 
     #[test]

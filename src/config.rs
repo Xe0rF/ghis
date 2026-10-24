@@ -405,10 +405,10 @@ pub enum CredentialMode {
     /// ghis installs its helper and resolves the token through `gh`.
     #[default]
     Manage,
-    /// ghis writes no credential configuration; the repository keeps whatever
-    /// helper chain the user configured.  The repository's inherited chain is
-    /// deliberately left intact, so the user becomes responsible for it.
-    Passthrough,
+    /// ghis installs the same helper, but it answers every request with
+    /// `quit=true`: the profile deliberately offers no HTTPS credential, so
+    /// transfers must use SSH or the repository must stay anonymous.
+    None,
     /// ghis installs its helper and resolves the token by running
     /// `credential_command`, still failing closed when that command fails.
     Command,
@@ -447,12 +447,14 @@ impl Profile {
         self.credential_mode.unwrap_or_default()
     }
 
-    /// Whether ghis writes credential configuration for this profile.  Only
-    /// `Passthrough` declines, and it declines by writing nothing at all — not
-    /// even the empty helper value that `Manage` uses to cut the inherited
-    /// chain, because the inherited chain is exactly what the user keeps.
-    pub fn manages_credentials(&self) -> bool {
-        self.credential_mode() != CredentialMode::Passthrough
+    /// Whether this profile can answer an HTTPS credential request.
+    ///
+    /// Every mode installs the same helper; only `None` refuses to resolve a
+    /// token.  Credential routing for other hosts uses this so a host whose
+    /// only Profile is `None` keeps the inherited chain instead of being
+    /// handed a helper that would always refuse.
+    pub fn serves_credentials(&self) -> bool {
+        self.credential_mode() != CredentialMode::None
     }
 
     /// The HTTP Basic username paired with the resolved token.
@@ -632,7 +634,7 @@ impl Config {
     /// Hosts whose HTTPS credentials this configuration answers by itself.
     ///
     /// A host is routable only when exactly one Profile is configured on it and
-    /// that Profile manages credentials.  Hosts with several Profiles are
+    /// that Profile serves credentials.  Hosts with several Profiles are
     /// ambiguous and are deliberately left to the current Profile's helper
     /// chain; nothing here picks an account.
     pub fn credential_routes(&self) -> BTreeMap<String, String> {
@@ -651,7 +653,7 @@ impl Config {
             .filter_map(|(host, (count, id))| {
                 let id = id?;
                 let profile = self.profiles.get(id)?;
-                (count == 1 && profile.manages_credentials()).then(|| (host, id.to_owned()))
+                (count == 1 && profile.serves_credentials()).then(|| (host, id.to_owned()))
             })
             .collect()
     }
@@ -1536,7 +1538,7 @@ mod tests {
     }
 
     #[test]
-    fn credential_routes_require_a_single_managing_profile_per_host() {
+    fn credential_routes_require_a_single_serving_profile_per_host() {
         let mut config = Config::default();
         let mut flowecho = profile();
         flowecho.host = "git.example.test".into();
@@ -1545,10 +1547,10 @@ mod tests {
         flowecho.credential_command = Some(vec!["printf".into(), "token".into()]);
         config.profiles.insert("flowecho".into(), flowecho);
 
-        let mut passthrough = profile();
-        passthrough.host = "pass.example.test".into();
-        passthrough.credential_mode = Some(CredentialMode::Passthrough);
-        config.profiles.insert("pass".into(), passthrough);
+        let mut none = profile();
+        none.host = "none.example.test".into();
+        none.credential_mode = Some(CredentialMode::None);
+        config.profiles.insert("none".into(), none);
 
         let mut shared_one = profile();
         shared_one.host = "shared.example.test".into();
@@ -1569,7 +1571,7 @@ mod tests {
             routes.get("git.example.test").map(String::as_str),
             Some("flowecho")
         );
-        assert!(!routes.contains_key("pass.example.test"));
+        assert!(!routes.contains_key("none.example.test"));
         assert!(!routes.contains_key("shared.example.test"));
         assert_eq!(
             routes.get("port.example.test:8443").map(String::as_str),
@@ -1601,14 +1603,23 @@ mod tests {
         let path = dir.path().join("config.toml");
         fs::write(
             &path,
+            "version = 1\n\n[profiles.work]\nhost = \"github.com\"\nlogin = \"alice\"\ngit_name = \"Alice\"\ngit_email = \"alice@example.com\"\ncredential_mode = \"none\"\n",
+        )
+        .unwrap();
+        let config = Config::load(&path).expect("none loads");
+        assert_eq!(
+            config.profiles["work"].credential_mode(),
+            CredentialMode::None
+        );
+
+        // The old name is not an accepted alias: it described keeping the
+        // inherited helper chain, which the global baseline no longer provides.
+        fs::write(
+            &path,
             "version = 1\n\n[profiles.work]\nhost = \"github.com\"\nlogin = \"alice\"\ngit_name = \"Alice\"\ngit_email = \"alice@example.com\"\ncredential_mode = \"passthrough\"\n",
         )
         .unwrap();
-        let config = Config::load(&path).expect("passthrough loads");
-        assert_eq!(
-            config.profiles["work"].credential_mode(),
-            CredentialMode::Passthrough
-        );
+        assert!(Config::load(&path).is_err(), "passthrough is removed");
 
         let command = "version = 1\n\n[profiles.work]\nhost = \"git.example.test\"\nlogin = \"alice\"\ngit_name = \"Alice\"\ngit_email = \"alice@example.com\"\ncredential_mode = \"command\"\ncredential_command = [\"op\", \"read\", \"op://item\"]\ncredential_username = \"oauth2\"\n";
         fs::write(&path, command).unwrap();
@@ -1670,7 +1681,7 @@ mod tests {
             .expect("a complete command profile is valid");
 
         let mut work = profile();
-        work.credential_mode = Some(CredentialMode::Passthrough);
+        work.credential_mode = Some(CredentialMode::None);
         work.credential_command = Some(vec!["op".into()]);
         config.profiles.insert("work".into(), work);
         assert!(
