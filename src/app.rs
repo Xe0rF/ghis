@@ -1831,20 +1831,31 @@ where
             (ctx.config.behavior.ssh_unmanaged == config::SshUnmanagedPolicy::Fail)
                 .then(ssh_guard_command)
         });
-    let token = github::token(&profile.host, &profile.login)?;
-    let token_text = token
-        .as_str()
-        .ok_or_else(|| AppError::Message("gh 返回的 token 不是 UTF-8".into()))?;
+    let token = if gh_command_requires_token(&view) {
+        Some(github::token(&profile.host, &profile.login)?)
+    } else {
+        None
+    };
+    let token_text = match token.as_ref() {
+        Some(token) => Some(
+            token
+                .as_str()
+                .ok_or_else(|| AppError::Message("gh 返回的 token 不是 UTF-8".into()))?,
+        ),
+        None => None,
+    };
     let mut command = CommandSpec::gh()
         .args(forwarded_args.iter().cloned())
         .clear_github_auth_env()
         .remove_env("GH_REPO")
-        .env_secret(
-            github::token_environment_variable(&profile.host),
-            token_text,
-        )
         .env("GH_HOST", profile.host.clone())
         .current_dir(cwd);
+    if let Some(token_text) = token_text {
+        command = command.env_secret(
+            github::token_environment_variable(&profile.host),
+            token_text,
+        );
+    }
     if let Some(repository) = target_policy.repository_environment {
         command = command.env("GH_REPO", repository);
     }
@@ -1857,6 +1868,16 @@ where
     let status = SystemCommandRunner::new().run_passthrough(&command)?;
     drop(token);
     Ok(status.code().unwrap_or(128))
+}
+
+/// Whether this `gh` invocation needs a Profile token at all.  Version, help,
+/// completion and local `auth status`/`auth token` calls never authenticate.
+fn gh_command_requires_token(view: &GhArgumentView<'_>) -> bool {
+    match view.command {
+        "--version" | "--help" | "version" | "help" | "completion" => false,
+        "auth" => !matches!(view.subcommand, Some("status" | "token")),
+        _ => true,
+    }
 }
 
 /// `gh auth login`, `logout`, `refresh` and `switch` change gh's own keyring

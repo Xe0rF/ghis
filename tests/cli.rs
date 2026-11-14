@@ -2077,6 +2077,50 @@ exit 62
 }
 
 #[test]
+fn gh_version_and_auth_status_do_not_require_a_profile_token() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).expect("bin directory");
+    let trace = temp.path().join("gh.trace");
+    write_executable(
+        &bin.join("gh"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_GH_TRACE"
+case "$*" in
+  "auth token --hostname github.com --user alice") exit 70 ;;
+  "--version") printf 'gh version test\n' ;;
+  "auth status") printf 'github.com\n  Logged in to github.com account alice\n' ;;
+  *) exit 62 ;;
+esac
+"#,
+    );
+
+    for arguments in [
+        vec!["gh", "--", "--version"],
+        vec!["gh", "--", "auth", "status"],
+    ] {
+        let mut command = isolated_ghis_command();
+        command
+            .current_dir(temp.path())
+            .args(&arguments)
+            .env("PATH", prepend_path(&bin))
+            .env("FAKE_GH_TRACE", &trace);
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.assert().success().stdout(
+            predicate::str::contains("version test").or(predicate::str::contains("github.com")),
+        );
+    }
+    let trace = fs::read_to_string(trace).expect("trace");
+    assert!(
+        !trace.contains("auth token"),
+        "commands that never authenticate must not resolve a token: {trace}"
+    );
+}
+
+#[test]
 fn cwd_rules_select_profiles_from_non_git_directories() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let matching = temp.path().join("home/discussions/topic");
