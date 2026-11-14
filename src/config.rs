@@ -5,7 +5,6 @@
 //! data and the cache/state locations derived from XDG variables.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::env;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
@@ -1375,15 +1374,9 @@ fn build_rule_glob(pattern: &str) -> Result<Glob, globset::Error> {
 }
 
 fn expand_home(value: &str) -> String {
-    if value == "~" {
-        return env::var("HOME").unwrap_or_else(|_| value.into());
-    }
-    if let Some(rest) = value.strip_prefix("~/")
-        && let Ok(home) = env::var("HOME")
-    {
-        return format!("{home}/{rest}");
-    }
-    value.to_owned()
+    crate::platform::expand_home_path(Path::new(value))
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Source used by the complete profile-resolution chain.

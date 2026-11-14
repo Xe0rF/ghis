@@ -67,6 +67,27 @@ fn user_home_from_environment(
     }
 }
 
+/// Expand a leading `~` or `~/` using the platform-resolved home directory.
+/// Other forms are returned unchanged, matching the historical behavior.
+pub(crate) fn expand_home_path(path: &Path) -> PathBuf {
+    let home = user_home().ok();
+    expand_home_path_with(path, home.as_deref())
+}
+
+fn expand_home_path_with(path: &Path, home: Option<&Path>) -> PathBuf {
+    let value = path.to_string_lossy();
+    let Some(home) = home else {
+        return path.to_owned();
+    };
+    if value == "~" {
+        return home.to_path_buf();
+    }
+    if let Some(rest) = value.strip_prefix("~/") {
+        return home.join(rest);
+    }
+    path.to_owned()
+}
+
 /// Base directories for user configuration, cache, and state.
 ///
 /// The application owns the namespace below these roots.  Keeping the bases
@@ -248,6 +269,27 @@ mod tests {
         assert_eq!(
             user_home_from_environment(|_| None),
             Err(PlatformError::MissingEnvironment { variable: "HOME" })
+        );
+    }
+
+    #[test]
+    fn expand_home_path_uses_the_resolved_home_directory() {
+        let home = Path::new("/home/alice");
+        assert_eq!(
+            expand_home_path_with(Path::new("~/keys/id.pub"), Some(home)),
+            home.join("keys/id.pub")
+        );
+        assert_eq!(
+            expand_home_path_with(Path::new("~"), Some(home)),
+            home.to_path_buf()
+        );
+        assert_eq!(
+            expand_home_path_with(Path::new("/absolute/key"), Some(home)),
+            PathBuf::from("/absolute/key")
+        );
+        assert_eq!(
+            expand_home_path_with(Path::new("~/unresolved"), None),
+            PathBuf::from("~/unresolved")
         );
     }
 

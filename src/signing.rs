@@ -584,18 +584,7 @@ fn ssh_config_quote_path(path: &Path) -> String {
 }
 
 pub fn expand_user(path: &Path) -> PathBuf {
-    let value = path.to_string_lossy();
-    if value == "~" {
-        return env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| path.to_owned());
-    }
-    if let Some(rest) = value.strip_prefix("~/")
-        && let Some(home) = env::var_os("HOME")
-    {
-        return PathBuf::from(home).join(rest);
-    }
-    path.to_owned()
+    crate::platform::expand_home_path(path)
 }
 
 fn is_executable(path: &Path) -> bool {
