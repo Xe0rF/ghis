@@ -438,3 +438,43 @@ exit 92
         "gh must not be invoked before rejecting the missing matching remote"
     );
 }
+
+#[test]
+fn remote_names_containing_dots_still_feed_host_and_owner_rules() {
+    let temporary = TempDir::new().expect("temporary directory");
+    let root = temporary.path();
+    let config = root.join("config/ghis/config.toml");
+    fs::create_dir_all(config.parent().expect("config parent")).expect("config directory");
+    fs::write(
+        &config,
+        r#"version = 1
+
+[profiles.public]
+host = "github.com"
+login = "public"
+git_name = "Public Identity"
+git_email = "public@example.test"
+
+[[rules]]
+id = "github-acme"
+profile = "public"
+priority = 10
+host = "github.com"
+owner = "acme"
+"#,
+    )
+    .expect("config");
+    let repository = initialize_repository(root, "dotted-remote");
+    require_git(
+        root,
+        &repository,
+        &[
+            "remote",
+            "add",
+            "corp.git",
+            "https://github.com/acme/project.git",
+        ],
+    );
+
+    assert_eq!(profile_name(root, &repository), "Public Identity");
+}

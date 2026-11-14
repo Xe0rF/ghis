@@ -984,12 +984,14 @@ pub fn remotes(repository: &Repository) -> Result<Vec<Remote>> {
         let Some((key, value)) = line.split_once('\t').or_else(|| line.split_once(' ')) else {
             continue;
         };
-        let mut parts = key.split('.');
-        if parts.next() != Some("remote") {
+        let Some(key) = key.strip_prefix("remote.") else {
             continue;
-        }
-        let Some(name) = parts.next() else { continue };
-        let Some(kind) = parts.next() else { continue };
+        };
+        // Remote names may contain dots, so split at the last dot instead of
+        // assuming `remote.NAME.KIND`.
+        let Some((name, kind)) = key.rsplit_once('.') else {
+            continue;
+        };
         let entry = values.entry(name.to_owned()).or_default();
         match kind {
             "url" if entry.0.is_none() => entry.0 = Some(value.trim().to_owned()),
