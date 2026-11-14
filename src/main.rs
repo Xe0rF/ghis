@@ -3454,10 +3454,19 @@ fn teardown(path: Option<&Path>, args: TeardownArgs) -> app::Result<i32> {
     let startup_file = renderer.startup_file(&home);
     let init_file = paths.config_dir.join(renderer.spec().init_file_name());
     let cwd = args.repo.unwrap_or(std::env::current_dir()?);
-    let ctx = context(path, None, &cwd)?;
+    let ctx = match context(path, None, &cwd) {
+        Ok(ctx) => Some(ctx),
+        Err(error) if args.purge => {
+            // `--purge` is the documented recovery path for a broken
+            // configuration; keep going without identity resolution.
+            eprintln!("ghis: 无法加载当前配置（{error}）；继续清理当前 namespace");
+            None
+        }
+        Err(error) => return Err(error),
+    };
     let project_root = ctx
-        .repository
         .as_ref()
+        .and_then(|ctx| ctx.repository.as_ref())
         .map(|repository| repository.command_dir().to_path_buf())
         .unwrap_or_else(|| cwd.clone());
     let user_settings = claude_settings_path(AgentScope::User, None)?;
@@ -3473,10 +3482,12 @@ fn teardown(path: Option<&Path>, args: TeardownArgs) -> app::Result<i32> {
             "  全局 Git 基线：{}",
             baseline::baseline_path(&paths).display()
         );
-        if let Some(repository) = &ctx.repository {
+        if let Some(repository) = ctx.as_ref().and_then(|ctx| ctx.repository.as_ref()) {
             println!("  仓库绑定：{}", repository.command_dir().display());
-        } else {
+        } else if ctx.is_some() {
             println!("  仓库绑定：跳过（{} 不是 Git 仓库）", cwd.display());
+        } else {
+            println!("  仓库绑定：跳过（配置无法加载）");
         }
         if args.purge {
             println!("将删除当前配置 namespace 中的用户数据：");
@@ -3524,11 +3535,15 @@ fn teardown(path: Option<&Path>, args: TeardownArgs) -> app::Result<i32> {
         }
     );
 
-    if ctx.repository.is_some() {
-        app::unbind_repository(&ctx)?;
-        println!("仓库集成：已撤销（{}）", cwd.display());
+    if let Some(ctx) = ctx.as_ref() {
+        if ctx.repository.is_some() {
+            app::unbind_repository(ctx)?;
+            println!("仓库集成：已撤销（{}）", cwd.display());
+        } else {
+            println!("仓库集成：跳过（{} 不是 Git 仓库）", cwd.display());
+        }
     } else {
-        println!("仓库集成：跳过（{} 不是 Git 仓库）", cwd.display());
+        println!("仓库集成：跳过（配置无法加载）");
     }
 
     if args.purge {

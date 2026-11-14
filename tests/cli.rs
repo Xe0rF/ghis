@@ -3218,6 +3218,31 @@ fn teardown_dry_run_preserves_state_and_purge_removes_only_ghis_owned_data() {
 }
 
 #[test]
+fn teardown_purge_still_works_when_the_config_is_corrupt() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let config_directory = temp.path().join("config/ghis");
+    fs::create_dir_all(&config_directory).expect("config directory");
+    fs::write(
+        config_directory.join("config.toml"),
+        "this is not = [valid toml",
+    )
+    .expect("corrupt config");
+
+    let mut teardown = isolated_ghis_command();
+    teardown
+        .current_dir(temp.path())
+        .args(["teardown", "--purge", "--yes"]);
+    for (key, value) in xdg_environment(&temp) {
+        teardown.env(key, value);
+    }
+    teardown.assert().success();
+
+    assert!(!config_directory.join("config.toml").exists());
+    assert!(!temp.path().join("cache/ghis").exists());
+    assert!(!temp.path().join("state/ghis").exists());
+}
+
+#[test]
 fn teardown_excludes_concurrent_namespace_writers() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let environment = xdg_environment(&temp);
