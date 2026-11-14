@@ -977,6 +977,107 @@ fi
 }
 
 #[test]
+fn unresolved_fail_blocks_gh_commands_that_cannot_be_proven_read_only() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let directory = temp.path().join("config/ghis");
+    fs::create_dir_all(&directory).expect("config directory");
+    fs::write(
+        directory.join("config.toml"),
+        r#"version = 1
+
+[behavior]
+unresolved = "fail"
+
+[profiles.alice]
+host = "git.company.test"
+login = "alice"
+git_name = "Alice"
+git_email = "alice@example.test"
+"#,
+    )
+    .expect("config");
+
+    let repository = temp.path().join("repo");
+    fs::create_dir_all(&repository).expect("repository directory");
+    let git = |arguments: &[&str]| {
+        assert!(
+            Command::new("git")
+                .args(arguments)
+                .current_dir(&repository)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .expect("git")
+                .success(),
+            "git {arguments:?}"
+        );
+    };
+    git(&["init", "-q"]);
+    git(&[
+        "remote",
+        "add",
+        "origin",
+        "https://git.example.com/acme/repo.git",
+    ]);
+
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).expect("bin directory");
+    let trace = temp.path().join("trace");
+    write_executable(
+        &bin.join("gh"),
+        "#!/bin/sh\nprintf 'run:%s\\n' \"$*\" >> \"$FAKE_GH_TRACE\"\n",
+    );
+
+    let run = |arguments: &[&str]| {
+        let mut command = isolated_ghis_command();
+        command
+            .current_dir(&repository)
+            .args(arguments)
+            .env("PATH", prepend_path(&bin))
+            .env("FAKE_GH_TRACE", &trace);
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.output().expect("run ghis")
+    };
+
+    for blocked in [
+        vec![
+            "gh",
+            "--",
+            "--repo",
+            "owner/repo",
+            "pr",
+            "create",
+            "--title",
+            "x",
+        ],
+        vec!["gh", "--", "secret", "set", "NAME"],
+    ] {
+        let output = run(&blocked);
+        assert!(
+            !output.status.success(),
+            "{blocked:?} must stop: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("unresolved=fail"),
+            "{blocked:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!trace.exists(), "{blocked:?} must not execute gh");
+    }
+
+    let allowed = run(&["gh", "--", "version"]);
+    assert!(
+        allowed.status.success(),
+        "a proven read-only command must still run: {}",
+        String::from_utf8_lossy(&allowed.stderr)
+    );
+    assert!(trace.exists(), "the read-only command must reach gh");
+}
+
+#[test]
 fn enterprise_gh_wrapper_uses_the_enterprise_token_variable() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let directory = temp.path().join("config/ghis");

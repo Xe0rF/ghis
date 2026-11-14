@@ -1742,7 +1742,7 @@ where
     ctx.ensure_selection_available()?;
     if ctx.profile.is_none()
         && ctx.config.behavior.unresolved == config::UnresolvedPolicy::Fail
-        && is_sensitive_operation("gh", args)
+        && is_sensitive_gh_operation(args)
     {
         return Err(AppError::Message(
             "当前仓库身份无法唯一解析，已按 unresolved=fail 停止操作".into(),
@@ -1750,7 +1750,7 @@ where
     }
     if should_display_identity_banner(
         &ctx,
-        is_sensitive_operation("gh", args),
+        is_sensitive_gh_operation(args),
         io::stderr().is_terminal(),
     ) {
         eprintln!("{}", ctx.operation_banner());
@@ -3048,23 +3048,41 @@ fn should_display_identity_banner(
         }
 }
 
-fn is_sensitive_operation(command: &str, args: &[String]) -> bool {
-    let first = if command == "git" {
-        git_subcommand(args)
-    } else {
-        args.first().map(String::as_str).unwrap_or_default()
-    };
-    if command == "git" {
-        matches!(
-            first,
-            "commit" | "push" | "pull" | "fetch" | "clone" | "submodule"
-        )
-    } else {
-        matches!(
-            first,
-            "pr" | "issue" | "project" | "repo" | "release" | "run" | "workflow" | "auth"
-        )
+/// Top-level `gh` commands that cannot mutate repository state and are
+/// therefore safe to run with the ambient identity when `unresolved = fail`.
+fn gh_read_only_command(command: &str) -> bool {
+    matches!(
+        command,
+        "help" | "version" | "completion" | "status" | "search" | "browse"
+    )
+}
+
+/// Whether a `gh` invocation may mutate repository state.  Commands whose
+/// top-level name cannot be determined are treated as sensitive so the
+/// fail-closed policy cannot be bypassed by an unknown flag or wrapper.
+fn is_sensitive_gh_operation(args: &[String]) -> bool {
+    gh_top_level_command(args).is_none_or(|command| !gh_read_only_command(command))
+}
+
+/// First positional token of a `gh` invocation, skipping the global flags
+/// that may legally precede the command.  Returns `None` for `--` or an
+/// unrecognized option: the command cannot then be proven read-only.
+fn gh_top_level_command(args: &[String]) -> Option<&str> {
+    let mut index = 0usize;
+    while let Some(argument) = args.get(index).map(String::as_str) {
+        match argument {
+            "--" => return None,
+            "-R" | "--repo" | "--hostname" => index += 2,
+            _ if argument.starts_with("--repo=") || argument.starts_with("--hostname=") => {
+                index += 1;
+            }
+            "--help" | "-h" => return Some("help"),
+            "--version" => return Some("version"),
+            _ if argument.starts_with('-') => return None,
+            _ => return Some(argument),
+        }
     }
+    None
 }
 
 fn git_subcommand(args: &[String]) -> &str {
