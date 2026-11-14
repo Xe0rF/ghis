@@ -3135,7 +3135,13 @@ fn teardown_dry_run_preserves_state_and_purge_removes_only_ghis_owned_data() {
     fs::create_dir_all(&repository_subdirectory).expect("repository subdirectory");
 
     let configure = |command: &mut AssertCommand| {
-        command.current_dir(&repository).env("SHELL", "/bin/zsh");
+        // Ambient shell hints would override the login shell this test
+        // controls, so implicit teardown must resolve through SHELL alone.
+        command
+            .current_dir(&repository)
+            .env("SHELL", "/bin/zsh")
+            .env_remove("ZDOTDIR")
+            .env_remove("PSModulePath");
         for (key, value) in &environment {
             command.env(key, value);
         }
