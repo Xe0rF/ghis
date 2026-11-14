@@ -294,7 +294,9 @@ pub fn setup_rendered(drop_in: &Path, init_script: &str) -> io::Result<SetupRepo
             backup: None,
             changed: false,
         }),
-        Some(existing) if is_managed_drop_in(&existing) => {
+        Some(existing) if existing.trim().is_empty() || is_managed_drop_in(&existing) => {
+            // An empty drop-in is what uninstall leaves behind for a
+            // symlinked entry; it holds no user content and stays recoverable.
             drop_in.write(init_script.as_bytes())?;
             Ok(SetupReport {
                 zshrc: drop_in.requested().to_path_buf(),
@@ -354,6 +356,47 @@ fn is_managed_drop_in(contents: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn setup_recovers_a_symlinked_drop_in_after_uninstall() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let target = directory.path().join("dotfiles/ghis.fish");
+        fs::create_dir_all(target.parent().expect("target parent")).expect("dotfiles directory");
+        let script = fish_init_script("ghis");
+        fs::write(&target, &script).expect("managed target");
+        let drop_in = directory.path().join("conf.d/ghis.fish");
+        fs::create_dir_all(drop_in.parent().expect("drop-in parent")).expect("conf.d directory");
+        symlink(&target, &drop_in).expect("symlink");
+
+        let report = setup_rendered(&drop_in, &script).expect("initial setup");
+        assert!(!report.changed);
+        assert!(uninstall(&drop_in).expect("uninstall"));
+        assert_eq!(fs::read_to_string(&target).expect("emptied target"), "");
+        assert!(
+            fs::symlink_metadata(&drop_in)
+                .expect("drop-in metadata")
+                .file_type()
+                .is_symlink(),
+            "uninstall must keep the user's symlink"
+        );
+
+        let report = setup_rendered(&drop_in, &script).expect("re-setup after uninstall");
+        assert!(report.changed);
+        assert_eq!(
+            fs::read_to_string(&target).expect("rewritten target"),
+            script
+        );
+        assert!(
+            fs::symlink_metadata(&drop_in)
+                .expect("drop-in metadata")
+                .file_type()
+                .is_symlink(),
+            "setup must write through the symlink"
+        );
+    }
 
     #[test]
     fn quote_handles_paths_with_spaces_and_apostrophes() {
