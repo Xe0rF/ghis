@@ -753,14 +753,22 @@ fn forget_repository(ctx: &AppContext, action: AuditAction) {
 }
 
 fn unset_profile_include(ctx: &AppContext, repository: &Repository, key: &str) -> Result<()> {
-    for value in ghis_owned_include_values(ctx, repository, key)? {
-        repo::unset_local_config_value(repository, key, &value)?;
-        if !repository.bare {
-            // Before worktreeConfig support, ghis wrote this gitdir-specific key
-            // into the shared config. Remove that legacy value as part of bind and
-            // unbind so an old fragment cannot become active again later.
-            repo::unset_common_config_value(repository, key, &value)?;
+    if profile_include_keys().iter().any(|owned| owned == key) {
+        // Only the values ghis wrote are removed; the same key may also carry
+        // includes the user added for this repository.
+        for value in ghis_owned_include_values(ctx, repository, key)? {
+            repo::unset_local_config_value(repository, key, &value)?;
+            if !repository.bare {
+                repo::unset_common_config_value(repository, key, &value)?;
+            }
         }
+        return Ok(());
+    }
+    // The `includeIf.gitdir:...` spellings were written only by older ghis, so
+    // clearing the whole key is the migration for that spelling.
+    repo::unset_local_config(repository, key)?;
+    if !repository.bare {
+        repo::unset_common_config(repository, key)?;
     }
     Ok(())
 }
