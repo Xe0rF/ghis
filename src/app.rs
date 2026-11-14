@@ -3819,12 +3819,15 @@ fn inspect_repository_auth_config(ctx: &AppContext) -> Result<()> {
     let output = if ctx.url_target.is_some() {
         // A clone reads only global, system and command-scope configuration,
         // not the local configuration of the enclosing repository.
-        repo::git_config_outside_repository(["config", "--get-regexp", QUERY])?
+        repo::git_config_outside_repository(["config", "--null", "--get-regexp", QUERY])?
     } else {
         let Some(repository) = ctx.repository.as_ref() else {
             return Ok(());
         };
-        git::run_git(repository.command_dir(), ["config", "--get-regexp", QUERY])?
+        git::run_git(
+            repository.command_dir(),
+            ["config", "--null", "--get-regexp", QUERY],
+        )?
     };
     if !output.status.success() {
         if output.status.code() == Some(1) {
@@ -3835,8 +3838,15 @@ fn inspect_repository_auth_config(ctx: &AppContext) -> Result<()> {
         ));
     }
     let stdout = Zeroizing::new(output.stdout);
-    for line in String::from_utf8_lossy(&stdout).lines() {
-        let Some((key, value)) = line.split_once([' ', '\t']) else {
+    // `--null` separates records with NUL and key from value with a newline.
+    // Parsing line by line would let an extraheader whose value contains a
+    // newline hide an `Authorization` line in a second output line.
+    for record in stdout.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        let record = String::from_utf8_lossy(record);
+        let Some((key, value)) = record.split_once('\n') else {
             continue;
         };
         let key = key.to_ascii_lowercase();

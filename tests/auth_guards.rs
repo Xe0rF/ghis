@@ -242,6 +242,61 @@ fn dangerous_https_auth_sources_are_rejected_without_leaking_values() {
 }
 
 #[test]
+fn an_embedded_newline_cannot_hide_an_authorization_extraheader() {
+    let temporary = tempfile::tempdir().expect("temporary directory");
+    let root = temporary.path();
+    let repository = init_repository(root);
+    let config = write_config(root, "external", None);
+    let mut bind = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    bind.args([
+        "--config",
+        config.to_str().expect("UTF-8 config path"),
+        "use",
+        "work",
+        "--repo",
+        repository.to_str().expect("UTF-8 repository path"),
+    ])
+    .env("GIT_CONFIG_GLOBAL", "/dev/null");
+    apply_environment(&mut bind, root);
+    bind.assert().success();
+    assert!(
+        Command::new("git")
+            .args([
+                "remote",
+                "add",
+                "origin",
+                "https://github.com/example/project.git",
+            ])
+            .current_dir(&repository)
+            .status()
+            .expect("git remote add")
+            .success()
+    );
+    let global_config = root.join("global.gitconfig");
+    assert!(
+        Command::new("git")
+            .args(["config", "--file"])
+            .arg(&global_config)
+            .arg("http.https://github.com/.extraheader")
+            .arg("X-Trace: harmless\nAuthorization: Bearer top-secret")
+            .status()
+            .expect("write multi-line header")
+            .success()
+    );
+    let mut header = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+    header
+        .current_dir(&repository)
+        .args(["git", "--", "fetch", "origin"])
+        .env("GIT_CONFIG_GLOBAL", &global_config);
+    apply_environment(&mut header, root);
+    header
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("Authorization extraHeader"))
+        .stderr(predicate::str::contains("top-secret").not());
+}
+
+#[test]
 fn non_profile_https_host_keeps_its_existing_helper_chain() {
     let temporary = tempfile::tempdir().expect("temporary directory");
     let root = temporary.path();
