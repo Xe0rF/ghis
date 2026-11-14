@@ -2869,6 +2869,44 @@ fn agent_setup_claude_requires_confirmation_before_writing_settings() {
 }
 
 #[test]
+fn agent_setup_claude_passes_the_selected_config_to_the_hook() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let config = temp.path().join("custom/identity.toml");
+    fs::create_dir_all(config.parent().expect("config parent")).expect("config directory");
+    fs::write(&config, "version = 1\n").expect("config");
+
+    let mut setup = isolated_ghis_command();
+    setup.args([
+        "--config",
+        config.to_str().expect("UTF-8 config path"),
+        "agent",
+        "setup",
+        "claude",
+        "--yes",
+    ]);
+    for (key, value) in xdg_environment(&temp) {
+        setup.env(key, value);
+    }
+    setup.assert().success();
+
+    let settings = temp.path().join("home/.claude/settings.json");
+    let settings = fs::read_to_string(&settings).expect("settings file");
+    let value: serde_json::Value = serde_json::from_str(&settings).expect("settings JSON");
+    let command = value["hooks"]["SessionStart"]
+        .as_array()
+        .and_then(|entries| entries.first())
+        .and_then(|entry| entry["hooks"].as_array())
+        .and_then(|hooks| hooks.first())
+        .and_then(|hook| hook["command"].as_str())
+        .expect("SessionStart hook command");
+    assert!(command.contains("--config"), "{command}");
+    assert!(
+        command.contains(config.to_str().expect("UTF-8 config path")),
+        "{command}"
+    );
+}
+
+#[test]
 fn onboard_rejects_noninteractive_input_without_writing_config() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let mut command = isolated_ghis_command();

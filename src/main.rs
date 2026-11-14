@@ -821,14 +821,17 @@ fn agent_command(
             project,
             yes,
         } => {
-            let path = claude_settings_path(scope, project)?;
+            let settings_path = claude_settings_path(scope, project)?;
             if !yes && !io::stdin().is_terminal() {
                 return Err(app::AppError::Message(
                     "非交互环境请明确使用 `ghis agent setup claude --yes`".into(),
                 ));
             }
             if !yes {
-                eprint!("将更新 Claude Code 设置 {}，继续吗？[y/N] ", path.display());
+                eprint!(
+                    "将更新 Claude Code 设置 {}，继续吗？[y/N] ",
+                    settings_path.display()
+                );
                 io::stderr().flush()?;
                 let mut answer = String::new();
                 io::stdin().read_line(&mut answer)?;
@@ -837,13 +840,16 @@ fn agent_command(
                     return Ok(0);
                 }
             }
-            let changed =
-                ghis::agent::claude::setup_settings(&path, Path::new(&agent_binary()), None)
-                    .map_err(|error| app::AppError::Message(error.to_string()))?;
+            let changed = ghis::agent::claude::setup_settings(
+                &settings_path,
+                Path::new(&agent_binary()),
+                path,
+            )
+            .map_err(|error| app::AppError::Message(error.to_string()))?;
             println!(
                 "Claude Code Hook {}：{}",
                 if changed { "已安装" } else { "无需更新" },
-                path.display()
+                settings_path.display()
             );
             Ok(0)
         }
