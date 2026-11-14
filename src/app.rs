@@ -666,7 +666,7 @@ pub fn bind_repository(ctx: &AppContext, id: &str) -> Result<()> {
     git::set_git_config(repository, PROFILE_CONFIG_KEY, id)?;
     let include_keys = profile_include_keys();
     for old_key in profile_include_cleanup_keys(repository) {
-        unset_profile_include(repository, &old_key)?;
+        unset_profile_include(ctx, repository, &old_key)?;
     }
     for include_key in &include_keys {
         repo::add_local_config(repository, include_key, fragment.to_string_lossy().as_ref())?;
@@ -691,7 +691,7 @@ pub fn unbind_repository(ctx: &AppContext) -> Result<()> {
         .ok_or_else(|| AppError::Message("当前目录不是 Git 仓库".into()))?;
     git::unset_git_config(repository, PROFILE_CONFIG_KEY)?;
     for include_key in profile_include_cleanup_keys(repository) {
-        unset_profile_include(repository, &include_key)?;
+        unset_profile_include(ctx, repository, &include_key)?;
     }
     remove_managed_credential_helpers(repository)?;
     if git::supports_named_hooks() {
@@ -752,15 +752,38 @@ fn forget_repository(ctx: &AppContext, action: AuditAction) {
     }
 }
 
-fn unset_profile_include(repository: &Repository, key: &str) -> Result<()> {
-    repo::unset_local_config(repository, key)?;
-    if !repository.bare {
-        // Before worktreeConfig support, ghis wrote this gitdir-specific key
-        // into the shared config. Remove that legacy value as part of bind and
-        // unbind so an old fragment cannot become active again later.
-        repo::unset_common_config(repository, key)?;
+fn unset_profile_include(ctx: &AppContext, repository: &Repository, key: &str) -> Result<()> {
+    for value in ghis_owned_include_values(ctx, repository, key)? {
+        repo::unset_local_config_value(repository, key, &value)?;
+        if !repository.bare {
+            // Before worktreeConfig support, ghis wrote this gitdir-specific key
+            // into the shared config. Remove that legacy value as part of bind and
+            // unbind so an old fragment cannot become active again later.
+            repo::unset_common_config_value(repository, key, &value)?;
+        }
     }
     Ok(())
+}
+
+/// Values of one include key that point into ghis's fragment directory.
+/// Everything else under the same key belongs to the user and stays untouched.
+fn ghis_owned_include_values(
+    ctx: &AppContext,
+    repository: &Repository,
+    key: &str,
+) -> Result<Vec<String>> {
+    let fragments = fs::canonicalize(ctx.paths.config_dir.join("fragments"))
+        .unwrap_or_else(|_| ctx.paths.config_dir.join("fragments"));
+    Ok(repo::config_values(repository, key)?
+        .into_iter()
+        .filter(|value| {
+            let path = signing::expand_user(Path::new(value));
+            fs::canonicalize(&path).map_or_else(
+                |_| path.starts_with(&fragments),
+                |path| path.starts_with(&fragments),
+            )
+        })
+        .collect())
 }
 
 /// The key that exposes the profile fragment to this repository.

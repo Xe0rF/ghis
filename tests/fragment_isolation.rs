@@ -189,3 +189,113 @@ fn profile_identity_wins_over_global_role_specific_config() {
         "global committer.* must not beat the fragment: {committer}"
     );
 }
+
+#[test]
+fn binding_and_unbinding_preserve_user_owned_repository_includes() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let config = temp.path().join("ghis/config.toml");
+    let repository = temp.path().join("repo");
+    write_config(&config, "Worker Identity", "worker@example.test");
+    init_repository(&repository);
+    let user_include = temp.path().join("user.gitconfig");
+    fs::write(&user_include, "[user]\n\tname = Included User\n").expect("user include");
+    assert!(
+        Command::new("git")
+            .args([
+                "config",
+                "--local",
+                "--add",
+                "include.path",
+                user_include.to_str().expect("UTF-8 user include"),
+            ])
+            .current_dir(&repository)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .expect("git config")
+            .success()
+    );
+
+    let ghis = || {
+        let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+        command
+            .env("HOME", temp.path())
+            .env("XDG_CONFIG_HOME", temp.path().join("xdg-config"))
+            .env("XDG_CACHE_HOME", temp.path().join("xdg-cache"))
+            .env("XDG_STATE_HOME", temp.path().join("xdg-state"))
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GHIS_CONFIG")
+            .env_remove("GHIS_PROFILE")
+            .env_remove("GHIS_BANNER_SHOWN")
+            .env_remove("GHIS_WRAPPER_ACTIVE")
+            .env_remove("GHIS_BYPASS")
+            .env_remove("GHIS_DISABLE_CHPWD");
+        command
+    };
+    let include_values = |repository: &Path| {
+        let output = Command::new("git")
+            .args(["config", "--get-all", "include.path"])
+            .current_dir(repository)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .expect("git config");
+        assert!(
+            output.status.success() || output.status.code() == Some(1),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::to_owned)
+            .collect::<Vec<_>>()
+    };
+
+    ghis()
+        .args([
+            "--config",
+            config.to_str().expect("UTF-8 config path"),
+            "use",
+            "work",
+            "--repo",
+            repository.to_str().expect("UTF-8 repository path"),
+        ])
+        .assert()
+        .success();
+
+    let bound = include_values(&repository);
+    assert!(
+        bound
+            .iter()
+            .any(|value| value == user_include.to_str().expect("UTF-8 user include")),
+        "the user's include must survive binding: {bound:?}"
+    );
+    assert!(
+        bound.iter().any(|value| value.contains("/fragments/")),
+        "ghis must add its fragment include: {bound:?}"
+    );
+
+    ghis()
+        .args([
+            "--config",
+            config.to_str().expect("UTF-8 config path"),
+            "unbind",
+            "--repo",
+            repository.to_str().expect("UTF-8 repository path"),
+        ])
+        .assert()
+        .success();
+
+    let remaining = include_values(&repository);
+    assert_eq!(
+        remaining,
+        vec![
+            user_include
+                .to_str()
+                .expect("UTF-8 user include")
+                .to_owned()
+        ],
+        "unbind must remove only ghis's include"
+    );
+}

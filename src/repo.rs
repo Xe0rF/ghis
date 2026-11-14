@@ -1142,6 +1142,31 @@ pub fn local_config_values(repository: &Repository, key: &str) -> Result<Vec<Str
     ))
 }
 
+/// Every value of `key` as Git resolves it for this repository, across all
+/// scopes. Callers use this only to identify values ghis owns; removals are
+/// still scoped to the repository configuration.
+pub fn config_values(repository: &Repository, key: &str) -> Result<Vec<String>> {
+    let out = run_git(
+        repository.command_dir(),
+        ["config", "--null", "--get-all", key],
+    )?;
+    if out.status.success() {
+        let mut values = out
+            .stdout
+            .split(|byte| *byte == 0)
+            .map(|value| String::from_utf8_lossy(value).into_owned())
+            .collect::<Vec<_>>();
+        if values.last().is_some_and(String::is_empty) {
+            values.pop();
+        }
+        return Ok(values);
+    }
+    if out.status.code() == Some(1) {
+        return Ok(Vec::new());
+    }
+    Err(command_error(format!("config --get-all {key}"), &out))
+}
+
 /// Return repository-local config keys matching a Git config regular
 /// expression. Values are deliberately not returned so callers cannot
 /// accidentally include credentials in diagnostics.
@@ -1231,6 +1256,31 @@ pub fn unset_local_config_value(repository: &Repository, key: &str, value: &str)
     } else {
         Err(command_error(
             format!("config {scope} --fixed-value --unset-all {key}"),
+            &out,
+        ))
+    }
+}
+
+/// Remove every shared-config entry exactly equal to `value` while retaining
+/// different values under the same key. This is the legacy counterpart of
+/// [`unset_local_config_value`].
+pub fn unset_common_config_value(repository: &Repository, key: &str, value: &str) -> Result<()> {
+    let out = run_git(
+        repository.command_dir(),
+        [
+            "config",
+            LOCAL_CONFIG_SCOPE,
+            "--fixed-value",
+            "--unset-all",
+            key,
+            value,
+        ],
+    )?;
+    if out.status.success() || matches!(out.status.code(), Some(1 | 5)) {
+        Ok(())
+    } else {
+        Err(command_error(
+            format!("config {LOCAL_CONFIG_SCOPE} --fixed-value --unset-all {key}"),
             &out,
         ))
     }

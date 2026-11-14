@@ -115,8 +115,60 @@ fn setup_collapses_duplicate_entries_for_its_own_path() {
 }
 
 #[test]
+fn setup_keeps_unrelated_global_include_entries() {
+    let fixture = Fixture::new();
+    let user_include = fixture.temp.path().join("user.gitconfig");
+    fs::write(&user_include, "[user]\n\tname = Included User\n").expect("user include");
+    for value in [
+        user_include.to_str().expect("UTF-8 user include"),
+        fixture.baseline().to_str().expect("UTF-8 baseline"),
+        fixture.baseline().to_str().expect("UTF-8 baseline"),
+    ] {
+        assert!(
+            Command::new("git")
+                .args(["config", "--global", "--add", "include.path", value])
+                .env("GIT_CONFIG_GLOBAL", &fixture.global)
+                .env("GIT_CONFIG_NOSYSTEM", "1")
+                .status()
+                .expect("git config")
+                .success()
+        );
+    }
+
+    fixture
+        .ghis()
+        .args(["gitconfig", "setup"])
+        .assert()
+        .success();
+
+    let text = fixture.global_text();
+    assert_eq!(fixture.include_count(), 1, "{text}");
+    assert!(
+        text.contains(&format!("path = {}", user_include.display())),
+        "an unrelated include must survive setup: {text}"
+    );
+}
+
+#[test]
 fn uninstall_removes_only_the_baseline_include() {
     let fixture = Fixture::new();
+    let user_include = fixture.temp.path().join("user.gitconfig");
+    fs::write(&user_include, "[user]\n\tname = Included User\n").expect("user include");
+    assert!(
+        Command::new("git")
+            .args([
+                "config",
+                "--global",
+                "--add",
+                "include.path",
+                user_include.to_str().expect("UTF-8 user include"),
+            ])
+            .env("GIT_CONFIG_GLOBAL", &fixture.global)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .status()
+            .expect("git config")
+            .success()
+    );
     fixture
         .ghis()
         .args(["gitconfig", "setup"])
@@ -131,6 +183,10 @@ fn uninstall_removes_only_the_baseline_include() {
     assert_eq!(fixture.include_count(), 0, "{remaining}");
     assert!(remaining.contains("name = User Choice"), "{remaining}");
     assert!(remaining.contains("defaultBranch = main"), "{remaining}");
+    assert!(
+        remaining.contains(&format!("path = {}", user_include.display())),
+        "an unrelated include must survive uninstall: {remaining}"
+    );
     assert!(!fixture.baseline().exists());
     // A second uninstall finds nothing and still succeeds.
     fixture

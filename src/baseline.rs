@@ -103,8 +103,13 @@ pub fn install(paths: &ConfigPaths) -> Result<InstallOutcome> {
     let include_changed = if matches.len() == 1 {
         false
     } else {
-        if !matches.is_empty() {
-            run_git(paths, &["--unset-all", INCLUDE_KEY])?;
+        // Remove only the entries whose value is ghis's own path, keeping any
+        // unrelated include the user added under the same key.
+        for value in &matches {
+            run_git(
+                paths,
+                &["--fixed-value", "--unset-all", INCLUDE_KEY, value.as_str()],
+            )?;
         }
         run_git(
             paths,
@@ -125,16 +130,14 @@ pub fn uninstall(paths: &ConfigPaths) -> Result<bool> {
     let matches = includes(paths, &path)?;
     let mut changed = false;
     if !matches.is_empty() {
-        // `--fixed-value` plus the exact path removes only ghis's own entries.
-        run_git(
-            paths,
-            &[
-                "--fixed-value",
-                "--unset-all",
-                INCLUDE_KEY,
-                path.to_string_lossy().as_ref(),
-            ],
-        )?;
+        // `--fixed-value` plus the exact value removes only ghis's own
+        // entries, including ones written with a `~/...` spelling.
+        for value in &matches {
+            run_git(
+                paths,
+                &["--fixed-value", "--unset-all", INCLUDE_KEY, value.as_str()],
+            )?;
+        }
         changed = true;
     }
     match fs::remove_file(&path) {
