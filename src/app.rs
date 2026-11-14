@@ -1785,8 +1785,17 @@ where
             .and_then(|remote| remote.host.as_deref()),
     )?;
     if gh_auth_mutates_keyring(&view) {
-        if view.subcommand == Some("refresh") {
-            ensure_gh_refresh_targets_profile(profile)?;
+        match view.subcommand {
+            Some("refresh") => ensure_gh_auth_targets_profile(profile, "refresh", None)?,
+            Some("logout") => {
+                let requested_user = view
+                    .option_values
+                    .iter()
+                    .find(|(name, _)| *name == "user")
+                    .map(|(_, value)| *value);
+                ensure_gh_auth_targets_profile(profile, "logout", requested_user)?;
+            }
+            _ => {}
         }
         // gh refuses to change the keyring while GH_TOKEN is set, and a missing
         // or expired token must not block the command that repairs it.
@@ -1853,11 +1862,25 @@ fn gh_auth_mutates_keyring(view: &GhArgumentView<'_>) -> bool {
         )
 }
 
-/// `gh auth refresh` only touches the account that is active for the host.
-/// ghis never switches accounts, so a different active account stops the
-/// command with the exact sequence the caller can run instead.
-fn ensure_gh_refresh_targets_profile(profile: &Profile) -> Result<()> {
+/// `gh auth refresh` and `gh auth logout` only touch the account that is
+/// active for the host unless `logout` names one explicitly.  ghis never
+/// switches accounts, so a different target stops the command with the exact
+/// sequence the caller can run instead.
+fn ensure_gh_auth_targets_profile(
+    profile: &Profile,
+    operation: &str,
+    requested_user: Option<&str>,
+) -> Result<()> {
     let host = git::normalize_host(&profile.host);
+    if let Some(user) = requested_user {
+        if user.eq_ignore_ascii_case(&profile.login) {
+            return Ok(());
+        }
+        return Err(AppError::Message(format!(
+            "gh {operation} 指定了账号 {user}，但当前 Profile 是 {}；ghis 只操作所选 Profile 的 keyring 条目",
+            profile.login
+        )));
+    }
     let discovery = github::discover_accounts(Some(&profile.host))?;
     let active = discovery
         .accounts
@@ -1865,7 +1888,7 @@ fn ensure_gh_refresh_targets_profile(profile: &Profile) -> Result<()> {
         .find(|account| account.active && git::normalize_host(&account.host) == host);
     let Some(active) = active else {
         return Err(AppError::Message(format!(
-            "gh 在 {host} 上没有报告活动账号，无法确定 refresh 会作用于哪个账号；ghis 不会替你切换账号。请先运行 `gh auth switch --hostname {host} --user {}`",
+            "gh 在 {host} 上没有报告活动账号，无法确定 {operation} 会作用于哪个账号；ghis 不会替你切换账号。请先运行 `gh auth switch --hostname {host} --user {}`",
             profile.login
         )));
     };
@@ -1873,7 +1896,7 @@ fn ensure_gh_refresh_targets_profile(profile: &Profile) -> Result<()> {
         return Ok(());
     }
     Err(AppError::Message(format!(
-        "gh 在 {host} 上的活动账号是 {}，与当前 Profile 的 {} 不一致，已停止 refresh（ghis 不会替你切换账号）。请依次运行：`gh auth switch --hostname {host} --user {}`，`gh auth refresh --hostname {host} <原参数>`，`gh auth switch --hostname {host} --user {}`",
+        "gh 在 {host} 上的活动账号是 {}，与当前 Profile 的 {} 不一致，已停止 {operation}（ghis 不会替你切换账号）。请依次运行：`gh auth switch --hostname {host} --user {}`，`gh auth {operation} --hostname {host} <原参数>`，`gh auth switch --hostname {host} --user {}`",
         active.login, profile.login, profile.login, active.login
     )))
 }
@@ -2581,6 +2604,7 @@ fn gh_long_option_takes_value(command: &str, subcommand: Option<&str>, name: &st
             | ("gist", Some("view"), "filename")
             | ("project", Some("item-add"), "url")
             | ("attestation", _, "owner")
+            | ("auth", Some("logout"), "user")
     ) {
         return true;
     }
@@ -2786,6 +2810,7 @@ fn gh_short_value_option(
     let option = match (command, subcommand, short) {
         ("browse", None, 'b') => "branch",
         ("browse", None, 'c') => "commit",
+        ("auth", Some("logout"), 'u') => "user",
         ("gist", Some("create"), 'd') => "desc",
         ("gist", Some("create" | "edit" | "view"), 'f') => "filename",
         ("gist", Some("edit"), 'a') => "add",

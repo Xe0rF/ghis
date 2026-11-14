@@ -1976,6 +1976,107 @@ exit 62
 }
 
 #[test]
+fn gh_auth_logout_requires_the_profile_account() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    write_default_profile(&temp);
+    let bin = temp.path().join("bin");
+    fs::create_dir_all(&bin).expect("bin directory");
+    write_executable(
+        &bin.join("gh"),
+        r#"#!/bin/sh
+printf '%s host=%s\n' "$*" "${GH_HOST-}" >> "$FAKE_GH_TRACE"
+case "$*" in
+  "auth status --json hosts --hostname github.com")
+    printf '{"hosts":{"github.com":[{"host":"github.com","login":"alice","active":false,"state":"success"},{"host":"github.com","login":"%s","active":true,"state":"success"}]}}\n' "${FAKE_GH_ACTIVE}"
+    exit 0 ;;
+  "auth logout"*)
+    [ -z "${GH_TOKEN+x}" ] || exit 71
+    exit 0 ;;
+esac
+exit 62
+"#,
+    );
+
+    let run = |arguments: &[&str], active: &str, trace: &Path| {
+        let mut command = isolated_ghis_command();
+        command
+            .current_dir(temp.path())
+            .arg("gh")
+            .arg("--")
+            .args(arguments)
+            .env("PATH", prepend_path(&bin))
+            .env("FAKE_GH_TRACE", trace)
+            .env("FAKE_GH_ACTIVE", active);
+        for (key, value) in xdg_environment(&temp) {
+            command.env(key, value);
+        }
+        command.output().expect("run ghis")
+    };
+
+    let other = temp.path().join("gh-other.trace");
+    let output = run(&["auth", "logout"], "someone-else", &other);
+    assert!(
+        !output.status.success(),
+        "logout must stop for another active account"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("与当前 Profile 的 alice 不一致"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let trace = fs::read_to_string(&other).expect("trace");
+    assert!(!trace.contains("auth logout"), "{trace}");
+
+    let matching = temp.path().join("gh-matching.trace");
+    let output = run(&["auth", "logout"], "alice", &matching);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let trace = fs::read_to_string(&matching).expect("trace");
+    assert!(trace.contains("auth logout host=github.com"), "{trace}");
+
+    let explicit_other = temp.path().join("gh-explicit-other.trace");
+    let output = run(
+        &["auth", "logout", "--user", "someone-else"],
+        "alice",
+        &explicit_other,
+    );
+    assert!(
+        !output.status.success(),
+        "logout must not target another account"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("只操作所选 Profile"),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !fs::read_to_string(&explicit_other)
+            .unwrap_or_default()
+            .contains("auth logout")
+    );
+
+    let explicit_profile = temp.path().join("gh-explicit-profile.trace");
+    let output = run(
+        &["auth", "logout", "-u", "alice"],
+        "someone-else",
+        &explicit_profile,
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let trace = fs::read_to_string(&explicit_profile).expect("trace");
+    assert!(
+        trace.contains("auth logout -u alice host=github.com"),
+        "{trace}"
+    );
+}
+
+#[test]
 fn cwd_rules_select_profiles_from_non_git_directories() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let matching = temp.path().join("home/discussions/topic");
