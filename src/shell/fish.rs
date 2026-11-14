@@ -170,7 +170,9 @@ end
 # Read-only Git commands retain Git's ordinary argv, cwd, streams and exit code.
 function ghis_git_read_only
     set -l ghis_option_arg 0
-    for ghis_arg in $argv
+    while test (count $argv) -gt 0
+        set -l ghis_arg $argv[1]
+        set -e argv[1]
         if test $ghis_option_arg -eq 1
             set ghis_option_arg 0
             continue
@@ -181,7 +183,20 @@ function ghis_git_read_only
             case '--git-dir=*' '--work-tree=*' '--namespace=*' '--super-prefix=*'
             case --
             case '-*'
-            case status branch rev-parse rev-list describe diff log show shortlog remote ls-files ls-tree cat-file check-ignore check-attr for-each-ref symbolic-ref name-rev count-objects version help
+            case remote
+                # Only the forms that never contact the remote: bare `remote`,
+                # `-v`, `--verbose` and `get-url`. Other subcommands may fetch
+                # with the ambient credentials and must go through ghis.
+                while test (count $argv) -gt 0
+                    switch $argv[1]
+                        case '-v' --verbose get-url
+                        case '*'
+                            return 1
+                    end
+                    set -e argv[1]
+                end
+                return 0
+            case status branch rev-parse rev-list describe diff log show shortlog ls-files ls-tree cat-file check-ignore check-attr for-each-ref symbolic-ref name-rev count-objects version help
                 return 0
             case '*'
                 return 1

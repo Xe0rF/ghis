@@ -184,7 +184,9 @@ _ghis_dispatch() {{
 ghis_git_read_only() {{
   local ghis_arg
   local ghis_option_arg=0
-  for ghis_arg in "$@"; do
+  while (( $# > 0 )); do
+    ghis_arg=$1
+    shift
     if (( ghis_option_arg )); then
       ghis_option_arg=0
       continue
@@ -199,7 +201,20 @@ ghis_git_read_only() {{
         ;;
       -*)
         ;;
-      status|branch|rev-parse|rev-list|describe|diff|log|show|shortlog|remote|ls-files|ls-tree|cat-file|check-ignore|check-attr|for-each-ref|symbolic-ref|name-rev|count-objects|version|help)
+      remote)
+        # Only the forms that never contact the remote: bare `remote`, `-v`,
+        # `--verbose` and `get-url`. Other subcommands may fetch with the
+        # ambient credentials and must go through ghis.
+        while (( $# > 0 )); do
+          case "$1" in
+            -v|--verbose|get-url) ;;
+            *) return 1 ;;
+          esac
+          shift
+        done
+        return 0
+        ;;
+      status|branch|rev-parse|rev-list|describe|diff|log|show|shortlog|ls-files|ls-tree|cat-file|check-ignore|check-attr|for-each-ref|symbolic-ref|name-rev|count-objects|version|help)
         return 0
         ;;
       *)

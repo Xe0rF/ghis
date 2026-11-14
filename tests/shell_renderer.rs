@@ -26,11 +26,11 @@ fn init_cli_output_bytes_match_goldens() {
     for (shell, expected) in [
         (
             "zsh",
-            "d73ffaf3493e68561014a98e91e72765812d00a5a0d48cdc0a1569e18faebc1b",
+            "78eed4b63836804af6ef59d51c7c2ae86428018d856a888edc7eea0d5fc565e3",
         ),
         (
             "bash",
-            "35aa42338773e44beb62ab4aed40ae674b096b591c702458211b0103fb9cc1c8",
+            "0e6a9e8ba14c951b91abc085ccb99a386da379f9b7012055c0f2cede1d25a624",
         ),
     ] {
         assert_eq!(
@@ -74,6 +74,81 @@ const COMPLETION_SYNTAX_SHELLS: &[&str] = &["zsh", "bash", "fish"];
 
 #[cfg(windows)]
 const COMPLETION_SYNTAX_SHELLS: &[&str] = &["powershell"];
+
+#[cfg(unix)]
+#[test]
+fn rendered_fast_path_keeps_network_remote_subcommands_inside_ghis() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = tempfile::tempdir().expect("temporary directory");
+    let bin = directory.path().join("bin");
+    fs::create_dir_all(&bin).expect("bin directory");
+    let fake_git = bin.join("git");
+    fs::write(&fake_git, "#!/bin/sh\nprintf 'plain-git:%s\\n' \"$*\"\n").expect("fake git");
+    fs::set_permissions(&fake_git, fs::Permissions::from_mode(0o755)).expect("permissions");
+    let path = match std::env::var("PATH") {
+        Ok(value) => format!("{}:{value}", bin.display()),
+        Err(_) => bin.display().to_string(),
+    };
+
+    for (shell, init, interactive_args) in [
+        (
+            "bash",
+            shell_cli_output("init", "bash"),
+            &["--norc", "--noprofile", "-i"][..],
+        ),
+        ("zsh", shell_cli_output("init", "zsh"), &["-f", "-i"][..]),
+    ] {
+        let init_path = directory.path().join(format!("init.{shell}"));
+        fs::write(&init_path, init).expect("init script");
+        let script = format!(
+            r#"source {init_path:?}
+ghis_dispatch() {{ printf 'dispatch:%s\n' "$*"; }}
+git status
+git remote
+git remote -v
+git remote --verbose
+git remote get-url origin
+git remote update
+git remote prune origin
+git remote show origin
+"#
+        );
+        let output = match Command::new(shell)
+            .args(interactive_args)
+            .args(["-c", &script])
+            .env("PATH", &path)
+            .output()
+        {
+            Ok(output) => output,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                eprintln!("{shell} is not installed; skipping rendered fast-path check");
+                continue;
+            }
+            Err(error) => panic!("run {shell}: {error}"),
+        };
+        assert!(
+            output.status.success(),
+            "{shell} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(
+            stdout.lines().collect::<Vec<_>>(),
+            vec![
+                "plain-git:status",
+                "plain-git:remote",
+                "plain-git:remote -v",
+                "plain-git:remote --verbose",
+                "dispatch:git remote get-url origin",
+                "dispatch:git remote update",
+                "dispatch:git remote prune origin",
+                "dispatch:git remote show origin",
+            ],
+            "{shell} fast path misclassified a command: {stdout}"
+        );
+    }
+}
 
 #[test]
 fn completion_scripts_parse_when_their_shell_is_available() {
