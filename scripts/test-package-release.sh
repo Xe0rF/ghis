@@ -7,10 +7,10 @@ trap 'rm -r -- "$tmpdir"' EXIT HUP INT TERM
 
 project_dir="$tmpdir/project"
 tool_dir="$tmpdir/tools"
-release_version=0.6.1
+release_version=$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$script_dir/../Cargo.toml" | head -n 1)
+[ -n "$release_version" ]
 mkdir -p "$project_dir/scripts" "$tool_dir"
 cp "$script_dir/package-release.sh" "$project_dir/scripts/package-release.sh"
-[ "$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$script_dir/../Cargo.toml" | head -n 1)" = "$release_version" ]
 printf '%s\n' '[package]' 'name = "ghis"' "version = \"$release_version\"" > "$project_dir/Cargo.toml"
 printf '%s\n' 'Test release notes.' > "$project_dir/README.md"
 printf '%s\n' 'Test license.' > "$project_dir/LICENSE"
@@ -80,15 +80,14 @@ run_package() {
 assert_windows_archive() {
   archive=$1
   target=$2
-  python3 - "$archive" "$target" <<'PY'
+  python3 - "$archive" "ghis-v$release_version-$target" <<'PY'
 from hashlib import sha256
 from pathlib import Path
 import sys
 import zipfile
 
 archive = Path(sys.argv[1])
-target = sys.argv[2]
-package = f"ghis-v0.6.1-{target}"
+package = sys.argv[2]
 with zipfile.ZipFile(archive) as zip_file:
     names = set(zip_file.namelist())
     expected = {
@@ -113,7 +112,7 @@ PY
 }
 
 for windows_target in aarch64-pc-windows-msvc x86_64-pc-windows-gnu; do
-  windows_archive="$project_dir/dist/ghis-v0.6.1-$windows_target.zip"
+  windows_archive="$project_dir/dist/ghis-v$release_version-$windows_target.zip"
   if [ "$windows_target" = x86_64-pc-windows-gnu ]; then
     custom_target_dir="$tmpdir/custom-target"
     CARGO_TARGET_DIR="$custom_target_dir" run_package --target "$windows_target" >/dev/null
@@ -133,19 +132,19 @@ for windows_target in aarch64-pc-windows-msvc x86_64-pc-windows-gnu; do
 done
 
 unix_target=x86_64-unknown-linux-gnu
-unix_archive="$project_dir/dist/ghis-v0.6.1-$unix_target.tar.gz"
+unix_archive="$project_dir/dist/ghis-v$release_version-$unix_target.tar.gz"
 run_package >/dev/null
 cp "$unix_archive" "$tmpdir/first-unix.tar.gz"
 run_package >/dev/null
 cmp "$tmpdir/first-unix.tar.gz" "$unix_archive"
-python3 - "$unix_archive" <<'PY'
+python3 - "$unix_archive" "ghis-v$release_version-$unix_target" <<'PY'
 from hashlib import sha256
 from pathlib import Path
 import sys
 import tarfile
 
 archive = Path(sys.argv[1])
-package = "ghis-v0.6.1-x86_64-unknown-linux-gnu"
+package = sys.argv[2]
 with tarfile.open(archive, mode="r:gz") as tar:
     members = {member.name: member for member in tar.getmembers()}
     expected = {
