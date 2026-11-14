@@ -7,6 +7,8 @@ on:
 
 permissions:
   contents: read
+  # audit-check reports advisory warnings through the checks API.
+  checks: write
 
 env:
   RUST_TOOLCHAIN: 1.97.1
