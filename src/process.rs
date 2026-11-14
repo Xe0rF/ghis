@@ -213,7 +213,7 @@ impl CommandSpec {
         command
     }
 
-    fn secrets(&self) -> impl Iterator<Item = &str> {
+    pub(crate) fn secrets(&self) -> impl Iterator<Item = &str> {
         self.secrets.iter().map(String::as_str)
     }
 }

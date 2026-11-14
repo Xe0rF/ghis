@@ -11,9 +11,10 @@
 //! produces an error; the caller turns that into `quit=true` so Git stops
 //! asking rather than falling through to an interactive prompt.
 
-use crate::process::{CommandRunner, CommandSpec, ProcessError, SystemCommandRunner};
+use crate::process::{CommandRunner, CommandSpec, ProcessError, Redactor, SystemCommandRunner};
 use crate::secret::SecretToken;
 use std::fmt;
+use zeroize::Zeroizing;
 
 #[derive(Debug)]
 pub enum CommandError {
@@ -88,6 +89,12 @@ pub fn run(argv: &[String]) -> Result<SecretToken, CommandError> {
     run_with(argv, &SystemCommandRunner::new())
 }
 
+/// Redact stderr against the secrets known to the command before it enters an
+/// error message.
+fn redacted_stderr(command: &CommandSpec, stderr: &[u8]) -> String {
+    Redactor::new(command.secrets()).redact(&String::from_utf8_lossy(stderr))
+}
+
 pub fn run_with<R: CommandRunner>(
     argv: &[String],
     runner: &R,
@@ -97,17 +104,22 @@ pub fn run_with<R: CommandRunner>(
     };
     let display = command.display();
     let output = runner.run(&command).map_err(CommandError::from)?;
-    if !output.success() {
+    let code = output.status.code();
+    let succeeded = output.status.success();
+    // The command's stdout is the token, even when the command also failed.
+    // Move it into a zeroizing buffer before any other use of the output.
+    let stdout = Zeroizing::new(output.stdout);
+    if !succeeded {
         return Err(CommandError::Failed {
             command: display,
-            status: match output.code() {
+            status: match code {
                 Some(code) => format!("exit code {code}"),
                 None => output.status.to_string(),
             },
-            stderr: output.stderr_string(),
+            stderr: redacted_stderr(&command, &output.stderr),
         });
     }
-    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    let stdout = String::from_utf8_lossy(&stdout);
     let token = stdout.trim();
     if token.is_empty() {
         return Err(CommandError::EmptyOutput { command: display });
@@ -126,6 +138,13 @@ mod tests {
             Err(CommandError::Empty)
         ));
         assert!(spec_for(&[]).is_none());
+    }
+
+    #[test]
+    fn failure_stderr_is_redacted_before_it_enters_the_error() {
+        let command = CommandSpec::new("op").env_secret("OP_TOKEN", "super-secret-token");
+        let stderr = redacted_stderr(&command, b"failed with super-secret-token");
+        assert_eq!(stderr, "failed with [REDACTED]");
     }
 
     #[test]
