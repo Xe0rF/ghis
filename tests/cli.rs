@@ -3559,6 +3559,30 @@ fn implicit_setup_and_uninstall_keep_zsh_without_environment_hints() {
 }
 
 #[test]
+fn implicit_setup_uses_the_login_shell_environment_hint() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let home = temp.path().join("home");
+    let config_home = temp.path().join("config");
+    fs::create_dir_all(&home).expect("home directory");
+    let drop_in = config_home.join("fish/conf.d/ghis.fish");
+
+    let mut setup = isolated_ghis_command();
+    setup
+        .args(["shell", "setup", "--yes"])
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", &config_home)
+        .env("SHELL", "/usr/bin/fish")
+        .env_remove("ZDOTDIR")
+        .env_remove("PSModulePath");
+    setup
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("fish 集成"));
+    assert!(drop_in.is_file());
+    assert!(!home.join(".zshrc").exists());
+}
+
+#[test]
 fn zsh_environment_hint_beats_a_bash_login_shell_for_implicit_print() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let home = temp.path().join("home");

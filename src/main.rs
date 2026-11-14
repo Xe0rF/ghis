@@ -3386,11 +3386,22 @@ fn tool_text(status: &ToolStatus) -> String {
 
 /// Preserve the established Unix zsh default while using native PowerShell on Windows.
 fn resolve_shell(explicit: Option<shell::ShellKind>) -> app::Result<shell::ShellKind> {
-    #[cfg(windows)]
-    let default = shell::ShellKind::PowerShell;
-    #[cfg(not(windows))]
-    let default = shell::ShellKind::Zsh;
-    Ok(explicit.unwrap_or(default))
+    match shell::detect_shell(explicit) {
+        Ok(kind) => Ok(kind),
+        Err(shell::ShellError::Undetected) => {
+            // With no environment hint at all (services, CI, `env -i`) keep
+            // the historical platform default instead of refusing to install.
+            #[cfg(windows)]
+            {
+                Ok(shell::ShellKind::PowerShell)
+            }
+            #[cfg(not(windows))]
+            {
+                Ok(shell::ShellKind::Zsh)
+            }
+        }
+        Err(error) => Err(app::AppError::Message(error.to_string())),
+    }
 }
 
 /// Resolve a shell startup-file root without falling back to the current
