@@ -1222,3 +1222,136 @@ git_email = "work@example.test"
     );
     assert_eq!(report["profile"], "work");
 }
+
+#[test]
+fn doctor_credential_check_follows_the_profile_credential_mode() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let repository = temp.path().join("repo");
+    let fake_bin = temp.path().join("bin");
+    let home = temp.path().join("home");
+    let config_home = temp.path().join("config");
+    let cache_home = temp.path().join("cache");
+    let state_home = temp.path().join("state");
+    let config_file = config_home.join("ghis/config.toml");
+    fs::create_dir_all(&fake_bin).expect("fake bin");
+    fs::create_dir_all(&home).expect("home");
+    fs::create_dir_all(config_file.parent().expect("config parent")).expect("config directory");
+    git_ok(
+        temp.path(),
+        &["init", "-q", repository.to_str().expect("UTF-8 path")],
+    );
+    executable(
+        &fake_bin.join("gh"),
+        r#"#!/bin/sh
+printf '%s\n' "$*" >> "$FAKE_GH_TRACE"
+case "$1 $2" in
+  "--version ") printf 'gh version test\n' ;;
+  "auth status")
+    printf '%s\n' '{"hosts":{"github.com":[{"host":"github.com","login":"alice","active":true,"state":"success"}]}}' ;;
+  "auth token") printf 'keyring-token\n' ;;
+  *) exit 64 ;;
+esac
+"#,
+    );
+    let trace = temp.path().join("gh.trace");
+    let inherited_path = std::env::var_os("PATH").expect("PATH");
+    let path = std::env::join_paths(
+        std::iter::once(fake_bin).chain(std::env::split_paths(&inherited_path)),
+    )
+    .expect("joined PATH");
+    let run = || {
+        let mut command = AssertCommand::cargo_bin("ghis").expect("ghis binary");
+        command
+            .args([
+                "--config",
+                config_file.to_str().expect("UTF-8 config"),
+                "doctor",
+                "--json",
+            ])
+            .current_dir(&repository)
+            .env("PATH", &path)
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("XDG_CACHE_HOME", &cache_home)
+            .env("XDG_STATE_HOME", &state_home)
+            .env("GIT_CONFIG_SYSTEM", "/dev/null")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("FAKE_GH_TRACE", &trace)
+            .env_remove("GHIS_CONFIG")
+            .env_remove("GHIS_PROFILE");
+        command.output().expect("run doctor")
+    };
+
+    fs::write(
+        &config_file,
+        r#"version = 1
+
+[behavior]
+default_profile = "work"
+
+[profiles.work]
+host = "github.com"
+login = "alice"
+git_name = "Alice"
+git_email = "alice@example.test"
+credential_mode = "command"
+credential_command = ["/bin/false"]
+"#,
+    )
+    .expect("command-mode config");
+    let _ = fs::remove_file(&trace);
+    let output = run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    assert_eq!(
+        report["credential_available"],
+        serde_json::Value::Bool(false),
+        "a failing credential command must be reported as unavailable"
+    );
+    assert!(
+        !fs::read_to_string(&trace)
+            .unwrap_or_default()
+            .contains("auth token"),
+        "doctor must not consult gh when the profile uses a command"
+    );
+
+    fs::write(
+        &config_file,
+        r#"version = 1
+
+[behavior]
+default_profile = "work"
+
+[profiles.work]
+host = "github.com"
+login = "alice"
+git_name = "Alice"
+git_email = "alice@example.test"
+credential_mode = "none"
+"#,
+    )
+    .expect("none-mode config");
+    let _ = fs::remove_file(&trace);
+    let output = run();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    assert_eq!(
+        report["credential_available"],
+        Value::Null,
+        "none mode intentionally has no credential source"
+    );
+    assert!(
+        !fs::read_to_string(&trace)
+            .unwrap_or_default()
+            .contains("auth token"),
+        "doctor must not consult gh when the profile uses none mode"
+    );
+}

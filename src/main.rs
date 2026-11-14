@@ -7,7 +7,9 @@ use ghis::config::{
     DisplayIdentity, Profile, ResolutionSource, Rule, SigningProfile, SigningTransport, SshMode,
     SshProfile, SshUnmanagedPolicy, UnresolvedPolicy,
 };
-use ghis::{baseline, credential, diagnostics, git, github, platform, shell, signing};
+use ghis::{
+    baseline, credential, credential_command, diagnostics, git, github, platform, shell, signing,
+};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -2397,29 +2399,41 @@ fn doctor(
         }
     };
 
-    let credential_available =
-        ctx.profile.as_ref().map(
-            |profile| match github::token(&profile.host, &profile.login) {
-                Ok(token) => {
-                    drop(token);
-                    true
-                }
-                Err(_) => {
-                    findings.push(
-                        dependency_finding(
-                            DiagnosticCode::CredentialUnavailable,
-                            Severity::Error,
-                            format!(
-                                "无法取得 {}/{} 的凭据；绑定仓库的 HTTPS 操作会停止",
-                                profile.host, profile.login
-                            ),
-                        )
-                        .source("gh"),
-                    );
-                    false
-                }
-            },
+    let credential_available = ctx.profile.as_ref().and_then(|profile| {
+        let (source, available) = match profile.credential_mode() {
+            // `none` deliberately offers no HTTPS credential; that is not a
+            // failure and must not be reported as one.
+            CredentialMode::None => return None,
+            CredentialMode::Manage => (
+                "gh",
+                github::token(&profile.host, &profile.login)
+                    .map(drop)
+                    .is_ok(),
+            ),
+            CredentialMode::Command => (
+                "credential_command",
+                profile
+                    .credential_command
+                    .as_ref()
+                    .is_some_and(|argv| credential_command::run(argv).map(drop).is_ok()),
+            ),
+        };
+        if available {
+            return Some(true);
+        }
+        findings.push(
+            dependency_finding(
+                DiagnosticCode::CredentialUnavailable,
+                Severity::Error,
+                format!(
+                    "无法取得 {}/{} 的凭据；绑定仓库的 HTTPS 操作会停止",
+                    profile.host, profile.login
+                ),
+            )
+            .source(source),
         );
+        Some(false)
+    });
 
     let forwarded_signing = ctx.profile.as_ref().is_some_and(|profile| {
         profile.signing.enabled
